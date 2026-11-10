@@ -1,5 +1,9 @@
 # AiFlow
 
+## Visão geral para o portefólio
+
+AiFlow reúne issues do GitHub e ferramentas de programação assistida por IA numa aplicação desktop. Demonstra integração com CLIs, separação entre interface e orquestração e persistência local. Stack: Tauri, React, TypeScript, Rust e SQLite. Versão de desenvolvimento.
+
 A free desktop workspace for everyone to manage GitHub issues, ordered execution queues and official AI coding clients. Built with **Tauri 2, React, TypeScript, Rust and SQLite**. Every user connects their own accounts; there is no AiFlow account subscription or shared developer credential at runtime. Provider-specific commands and output parsing are isolated from orchestration.
 
 **Development preview, not a production-certified release.** See [implementation status](docs/IMPLEMENTATION_STATUS.md) for precise verification boundaries. No demo issues, fabricated account states or simulated agent output are loaded into the application.
