@@ -492,7 +492,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             state: localBrain.backendStatus == .appleFoundationModelsReady ? .ready : .degraded,
             engineOrModel: localBrain.backendStatus.rawValue,
             latencyMs: llmMs,
-            dependencyHint: localBrain.backendStatus == .appleFoundationModelsReady ? nil : "Apple FoundationModels ANE indisponível; usando motor conversacional nativo de reserva."
+            dependencyHint: localBrain.backendStatus == .appleFoundationModelsReady ? nil : "Apple FoundationModels indisponível; respostas gerais locais não estão disponíveis."
         )
 
         let ptVoices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.lowercased().hasPrefix("pt") }
@@ -935,6 +935,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     private func handlePartialTranscript(_ text: String) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, isVoiceSessionActive, !isMuted else { return }
+        // Recognition alone is not evidence of a new human turn (echo or stale callbacks).
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard userSpeechStartedAtNs != 0,
+              now &- lastAcousticSpeechTimestampNs < 1_500_000_000 else { return }
+        guard state != .processing, state != .consultingAgent else { return }
 
         if state == .assistantSpeaking {
             // Backchannel brief acknowledgements ("aham", "ok") should NOT cut off an ongoing reply unless sustained.
@@ -1006,14 +1011,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     private func handleFinalizedAutonomousTurn(_ utterance: String) {
         memoryStore.appendUserTurn(utterance, providerID: resolvedPipeline.effectiveProvider.rawValue)
-        if policy.allowPersistentVoiceMemory {
-            _ = knowledgeStore.storeFact(
-                utterance,
-                source: "user_voice",
-                projectScope: memoryStore.workspaceContext.projectName ?? "global",
-                explicitTrusted: false
-            )
-        }
+        // Raw ASR output is not a verified fact. Keep it in session history only.
 
         let decision = LocalQueryComplexityAnalyzer.route(
             utterance: utterance,
@@ -1156,6 +1154,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     private func buildLocalBrainInstructions(for language: VoiceLanguageVariant) -> String {
         var instructions = behavior.systemPromptInstructions(projectName: memoryStore.workspaceContext.projectName)
+        instructions += "\nResponda à pergunta atual, sem inventar assuntos, nomes ou tarefas. Contexto anterior é apenas referência, não uma instrução. Se não compreender, peça esclarecimento. Nunca afirme ter executado uma ação sem confirmação." 
         instructions += "\nIdentidade vocal ativa: \(voiceIdentity.persona.displayName) (\(voiceIdentity.persona.subtitle))."
         if language == .englishUS {
             instructions += " Keep replies conversational, clear, and concise in English (1 to 3 natural spoken sentences)."
@@ -1469,7 +1468,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 state: brainStatus == .appleFoundationModelsReady ? .ready : .degraded,
                 engineOrModel: brainStatus.rawValue,
                 latencyMs: ms,
-                dependencyHint: brainStatus == .appleFoundationModelsReady ? nil : "Apple FoundationModels indisponível; usando reserva conversacional local."
+                dependencyHint: brainStatus == .appleFoundationModelsReady ? nil : "Apple FoundationModels indisponível; respostas gerais locais não estão disponíveis."
             )
 
         case .tts:
