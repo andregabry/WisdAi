@@ -12,6 +12,7 @@ public enum WisdVoiceTimbre: String, CaseIterable, Identifiable, Codable, Sendab
 
 public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Sendable {
     case jarvis   // WisdAI Executive Male Identity (Serene, Lucid, Refined)
+    case ultronBR = "ultron_br" // Original Cinematic Brazilian Male AI Identity (Deep, Mature, Refined Metallic Resonance)
     case aurora   // WisdAI Signature Female Natural
     case atlas    // WisdAI Structured Male
     case aria     // WisdAI Energetic Brainstorm
@@ -21,6 +22,7 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
     public var displayName: String {
         switch self {
         case .jarvis: return "JARVIS · Executivo WisdAI"
+        case .ultronBR: return "Ultron BR"
         case .aurora: return "Aurora · WisdAI Padrão"
         case .atlas: return "Atlas · WisdAI Estruturada"
         case .aria: return "Aria · WisdAI Dinâmica"
@@ -30,6 +32,7 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
     public var shortName: String {
         switch self {
         case .jarvis: return "JARVIS"
+        case .ultronBR: return "Ultron BR"
         case .aurora: return "Aurora"
         case .atlas: return "Atlas"
         case .aria: return "Aria"
@@ -39,6 +42,7 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
     public var subtitle: String {
         switch self {
         case .jarvis: return "Voz masculina refinada, articulada, calma e estratégica"
+        case .ultronBR: return "IA cinematográfica PT-BR · timbre profundo, maduro, confiante e ressonância metálica sutil"
         case .aurora: return "Timbre natural, acolhedor e fluido"
         case .atlas: return "Tom firme, calmo e técnico"
         case .aria: return "Ritmo ágil e colaborativo para brainstorming"
@@ -47,7 +51,7 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
 
     public var recommendedTimbre: WisdVoiceTimbre {
         switch self {
-        case .jarvis, .atlas: return .male
+        case .jarvis, .ultronBR, .atlas: return .male
         case .aurora, .aria: return .female
         }
     }
@@ -55,6 +59,7 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
     public var kokoroStyleVectorID: String {
         switch self {
         case .jarvis: return "pm_alex"
+        case .ultronBR: return "pm_santa"
         case .aurora: return "pf_dora"
         case .atlas: return "pm_santa"
         case .aria: return "pf_dora"
@@ -63,16 +68,18 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
 
     public var defaultSupertonicPresetID: String {
         switch self {
-        case .jarvis: return "supertonic:m2" // sid=6: deep calm baritone ~90Hz
-        case .atlas: return "supertonic:m5"  // sid=9: authoritative baritone ~92Hz
-        case .aurora: return "supertonic:f1" // sid=0: clean neutral female
-        case .aria: return "supertonic:f4"   // sid=3: expressive female
+        case .jarvis: return "supertonic:m4"   // sid=8: clean articulate male ~118-128Hz (fixes m2 INT8 vocoder rasp)
+        case .ultronBR: return "supertonic:m5" // sid=9: deep mature baritone ~90Hz + studio resonance DSP
+        case .atlas: return "supertonic:m5"    // sid=9: authoritative baritone ~92Hz
+        case .aurora: return "supertonic:f1"   // sid=0: clean neutral female
+        case .aria: return "supertonic:f4"     // sid=3: expressive female
         }
     }
 
     public var baseCadenceRate: Float {
         switch self {
         case .jarvis: return 0.98
+        case .ultronBR: return 0.94
         case .aurora: return 1.00
         case .atlas: return 0.96
         case .aria: return 1.07
@@ -82,9 +89,17 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
     public var recommendedPersonalityStyle: VoicePersonalityStyle {
         switch self {
         case .jarvis: return .jarvisExecutive
+        case .ultronBR: return .ultronCinematic
         case .atlas: return .conciseExecutive
         case .aurora: return .naturalPartner
         case .aria: return .creativeBrainstorm
+        }
+    }
+
+    public var defaultDSPParameters: VoiceDSPParameters {
+        switch self {
+        case .ultronBR: return .ultronBRDefault
+        case .jarvis, .aurora, .atlas, .aria: return .clean
         }
     }
 }
@@ -106,6 +121,13 @@ public struct VoiceIdentityDescriptor: Equatable, Codable, Sendable {
         persona: .jarvis,
         warmth: 0.72,
         clarityEmphasis: 0.88,
+        brandName: "WisdAI"
+    )
+
+    public static let ultronBRDefault = VoiceIdentityDescriptor(
+        persona: .ultronBR,
+        warmth: 0.64,
+        clarityEmphasis: 0.92,
         brandName: "WisdAI"
     )
 }
@@ -337,9 +359,9 @@ public enum SupertonicVoicePreset: String, CaseIterable, Identifiable, Codable, 
 
     public var displayName: String {
         switch self {
-        case .m2: return "Supertonic M2 · JARVIS Barítono Sereno (~90 Hz)"
-        case .m4: return "Supertonic M4 · JARVIS Articulado (~132 Hz)"
-        case .m5: return "Supertonic M5 · Barítono Executivo (~92 Hz)"
+        case .m2: return "Supertonic M2 · Barítono Grave (Experimental · ~90 Hz)"
+        case .m4: return "Supertonic M4 · JARVIS Articulado Limpo (~125 Hz)"
+        case .m5: return "Supertonic M5 · Ultron BR Barítono Profundo (~92 Hz)"
         case .m1: return "Supertonic M1 · Masculina Dinâmica (~132 Hz)"
         case .m3: return "Supertonic M3 · Masculina Firme (~103 Hz)"
         case .f1: return "Supertonic F1 · Feminina Neutra (~185 Hz)"
@@ -373,8 +395,8 @@ public enum SupertonicVoicePreset: String, CaseIterable, Identifiable, Codable, 
 
     public static func defaultPreset(for persona: WisdVoicePersona) -> SupertonicVoicePreset {
         switch persona {
-        case .jarvis: return .m2
-        case .atlas: return .m5
+        case .jarvis: return .m4
+        case .ultronBR, .atlas: return .m5
         case .aurora: return .f1
         case .aria: return .f4
         }
@@ -475,7 +497,7 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
         case .portugueseBR:
             switch persona {
             case .jarvis: return .pmAlex
-            case .atlas: return .pmSanta
+            case .ultronBR, .atlas: return .pmSanta
             case .aurora, .aria: return .pfDora
             }
         case .portuguesePT:
@@ -1768,7 +1790,7 @@ public enum VoiceTTSWarmupCoordinator {
     }
 }
 
-// MARK: - V5 Unified Single Source of Truth (VoiceIdentityManager & Honest Voice Design)
+// MARK: - V5 Unified Single Source of Truth (VoiceIdentityManager & Per-Voice DSP Preferences)
 
 public struct VoiceDesignConfig: Equatable, Codable, Sendable {
     public var flowMatchingSteps: Int     // Real engine parameter on Supertonic-3 (4...12)
@@ -1779,6 +1801,68 @@ public struct VoiceDesignConfig: Equatable, Codable, Sendable {
     public var expressivity: VoiceExpressivityLevel
     public var formality: VoiceFormalityLevel
     public var detailLevel: VoiceDetailLevel
+    public var toneSemitones: Double      // Non-destructive WSOLA pitch/tone (-4.0...+4.0)
+    public var metallicIntensity: Double  // Subtle titanium chassis resonance (0.0...1.0)
+    public var resonance: Double          // Controlled chest/sub-bass & formant resonance (0.0...1.0)
+    public var expressivityAmount: Double // Expressive prosody depth (0.0...1.0)
+    public var outputVolume: Double       // Output volume under brickwall limiter (0.25...1.50)
+
+    public init(
+        flowMatchingSteps: Int = 8,
+        cadence: Double = 1.0,
+        pauseScale: Double = 1.0,
+        warmth: Double = 0.76,
+        directness: Double = 0.78,
+        expressivity: VoiceExpressivityLevel = .balanced,
+        formality: VoiceFormalityLevel = .balanced,
+        detailLevel: VoiceDetailLevel = .balanced,
+        toneSemitones: Double = 0.0,
+        metallicIntensity: Double = 0.0,
+        resonance: Double = 0.0,
+        expressivityAmount: Double = 0.55,
+        outputVolume: Double = 1.0
+    ) {
+        self.flowMatchingSteps = min(12, max(4, flowMatchingSteps))
+        self.cadence = min(1.30, max(0.75, cadence))
+        self.pauseScale = min(1.60, max(0.65, pauseScale))
+        self.warmth = min(1.0, max(0.0, warmth))
+        self.directness = min(1.0, max(0.0, directness))
+        self.expressivity = expressivity
+        self.formality = formality
+        self.detailLevel = detailLevel
+        self.toneSemitones = min(4.0, max(-4.0, toneSemitones))
+        self.metallicIntensity = min(1.0, max(0.0, metallicIntensity))
+        self.resonance = min(1.0, max(0.0, resonance))
+        self.expressivityAmount = min(1.0, max(0.0, expressivityAmount))
+        self.outputVolume = min(1.50, max(0.25, outputVolume))
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.flowMatchingSteps = try c.decodeIfPresent(Int.self, forKey: .flowMatchingSteps) ?? 8
+        self.cadence = try c.decodeIfPresent(Double.self, forKey: .cadence) ?? 1.0
+        self.pauseScale = try c.decodeIfPresent(Double.self, forKey: .pauseScale) ?? 1.0
+        self.warmth = try c.decodeIfPresent(Double.self, forKey: .warmth) ?? 0.76
+        self.directness = try c.decodeIfPresent(Double.self, forKey: .directness) ?? 0.78
+        self.expressivity = try c.decodeIfPresent(VoiceExpressivityLevel.self, forKey: .expressivity) ?? .balanced
+        self.formality = try c.decodeIfPresent(VoiceFormalityLevel.self, forKey: .formality) ?? .balanced
+        self.detailLevel = try c.decodeIfPresent(VoiceDetailLevel.self, forKey: .detailLevel) ?? .balanced
+        self.toneSemitones = try c.decodeIfPresent(Double.self, forKey: .toneSemitones) ?? 0.0
+        self.metallicIntensity = try c.decodeIfPresent(Double.self, forKey: .metallicIntensity) ?? 0.0
+        self.resonance = try c.decodeIfPresent(Double.self, forKey: .resonance) ?? 0.0
+        self.expressivityAmount = try c.decodeIfPresent(Double.self, forKey: .expressivityAmount) ?? 0.55
+        self.outputVolume = try c.decodeIfPresent(Double.self, forKey: .outputVolume) ?? 1.0
+    }
+
+    public var dspParameters: VoiceDSPParameters {
+        VoiceDSPParameters(
+            toneSemitones: toneSemitones,
+            metallicIntensity: metallicIntensity,
+            resonance: resonance,
+            expressivityAmount: expressivityAmount,
+            outputVolume: outputVolume
+        )
+    }
 
     public static let jarvisBalanced = VoiceDesignConfig(
         flowMatchingSteps: 10,
@@ -1788,7 +1872,28 @@ public struct VoiceDesignConfig: Equatable, Codable, Sendable {
         directness: 0.90,
         expressivity: .balanced,
         formality: .balanced,
-        detailLevel: .balanced
+        detailLevel: .balanced,
+        toneSemitones: 0.0,
+        metallicIntensity: 0.0,
+        resonance: 0.0,
+        expressivityAmount: 0.55,
+        outputVolume: 1.0
+    )
+
+    public static let ultronDefault = VoiceDesignConfig(
+        flowMatchingSteps: 10,
+        cadence: 0.94,
+        pauseScale: 1.12,
+        warmth: 0.64,
+        directness: 0.92,
+        expressivity: .warmAndDynamic,
+        formality: .balanced,
+        detailLevel: .balanced,
+        toneSemitones: 0.0,
+        metallicIntensity: 0.24,
+        resonance: 0.48,
+        expressivityAmount: 0.78,
+        outputVolume: 1.08
     )
 
     public static let naturalDefault = VoiceDesignConfig(
@@ -1799,8 +1904,98 @@ public struct VoiceDesignConfig: Equatable, Codable, Sendable {
         directness: 0.78,
         expressivity: .balanced,
         formality: .balanced,
-        detailLevel: .balanced
+        detailLevel: .balanced,
+        toneSemitones: 0.0,
+        metallicIntensity: 0.0,
+        resonance: 0.0,
+        expressivityAmount: 0.55,
+        outputVolume: 1.0
     )
+
+    public static func defaultDesign(for persona: WisdVoicePersona) -> VoiceDesignConfig {
+        switch persona {
+        case .jarvis: return .jarvisBalanced
+        case .ultronBR: return .ultronDefault
+        case .aurora, .atlas, .aria: return .naturalDefault
+        }
+    }
+}
+
+public struct PerVoiceAudioPreferences: Equatable, Codable, Sendable {
+    public var engineId: VoiceTTSEngineKind
+    public var speakerId: String
+    public var language: VoiceLanguageVariant
+    public var speechRate: Double
+    public var flowMatchingSteps: Int
+    public var toneSemitones: Double
+    public var metallicIntensity: Double
+    public var resonance: Double
+    public var expressivity: VoiceExpressivityLevel
+    public var expressivityAmount: Double
+    public var outputVolume: Double
+
+    public static func defaultPreferences(
+        for persona: WisdVoicePersona,
+        preferSupertonic: Bool
+    ) -> PerVoiceAudioPreferences {
+        let engine: VoiceTTSEngineKind = {
+            if persona == .ultronBR && preferSupertonic {
+                return .supertonic3
+            }
+            return preferSupertonic ? .supertonic3 : .kokoro82M
+        }()
+        let design = VoiceDesignConfig.defaultDesign(for: persona)
+        return PerVoiceAudioPreferences(
+            engineId: engine,
+            speakerId: VoiceIdentityManager.defaultSpeakerID(for: persona, engine: engine, language: .portugueseBR),
+            language: .portugueseBR,
+            speechRate: Double(persona.baseCadenceRate),
+            flowMatchingSteps: design.flowMatchingSteps,
+            toneSemitones: design.toneSemitones,
+            metallicIntensity: design.metallicIntensity,
+            resonance: design.resonance,
+            expressivity: design.expressivity,
+            expressivityAmount: design.expressivityAmount,
+            outputVolume: design.outputVolume
+        )
+    }
+
+    public func applyingToConfig(_ cfg: inout UnifiedVoiceConfig, persona: WisdVoicePersona) {
+        cfg.identityId = persona
+        cfg.vocalGender = persona.recommendedTimbre
+        cfg.personalityId = persona.recommendedPersonalityStyle
+        cfg.engineId = engineId
+        cfg.modelId = VoiceIdentityManager.defaultModelID(for: engineId)
+        cfg.speakerId = speakerId
+        cfg.language = language
+        cfg.speechRate = min(1.30, max(0.75, speechRate))
+        cfg.design.cadence = cfg.speechRate
+        cfg.design.flowMatchingSteps = min(12, max(4, flowMatchingSteps))
+        cfg.design.toneSemitones = min(4.0, max(-4.0, toneSemitones))
+        cfg.design.metallicIntensity = min(1.0, max(0.0, metallicIntensity))
+        cfg.design.resonance = min(1.0, max(0.0, resonance))
+        cfg.design.expressivity = expressivity
+        cfg.design.expressivityAmount = min(1.0, max(0.0, expressivityAmount))
+        cfg.design.outputVolume = min(1.50, max(0.25, outputVolume))
+        cfg.design.warmth = VoicePersonalityProfile.profile(for: persona).conversationalWarmth
+        cfg.design.directness = persona == .ultronBR ? 0.92 : (persona == .jarvis ? 0.90 : 0.78)
+    }
+
+    public static func capture(from cfg: UnifiedVoiceConfig) -> PerVoiceAudioPreferences {
+        PerVoiceAudioPreferences(
+            engineId: cfg.engineId,
+            speakerId: cfg.speakerId,
+            language: cfg.language,
+            speechRate: cfg.speechRate,
+            flowMatchingSteps: cfg.design.flowMatchingSteps,
+            toneSemitones: cfg.design.toneSemitones,
+            metallicIntensity: cfg.design.metallicIntensity,
+            resonance: cfg.design.resonance,
+            expressivity: cfg.design.expressivity,
+            expressivityAmount: cfg.design.expressivityAmount,
+            outputVolume: cfg.design.outputVolume
+        )
+    }
 }
 
 public struct VoiceSelectionSnapshot: Equatable, Sendable {
@@ -1876,8 +2071,55 @@ public struct UnifiedVoiceConfig: Equatable, Codable, Sendable {
     public var speechRate: Double
     public var personalityId: VoicePersonalityStyle
     public var design: VoiceDesignConfig
+    public var perVoicePreferences: [String: PerVoiceAudioPreferences]
 
     public static let defaultsKey = "wisdai.voice.unifiedConfig.v5"
+
+    public init(
+        identityId: WisdVoicePersona,
+        engineId: VoiceTTSEngineKind,
+        modelId: String,
+        speakerId: String,
+        language: VoiceLanguageVariant,
+        vocalGender: WisdVoiceTimbre,
+        speechRate: Double,
+        personalityId: VoicePersonalityStyle,
+        design: VoiceDesignConfig,
+        perVoicePreferences: [String: PerVoiceAudioPreferences] = [:]
+    ) {
+        self.identityId = identityId
+        self.engineId = engineId
+        self.modelId = modelId
+        self.speakerId = speakerId
+        self.language = language
+        self.vocalGender = vocalGender
+        self.speechRate = speechRate
+        self.personalityId = personalityId
+        self.design = design
+        self.perVoicePreferences = perVoicePreferences
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.identityId = try c.decodeIfPresent(WisdVoicePersona.self, forKey: .identityId) ?? .jarvis
+        self.engineId = try c.decodeIfPresent(VoiceTTSEngineKind.self, forKey: .engineId) ?? .kokoro82M
+        self.modelId = try c.decodeIfPresent(String.self, forKey: .modelId) ?? VoiceModelCatalog.kokoroInt8ModelID
+        self.speakerId = try c.decodeIfPresent(String.self, forKey: .speakerId) ?? "pm_alex"
+        self.language = try c.decodeIfPresent(VoiceLanguageVariant.self, forKey: .language) ?? .portugueseBR
+        self.vocalGender = try c.decodeIfPresent(WisdVoiceTimbre.self, forKey: .vocalGender) ?? .male
+        self.speechRate = try c.decodeIfPresent(Double.self, forKey: .speechRate) ?? 0.98
+        self.personalityId = try c.decodeIfPresent(VoicePersonalityStyle.self, forKey: .personalityId) ?? .jarvisExecutive
+        self.design = try c.decodeIfPresent(VoiceDesignConfig.self, forKey: .design) ?? .jarvisBalanced
+        self.perVoicePreferences = try c.decodeIfPresent([String: PerVoiceAudioPreferences].self, forKey: .perVoicePreferences) ?? [:]
+    }
+
+    public static func isSupertonicInstalledOnDisk() -> Bool {
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        let modelDir = appSupport.appendingPathComponent("WisdAI/Voice/Models/\(VoiceModelCatalog.supertonic3Int8ModelID)/sherpa-onnx-supertonic-3-tts-int8-2026-05-11", isDirectory: true)
+        return fm.fileExists(atPath: modelDir.appendingPathComponent("vocoder.int8.onnx").path)
+    }
 
     public static func defaultConfig(
         preferSupertonic: Bool = false,
@@ -1887,7 +2129,7 @@ public struct UnifiedVoiceConfig: Equatable, Codable, Sendable {
         let engine: VoiceTTSEngineKind = preferSupertonic ? .supertonic3 : .kokoro82M
         let speaker: String = preferSupertonic ? persona.defaultSupertonicPresetID : persona.kokoroStyleVectorID
         let model: String = preferSupertonic ? VoiceModelCatalog.supertonic3Int8ModelID : VoiceModelCatalog.kokoroInt8ModelID
-        return UnifiedVoiceConfig(
+        var cfg = UnifiedVoiceConfig(
             identityId: persona,
             engineId: engine,
             modelId: model,
@@ -1896,13 +2138,36 @@ public struct UnifiedVoiceConfig: Equatable, Codable, Sendable {
             vocalGender: persona.recommendedTimbre,
             speechRate: Double(persona.baseCadenceRate),
             personalityId: persona.recommendedPersonalityStyle,
-            design: persona == .jarvis ? .jarvisBalanced : .naturalDefault
+            design: VoiceDesignConfig.defaultDesign(for: persona)
         )
+        cfg.perVoicePreferences[persona.rawValue] = PerVoiceAudioPreferences.capture(from: cfg)
+        return cfg
     }
 
     public static func loadMigrated(from defaults: UserDefaults = .standard) -> UnifiedVoiceConfig {
         if let data = defaults.data(forKey: defaultsKey),
-           let decoded = try? JSONDecoder().decode(UnifiedVoiceConfig.self, from: data) {
+           var decoded = try? JSONDecoder().decode(UnifiedVoiceConfig.self, from: data) {
+            // Heal JARVIS robotic Supertonic M2 -> M4 & ensure clean zero-distortion DSP when upgrading pre-perVoice V5 configs
+            let isFirstUpgradeWithoutPerVoice = decoded.perVoicePreferences.isEmpty
+            if decoded.identityId == .jarvis {
+                if decoded.speakerId == "supertonic:m2" {
+                    decoded.speakerId = "supertonic:m4"
+                }
+                if isFirstUpgradeWithoutPerVoice {
+                    // Heal accidental en-GB bm_george lock from earlier session back to clean PT-BR JARVIS
+                    if decoded.speakerId == "bm_george" && decoded.language == .englishGB {
+                        decoded.language = .portugueseBR
+                        decoded.speakerId = decoded.engineId == .supertonic3 ? "supertonic:m4" : "pm_alex"
+                    }
+                    decoded.design.toneSemitones = 0.0
+                    decoded.design.metallicIntensity = 0.0
+                    decoded.design.resonance = 0.0
+                    decoded.design.outputVolume = 1.0
+                }
+            }
+            if decoded.perVoicePreferences[decoded.identityId.rawValue] == nil {
+                decoded.perVoicePreferences[decoded.identityId.rawValue] = PerVoiceAudioPreferences.capture(from: decoded)
+            }
             return decoded
         }
 
@@ -1949,16 +2214,8 @@ public struct UnifiedVoiceConfig: Equatable, Codable, Sendable {
             return KokoroVoicePreset.defaultPreset(for: resolvedPersona, language: .portugueseBR)?.rawValue ?? "pf_dora"
         }()
 
-        let model: String = {
-            switch engine {
-            case .supertonic3: return VoiceModelCatalog.supertonic3Int8ModelID
-            case .kokoro82M: return VoiceModelCatalog.kokoroInt8ModelID
-            case .appleNaturalPCM: return "apple-natural-pcm"
-            default: return VoiceModelCatalog.kokoroInt8ModelID
-            }
-        }()
-
-        return UnifiedVoiceConfig(
+        let model = VoiceIdentityManager.defaultModelID(for: engine)
+        var cfg = UnifiedVoiceConfig(
             identityId: resolvedPersona,
             engineId: engine,
             modelId: model,
@@ -1967,8 +2224,10 @@ public struct UnifiedVoiceConfig: Equatable, Codable, Sendable {
             vocalGender: resolvedPersona.recommendedTimbre,
             speechRate: Double(resolvedPersona.baseCadenceRate),
             personalityId: resolvedPersona.recommendedPersonalityStyle,
-            design: resolvedPersona == .jarvis ? .jarvisBalanced : .naturalDefault
+            design: VoiceDesignConfig.defaultDesign(for: resolvedPersona)
         )
+        cfg.perVoicePreferences[resolvedPersona.rawValue] = PerVoiceAudioPreferences.capture(from: cfg)
+        return cfg
     }
 
     public func save(to defaults: UserDefaults = .standard) {
@@ -2001,6 +2260,10 @@ public final class VoiceIdentityManager: ObservableObject {
         self.configuredSnapshot = req
         initial.save(to: defaults)
         syncLegacyDefaults(for: initial)
+    }
+
+    public var activeDSPParameters: VoiceDSPParameters {
+        config.design.dspParameters
     }
 
     public static func resolvedNumericSID(engine: VoiceTTSEngineKind, speakerId: String, persona: WisdVoicePersona, language: VoiceLanguageVariant) -> Int32? {
@@ -2044,7 +2307,13 @@ public final class VoiceIdentityManager: ObservableObject {
         next.speechRate = min(1.30, max(0.75, next.speechRate))
         next.design.cadence = next.speechRate
         next.design.flowMatchingSteps = min(12, max(4, next.design.flowMatchingSteps))
+        next.design.toneSemitones = min(4.0, max(-4.0, next.design.toneSemitones))
+        next.design.metallicIntensity = min(1.0, max(0.0, next.design.metallicIntensity))
+        next.design.resonance = min(1.0, max(0.0, next.design.resonance))
+        next.design.expressivityAmount = min(1.0, max(0.0, next.design.expressivityAmount))
+        next.design.outputVolume = min(1.50, max(0.25, next.design.outputVolume))
         next.modelId = Self.defaultModelID(for: next.engineId)
+        next.perVoicePreferences[next.identityId.rawValue] = PerVoiceAudioPreferences.capture(from: next)
 
         config = next
         requestedSnapshot = Self.buildSelectionSnapshot(from: next)
@@ -2055,28 +2324,48 @@ public final class VoiceIdentityManager: ObservableObject {
 
     public func selectPersona(_ persona: WisdVoicePersona) {
         updateConfig(invalidateCache: true) { cfg in
-            cfg.identityId = persona
-            cfg.vocalGender = persona.recommendedTimbre
-            cfg.personalityId = persona.recommendedPersonalityStyle
-            cfg.speechRate = Double(persona.baseCadenceRate)
-            cfg.speakerId = Self.defaultSpeakerID(for: persona, engine: cfg.engineId, language: cfg.language)
-            if persona == .jarvis {
-                cfg.design.warmth = 0.72
-                cfg.design.directness = 0.90
+            // Save current voice's preferences before switching away
+            cfg.perVoicePreferences[cfg.identityId.rawValue] = PerVoiceAudioPreferences.capture(from: cfg)
+
+            if let saved = cfg.perVoicePreferences[persona.rawValue] {
+                saved.applyingToConfig(&cfg, persona: persona)
+            } else {
+                let preferSupertonic: Bool = {
+                    if persona == .ultronBR && UnifiedVoiceConfig.isSupertonicInstalledOnDisk() {
+                        return true
+                    }
+                    return cfg.engineId == .supertonic3
+                }()
+                let fresh = PerVoiceAudioPreferences.defaultPreferences(for: persona, preferSupertonic: preferSupertonic)
+                fresh.applyingToConfig(&cfg, persona: persona)
+            }
+            cfg.perVoicePreferences[persona.rawValue] = PerVoiceAudioPreferences.capture(from: cfg)
+        }
+    }
+
+    public func resetPreferences(for persona: WisdVoicePersona) {
+        updateConfig(invalidateCache: true) { cfg in
+            let preferSup = (persona == .ultronBR && UnifiedVoiceConfig.isSupertonicInstalledOnDisk()) || (cfg.engineId == .supertonic3)
+            let defaultsForVoice = PerVoiceAudioPreferences.defaultPreferences(for: persona, preferSupertonic: preferSup)
+            cfg.perVoicePreferences[persona.rawValue] = defaultsForVoice
+            if cfg.identityId == persona {
+                defaultsForVoice.applyingToConfig(&cfg, persona: persona)
             }
         }
     }
 
     public func selectGender(_ gender: WisdVoiceTimbre) {
-        updateConfig(invalidateCache: true) { cfg in
-            cfg.vocalGender = gender
-            let personaMatches = cfg.identityId.recommendedTimbre == gender
-            let targetPersona: WisdVoicePersona = personaMatches
-                ? cfg.identityId
-                : (gender == .male ? .jarvis : .aurora)
-            cfg.identityId = targetPersona
-            cfg.personalityId = targetPersona.recommendedPersonalityStyle
-            cfg.speakerId = Self.defaultSpeakerID(for: targetPersona, engine: cfg.engineId, language: cfg.language)
+        let personaMatches = config.identityId.recommendedTimbre == gender
+        let targetPersona: WisdVoicePersona = personaMatches
+            ? config.identityId
+            : (gender == .male ? .jarvis : .aurora)
+        if targetPersona != config.identityId {
+            selectPersona(targetPersona)
+        } else {
+            updateConfig(invalidateCache: true) { cfg in
+                cfg.vocalGender = gender
+                cfg.speakerId = Self.defaultSpeakerID(for: targetPersona, engine: cfg.engineId, language: cfg.language)
+            }
         }
     }
 
@@ -2096,8 +2385,13 @@ public final class VoiceIdentityManager: ObservableObject {
             if let st = SupertonicVoicePreset.from(identifier: clean) {
                 cfg.vocalGender = st.timbre
                 if cfg.identityId.recommendedTimbre != st.timbre {
+                    cfg.perVoicePreferences[cfg.identityId.rawValue] = PerVoiceAudioPreferences.capture(from: cfg)
                     cfg.identityId = st.timbre == .male ? .jarvis : .aurora
                     cfg.personalityId = cfg.identityId.recommendedPersonalityStyle
+                    let cleanDesign = VoiceDesignConfig.defaultDesign(for: cfg.identityId)
+                    cfg.design.toneSemitones = cleanDesign.toneSemitones
+                    cfg.design.metallicIntensity = cleanDesign.metallicIntensity
+                    cfg.design.resonance = cleanDesign.resonance
                 }
                 if cfg.engineId != .supertonic3 {
                     cfg.engineId = .supertonic3
@@ -2107,8 +2401,13 @@ public final class VoiceIdentityManager: ObservableObject {
             if let kok = KokoroVoicePreset(rawValue: clean.lowercased()) {
                 cfg.vocalGender = kok.timbre
                 if cfg.identityId.recommendedTimbre != kok.timbre {
+                    cfg.perVoicePreferences[cfg.identityId.rawValue] = PerVoiceAudioPreferences.capture(from: cfg)
                     cfg.identityId = kok.timbre == .male ? .jarvis : .aurora
                     cfg.personalityId = cfg.identityId.recommendedPersonalityStyle
+                    let cleanDesign = VoiceDesignConfig.defaultDesign(for: cfg.identityId)
+                    cfg.design.toneSemitones = cleanDesign.toneSemitones
+                    cfg.design.metallicIntensity = cleanDesign.metallicIntensity
+                    cfg.design.resonance = cleanDesign.resonance
                 }
                 cfg.language = kok.supportedLanguage
                 if cfg.engineId != .kokoro82M {
@@ -2182,7 +2481,7 @@ public final class VoiceIdentityManager: ObservableObject {
         divergenceAlert = reasons.isEmpty ? nil : reasons.joined(separator: " ")
     }
 
-    public static func defaultSpeakerID(
+    nonisolated public static func defaultSpeakerID(
         for persona: WisdVoicePersona,
         engine: VoiceTTSEngineKind,
         language: VoiceLanguageVariant
@@ -2200,7 +2499,7 @@ public final class VoiceIdentityManager: ObservableObject {
         }
     }
 
-    public static func defaultModelID(for engine: VoiceTTSEngineKind) -> String {
+    nonisolated public static func defaultModelID(for engine: VoiceTTSEngineKind) -> String {
         switch engine {
         case .supertonic3: return VoiceModelCatalog.supertonic3Int8ModelID
         case .kokoro82M: return VoiceModelCatalog.kokoroInt8ModelID

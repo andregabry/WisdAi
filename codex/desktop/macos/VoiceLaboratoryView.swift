@@ -447,45 +447,173 @@ struct VoiceLaboratoryView: View {
                     .foregroundStyle(.orange)
                 }
 
-                // Voice Design Controls strictly gated by real active engine capabilities
                 let designCaps = EngineProsodyCapabilities.forEngine(
                     orchestrator.selectedTTSEngine,
                     isKokoroActive: orchestrator.selectActiveTTSProvider().providerID == orchestrator.kokoroTTS.providerID,
                     isSupertonicActive: orchestrator.selectActiveTTSProvider().providerID == orchestrator.supertonicTTS.providerID
                 )
 
-                if designCaps.supportsRateControl {
+                // Per-Voice Saved Acoustic & Prosody Controls (Velocidade, Tom, Intensidade metálica, Expressividade, Ressonância, Volume)
+                VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Velocidade Real (\(String(format: "%.2f×", orchestrator.behavior.speechRate)))")
-                            .font(.system(size: 11.5))
-                        Slider(value: $orchestrator.behavior.speechRate, in: 0.75...1.30, step: 0.05)
-                            .tint(WisdTheme.accent)
+                        Text("Controles Individuais (\(identityManager.config.identityId.shortName) · salvos por voz)")
+                            .font(.system(size: 11.5, weight: .semibold))
+                        Spacer()
+                        Button("Restaurar padrão") {
+                            identityManager.resetPreferences(for: identityManager.config.identityId)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
                     }
-                }
-                if designCaps.supportsFlowMatchingSteps {
+
                     HStack {
-                        Text("Passos Flow Matching Supertonic (\(identityManager.config.design.flowMatchingSteps) passos · qualidade × velocidade)")
+                        Text("Velocidade (\(String(format: "%.2f×", identityManager.config.speechRate)))")
                             .font(.system(size: 11.5))
+                            .frame(width: 175, alignment: .leading)
                         Slider(
                             value: Binding(
-                                get: { Double(identityManager.config.design.flowMatchingSteps) },
+                                get: { identityManager.config.speechRate },
                                 set: { val in
                                     identityManager.updateConfig(invalidateCache: true) { cfg in
-                                        cfg.design.flowMatchingSteps = Int(val.rounded())
+                                        cfg.speechRate = val
                                     }
                                 }
                             ),
-                            in: 4...12,
-                            step: 1
+                            in: 0.75...1.30,
+                            step: 0.02
                         )
                         .tint(WisdTheme.accent)
                     }
+
+                    HStack {
+                        Text("Tom (\(String(format: "%+.1f st", identityManager.config.design.toneSemitones)))")
+                            .font(.system(size: 11.5))
+                            .frame(width: 175, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { identityManager.config.design.toneSemitones },
+                                set: { val in
+                                    identityManager.updateConfig(invalidateCache: true) { cfg in
+                                        cfg.design.toneSemitones = (val * 10.0).rounded() / 10.0
+                                    }
+                                }
+                            ),
+                            in: -4.0...4.0,
+                            step: 0.2
+                        )
+                        .tint(WisdTheme.accent)
+                    }
+
+                    HStack {
+                        Text("Intensidade Metálica (\(Int((identityManager.config.design.metallicIntensity * 100).rounded()))%)")
+                            .font(.system(size: 11.5))
+                            .frame(width: 175, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { identityManager.config.design.metallicIntensity },
+                                set: { val in
+                                    identityManager.updateConfig(invalidateCache: true) { cfg in
+                                        cfg.design.metallicIntensity = val
+                                    }
+                                }
+                            ),
+                            in: 0.0...1.0,
+                            step: 0.02
+                        )
+                        .tint(WisdTheme.accent)
+                    }
+
+                    HStack {
+                        Text("Ressonância (\(Int((identityManager.config.design.resonance * 100).rounded()))%)")
+                            .font(.system(size: 11.5))
+                            .frame(width: 175, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { identityManager.config.design.resonance },
+                                set: { val in
+                                    identityManager.updateConfig(invalidateCache: true) { cfg in
+                                        cfg.design.resonance = val
+                                    }
+                                }
+                            ),
+                            in: 0.0...1.0,
+                            step: 0.02
+                        )
+                        .tint(WisdTheme.accent)
+                    }
+
+                    HStack {
+                        Text("Expressividade (\(Int((identityManager.config.design.expressivityAmount * 100).rounded()))%)")
+                            .font(.system(size: 11.5))
+                            .frame(width: 175, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { identityManager.config.design.expressivityAmount },
+                                set: { val in
+                                    identityManager.updateConfig(invalidateCache: true) { cfg in
+                                        cfg.design.expressivityAmount = val
+                                        if val < 0.30 {
+                                            cfg.design.expressivity = .subtle
+                                        } else if val > 0.70 {
+                                            cfg.design.expressivity = .warmAndDynamic
+                                        } else {
+                                            cfg.design.expressivity = .balanced
+                                        }
+                                    }
+                                }
+                            ),
+                            in: 0.0...1.0,
+                            step: 0.05
+                        )
+                        .tint(WisdTheme.accent)
+                    }
+
+                    HStack {
+                        Text("Volume (\(Int((identityManager.config.design.outputVolume * 100).rounded()))%)")
+                            .font(.system(size: 11.5))
+                            .frame(width: 175, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { identityManager.config.design.outputVolume },
+                                set: { val in
+                                    identityManager.updateConfig(invalidateCache: true) { cfg in
+                                        cfg.design.outputVolume = val
+                                    }
+                                }
+                            ),
+                            in: 0.25...1.50,
+                            step: 0.05
+                        )
+                        .tint(WisdTheme.accent)
+                    }
+
+                    if designCaps.supportsFlowMatchingSteps {
+                        HStack {
+                            Text("Flow Matching (\(identityManager.config.design.flowMatchingSteps) passos)")
+                                .font(.system(size: 11.5))
+                                .frame(width: 175, alignment: .leading)
+                            Slider(
+                                value: Binding(
+                                    get: { Double(identityManager.config.design.flowMatchingSteps) },
+                                    set: { val in
+                                        identityManager.updateConfig(invalidateCache: true) { cfg in
+                                            cfg.design.flowMatchingSteps = Int(val.rounded())
+                                        }
+                                    }
+                                ),
+                                in: 4...12,
+                                step: 1
+                            )
+                            .tint(WisdTheme.accent)
+                        }
+                    }
                 }
-                if !designCaps.supportsPitchModulation && !designCaps.supportsNativeAudioTags {
-                    Text("Controles honestos: timbre e entonação vêm dos vetores neurais nativos do speaker; ajustes falsos de pitch/emoção permanecem ocultos para este motor.")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(DesktopStyle.muted)
-                }
+                .padding(8)
+                .background(DesktopStyle.surface.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+
+                Text("DSP não destrutivo de estúdio (EQ paramétrico + compressor + limiter -1 dBFS; bypass limpo para JARVIS/Aurora quando em 0%).")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(DesktopStyle.muted)
 
                 Divider()
 
@@ -530,15 +658,17 @@ struct VoiceLaboratoryView: View {
                     .disabled(isSynthesizingSample || sampleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     if orchestrator.supertonicTTS.isReadyOnDisk {
-                        Button("JARVIS Barítono (M2)") {
-                            synthesizeSupertonicPresetSample(.m2)
+                        Button("JARVIS Limpo (M4)") {
+                            identityManager.selectPersona(.jarvis)
+                            synthesizeSupertonicPresetSample(.m4)
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(isSynthesizingSample)
 
-                        Button("JARVIS Articulado (M4)") {
-                            synthesizeSupertonicPresetSample(.m4)
+                        Button("Ultron BR") {
+                            identityManager.selectPersona(.ultronBR)
+                            applyAndTestConfiguredVoice()
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -602,7 +732,7 @@ struct VoiceLaboratoryView: View {
                 }
 
                 if orchestrator.behavior.languageVariant == .portugueseBR {
-                    Text("Candidatos masculinos JARVIS disponíveis para escuta imediata (Supertonic-3 M2/M4 @ 44.1 kHz e Kokoro pm_alex/pm_santa @ 24 kHz); seleção definitiva permanece aberta até sua aprovação.")
+                    Text("JARVIS utiliza Supertonic M4 (~125 Hz) ou Kokoro pm_alex sem distorção DSP; Ultron BR utiliza Supertonic M5 (~92 Hz) com ressonância grave controlada e brilho metálico sutil.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(DesktopStyle.muted)
                 }

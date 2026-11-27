@@ -1316,7 +1316,63 @@ struct VoiceSmokeTests {
             }
         }
 
-        // 6. Controller <-> Orchestrator Unified Bridge without AudioEngine stop
+        // 6. Per-voice persistence, JARVIS healing (no M2 buzz / no pitch drop), StreamingSincResampler & Ultron BR DSP verification
+        mgr.selectPersona(.jarvis)
+        precondition(mgr.activeDSPParameters.isIdentityClean, "JARVIS deve operar sem DSP metálico/pitch-shift destrutivo")
+        mgr.updateConfig { cfg in
+            cfg.speechRate = 1.06
+        }
+        mgr.selectPersona(.ultronBR)
+        precondition(mgr.config.language == .portugueseBR && mgr.config.vocalGender == .male)
+        precondition(mgr.activeDSPParameters.metallicIntensity > 0.1 && mgr.activeDSPParameters.resonance > 0.2)
+        mgr.updateConfig { cfg in
+            cfg.design.metallicIntensity = 0.30
+            cfg.design.outputVolume = 1.12
+        }
+        // Switching back to JARVIS MUST keep JARVIS clean settings untouched!
+        mgr.selectPersona(.jarvis)
+        precondition(abs(mgr.config.speechRate - 1.06) < 0.01 && mgr.activeDSPParameters.isIdentityClean,
+                     "Preferências de Ultron BR não podem vazar para JARVIS")
+        mgr.selectPersona(.ultronBR)
+        precondition(abs(mgr.config.design.metallicIntensity - 0.30) < 0.01 && abs(mgr.config.design.outputVolume - 1.12) < 0.01,
+                     "Preferências de Ultron BR devem persistir individualmente")
+
+        // StreamingSincResampler 44.1k -> 24k chunked continuity + VoiceStudioDSPProcessor soft limiter
+        let resampler = StreamingSincResampler(fromSampleRate: 44_100, toSampleRate: 24_000)
+        let sine44 = (0..<4410).map { Float(sin(2.0 * Double.pi * 220.0 * Double($0) / 44_100.0) * 0.5) }
+        let p1 = resampler.process(Array(sine44[..<2205]), isFinal: false)
+        let p2 = resampler.process(Array(sine44[2205...]), isFinal: true)
+        let joined24 = p1 + p2
+        precondition(joined24.count > 2200 && joined24.count < 2600)
+        if !p1.isEmpty && !p2.isEmpty {
+            let seamJump = abs(p2[0] - p1[p1.count - 1])
+            precondition(seamJump < 0.15, "StreamingSincResampler não deve gerar salto na emenda (\(seamJump))")
+        }
+
+        let studioDSP = VoiceStudioDSPProcessor(sampleRate: 24_000)
+        let rawWithDC = (0..<4800).map { Float(0.03 + 0.45 * sin(2.0 * Double.pi * 110.0 * Double($0) / 24_000.0)) }
+        let cleaned = studioDSP.process(rawWithDC, parameters: .clean, isFinalChunk: true)
+        let cleanedDC = cleaned.suffix(2400).reduce(0, +) / 2400.0
+        precondition(abs(cleanedDC) < 0.005, "DC blocker limpo deve remover offset DC sem distorção (\(cleanedDC))")
+
+        studioDSP.reset()
+        let ultronOut = studioDSP.process(rawWithDC, parameters: .ultronBRDefault, isFinalChunk: true)
+        let ultronPeak = ultronOut.map { abs($0) }.max() ?? 0
+        precondition(!ultronOut.isEmpty && ultronPeak <= 0.892, "Limiter de estúdio deve prevenir clipping (\(ultronPeak))")
+
+        // Heal legacy JARVIS Supertonic M2 -> M4 & accidental en-GB lock
+        let healSuite = "local.wisdai.voice.v5.heal.\(UUID().uuidString)"
+        let healDefaults = UserDefaults(suiteName: healSuite)!
+        defer { healDefaults.removePersistentDomain(forName: healSuite) }
+        var brokenV5 = UnifiedVoiceConfig.defaultConfig(preferSupertonic: true, preferMaleJarvis: true)
+        brokenV5.speakerId = "supertonic:m2"
+        brokenV5.perVoicePreferences.removeAll()
+        brokenV5.save(to: healDefaults)
+        let healedMgr = VoiceIdentityManager(defaults: healDefaults)
+        precondition(healedMgr.config.speakerId == "supertonic:m4" && healedMgr.activeDSPParameters.isIdentityClean,
+                     "Migração V5.1 deve curar JARVIS de supertonic:m2 para supertonic:m4 limpo")
+
+        // 7. Controller <-> Orchestrator Unified Bridge without AudioEngine stop
         let vc = VoiceController()
         let savedCfg = vc.orchestrator.identityManager.config
         defer { vc.orchestrator.identityManager.updateConfig(invalidateCache: false) { $0 = savedCfg } }
@@ -1324,7 +1380,7 @@ struct VoiceSmokeTests {
         precondition(vc.orchestrator.identityManager.config.vocalGender == .female)
         vc.voiceGender = .male
         precondition(vc.orchestrator.identityManager.config.vocalGender == .male)
-        precondition(vc.orchestrator.identityManager.config.identityId == .jarvis || vc.orchestrator.identityManager.config.identityId == .atlas)
-        print("PASS: V5 Unified VoiceIdentityManager, Live Controller Bridge, Supertonic-3 & JARVIS Male Verification")
+        precondition(vc.orchestrator.identityManager.config.identityId == .jarvis || vc.orchestrator.identityManager.config.identityId == .ultronBR || vc.orchestrator.identityManager.config.identityId == .atlas)
+        print("PASS: V5.1 Unified VoiceIdentityManager, Per-Voice Prefs, JARVIS Fix, Ultron BR DSP & Live Controller Bridge")
     }
 }

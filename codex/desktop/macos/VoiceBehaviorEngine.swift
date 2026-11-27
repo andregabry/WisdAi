@@ -64,6 +64,18 @@ public struct VoicePersonalityProfile: Equatable, Codable, Sendable {
                 directness: 0.68,
                 interactionStyle: "Colaboradora energética e espontânea, ótima para explorar ideias e prototipar."
             )
+        case .ultronBR:
+            return VoicePersonalityProfile(
+                persona: .ultronBR,
+                conversationalWarmth: 0.64,
+                formality: .balanced,
+                energy: 0.66,
+                cadenceRate: 0.94,
+                backchannelFrequency: 0.42,
+                expressivity: .warmAndDynamic,
+                directness: 0.92,
+                interactionStyle: "Inteligência madura, elegante e confiante em PT-BR; combina precisão analítica, pausas teatrais sutis e ironia refinada."
+            )
         }
     }
 }
@@ -681,7 +693,7 @@ public final class ConversationalBehaviorPlanner: @unchecked Sendable {
                 case .enthusiasm:
                     return .interessante
                 case .technicalExplanation where profile.profilePreset == .casual || profile.profilePreset == .expressive:
-                    return persona == .jarvis ? .certo : .olha
+                    return (persona == .jarvis || persona == .ultronBR) ? .certo : .olha
                 default:
                     return nil
                 }

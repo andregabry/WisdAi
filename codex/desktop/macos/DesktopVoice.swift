@@ -1833,7 +1833,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
                 fallback.voice = fallbackVoice
                 fallback.rate = utterance.rate
                 fallback.volume = 1.0
-                fallback.pitchMultiplier = self.voiceGender == .male ? 0.82 : 1.0
+                fallback.pitchMultiplier = 1.0
                 self.activeSpeechUtterance = fallback
                 self.synthesizer.speak(fallback)
             }
@@ -1885,110 +1885,13 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
     }
 
     private func synthesizeAndPlayWithBaritoneTimbre(utterance: AVSpeechUtterance, token: UUID) {
+        // Legacy AVAudioUnitTimePitch (-290 cents) caused severe metallic distortion on male/JARVIS voices.
+        // Route cleanly through natural utterance without destructive pitch shifting.
         teardownPlaybackEngine()
         baritoneWriteWatchdog?.cancel()
-
-        let engine = AVAudioEngine()
-        let playerNode = AVAudioPlayerNode()
-        let timePitch = AVAudioUnitTimePitch()
-        timePitch.pitch = -290
-        timePitch.rate = 1.0
-        timePitch.overlap = 12.0
-
-        engine.attach(playerNode)
-        engine.attach(timePitch)
-        engine.mainMixerNode.outputVolume = 1.0
-        playerNode.volume = 1.0
-        self.playbackEngine = engine
-        self.playbackPlayerNode = playerNode
-        self.playbackTimePitch = timePitch
-
-        var engineConfigured = false
-        var scheduledCount = 0
-        var lastFormat: AVAudioFormat?
-
-        let watchdog = DispatchWorkItem { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.speechToken == token, self.playbackEngine === engine else { return }
-                if self.playbackPlayerNode?.isPlaying != true && self.pendingSentences.isEmpty && self.activeSpeechUtterance == nil {
-                    self.teardownPlaybackEngine()
-                    let fallback = AVSpeechUtterance(string: utterance.speechString)
-                    fallback.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.pt-BR.Luciana") ?? utterance.voice
-                    fallback.rate = utterance.rate
-                    fallback.volume = 1.0
-                    fallback.pitchMultiplier = 0.82
-                    self.speakDirectUtteranceWithWatchdog(fallback, token: token)
-                }
-            }
-        }
-        baritoneWriteWatchdog = watchdog
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: watchdog)
-
-        synthesizer.write(utterance) { [weak self] audioBuffer in
-            guard let pcm = audioBuffer as? AVAudioPCMBuffer else { return }
-            let isEndMarker = (pcm.frameLength == 0)
-            let cloned = isEndMarker ? nil : Self.cloneAsFloat32PCMBuffer(pcm)
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.speechToken == token, self.playbackEngine === engine else { return }
-
-                if isEndMarker {
-                    self.baritoneWriteWatchdog?.cancel()
-                    self.baritoneWriteWatchdog = nil
-                    if scheduledCount == 0 {
-                        self.teardownPlaybackEngine()
-                        let fallback = AVSpeechUtterance(string: utterance.speechString)
-                        fallback.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.pt-BR.Luciana") ?? utterance.voice
-                        fallback.rate = utterance.rate
-                        fallback.volume = 1.0
-                        fallback.pitchMultiplier = 0.82
-                        self.speakDirectUtteranceWithWatchdog(fallback, token: token)
-                        return
-                    }
-                    if let fmt = lastFormat,
-                       let marker = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 1) {
-                        marker.frameLength = 1
-                        marker.floatChannelData?[0][0] = 0
-                        playerNode.scheduleBuffer(marker, completionCallbackType: .dataPlayedBack) { [weak self] _ in
-                            Task { @MainActor [weak self] in
-                                self?.playNextLocalSentence(token: token)
-                            }
-                        }
-                    } else {
-                        self.playNextLocalSentence(token: token)
-                    }
-                    return
-                }
-
-                guard let safePCM = cloned else { return }
-
-                if !engineConfigured {
-                    self.baritoneWriteWatchdog?.cancel()
-                    self.baritoneWriteWatchdog = nil
-                    engine.connect(playerNode, to: timePitch, format: safePCM.format)
-                    engine.connect(timePitch, to: engine.mainMixerNode, format: safePCM.format)
-                    do {
-                        try engine.start()
-                        playerNode.play()
-                        engineConfigured = true
-                        lastFormat = safePCM.format
-                    } catch {
-                        self.teardownPlaybackEngine()
-                        let fallback = AVSpeechUtterance(string: utterance.speechString)
-                        fallback.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.pt-BR.Luciana") ?? utterance.voice
-                        fallback.rate = utterance.rate
-                        fallback.volume = 1.0
-                        fallback.pitchMultiplier = 0.82
-                        self.speakDirectUtteranceWithWatchdog(fallback, token: token)
-                        return
-                    }
-                }
-
-                lastFormat = safePCM.format
-                scheduledCount += 1
-                playerNode.scheduleBuffer(safePCM, completionHandler: nil)
-            }
-        }
+        baritoneWriteWatchdog = nil
+        utterance.pitchMultiplier = 1.0
+        speakDirectUtteranceWithWatchdog(utterance, token: token)
     }
 
     private func playStudioAudioData(_ data: Data, token: UUID) -> Bool {

@@ -387,6 +387,9 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         if cleaned.contains("jarvis") {
             return KokoroVoicePreset.defaultPreset(for: .jarvis, language: language)
         }
+        if cleaned.contains("ultron") {
+            return KokoroVoicePreset.defaultPreset(for: .ultronBR, language: language)
+        }
         if cleaned.contains("mascul") || cleaned.contains("homem") || cleaned.contains("male") || cleaned.contains("atlas") || cleaned.contains("alex") {
             return KokoroVoicePreset.defaultPreset(for: .atlas, language: language)
         }
@@ -826,8 +829,8 @@ public final class SupertonicNeuralTTSProvider: StreamingTextToSpeechProvider, @
                 return SupertonicVoicePreset.defaultPreset(for: persona)
             }
         }
-        if cleaned.contains("jarvis") { return .m2 }
-        if cleaned.contains("atlas") || cleaned.contains("pm_santa") || cleaned.contains("bm_lewis") { return .m5 }
+        if cleaned.contains("jarvis") { return .m4 }
+        if cleaned.contains("ultron") || cleaned.contains("atlas") || cleaned.contains("pm_santa") || cleaned.contains("bm_lewis") { return .m5 }
         if cleaned.contains("pm_alex") || cleaned.contains("bm_") || cleaned.contains("am_") || cleaned.contains("male") || cleaned.contains("homem") {
             return .m4
         }
@@ -1005,13 +1008,14 @@ public final class SupertonicNeuralTTSProvider: StreamingTextToSpeechProvider, @
                         }
                     }
                     let labelState = SupertonicLabelState(text: clean)
+                    let streamResampler = (handles.sampleRate != targetSampleRate)
+                        ? StreamingSincResampler(fromSampleRate: Double(handles.sampleRate), toSampleRate: Double(targetSampleRate))
+                        : nil
                     let ctx = KokoroGenerationContext(
                         sampleRate: handles.sampleRate,
                         cancelCheck: { self.stateLock.withLock { self.cancelledEpoch != startEpoch } },
-                        chunkHandler: { rawSamples, sr in
-                            let converted = (sr != targetSampleRate)
-                                ? AudioPCMConverter.resampleHighQuality(samples: rawSamples, fromSampleRate: Double(sr), toSampleRate: Double(targetSampleRate))
-                                : rawSamples
+                        chunkHandler: { rawSamples, _ in
+                            let converted = streamResampler?.process(rawSamples, isFinal: false) ?? rawSamples
                             guard !converted.isEmpty else { return }
                             onAudioFloats(converted, labelState.claimLabel())
                         }
@@ -1029,15 +1033,25 @@ public final class SupertonicNeuralTTSProvider: StreamingTextToSpeechProvider, @
                     if let audioPtr {
                         defer { handles.fns.destroyAudioFn(audioPtr) }
                         let cancelled = self.stateLock.withLock { self.cancelledEpoch != startEpoch }
-                        if !cancelled && ctx.streamedSamplesCount == 0 {
-                            let audio = audioPtr.assumingMemoryBound(to: SherpaGeneratedAudioC.self).pointee
-                            if audio.n > 0, let ptr = audio.samples {
-                                let raw = Array(UnsafeBufferPointer(start: ptr, count: Int(audio.n)))
-                                let sr = audio.sample_rate > 0 ? Int(audio.sample_rate) : handles.sampleRate
-                                let out = (sr != targetSampleRate)
-                                    ? AudioPCMConverter.resampleHighQuality(samples: raw, fromSampleRate: Double(sr), toSampleRate: Double(targetSampleRate))
-                                    : raw
-                                if !out.isEmpty { onAudioFloats(out, clean) }
+                        if !cancelled {
+                            if ctx.streamedSamplesCount == 0 {
+                                let audio = audioPtr.assumingMemoryBound(to: SherpaGeneratedAudioC.self).pointee
+                                if audio.n > 0, let ptr = audio.samples {
+                                    let raw = Array(UnsafeBufferPointer(start: ptr, count: Int(audio.n)))
+                                    let sr = audio.sample_rate > 0 ? Int(audio.sample_rate) : handles.sampleRate
+                                    let out: [Float]
+                                    if sr != targetSampleRate {
+                                        let singleResampler = StreamingSincResampler(fromSampleRate: Double(sr), toSampleRate: Double(targetSampleRate))
+                                        out = singleResampler.process(raw, isFinal: true)
+                                    } else {
+                                        out = raw
+                                    }
+                                    if !out.isEmpty { onAudioFloats(out, clean) }
+                                }
+                            } else if let streamResampler {
+                                // Flush final Blackman-sinc history tail cleanly without chunk discontinuities
+                                let tail = streamResampler.process([], isFinal: true)
+                                if !tail.isEmpty { onAudioFloats(tail, "") }
                             }
                         }
                     }
@@ -1928,7 +1942,7 @@ public final class LocalExpressiveTTSLoopbackClient: ObservableObject, Streaming
         req.httpMethod = "POST"
         req.timeoutInterval = 20
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
+        var payload: [String: Any] = [
             "model": targetModel,
             "input": clean,
             "voice": voicePreference,
@@ -1936,7 +1950,11 @@ public final class LocalExpressiveTTSLoopbackClient: ObservableObject, Streaming
             "stream": true,
             "response_format": "pcm",
             "lang_code": language.bcp47LanguagePrefix
-        ])
+        ]
+        if voicePreference.lowercased().contains("ultron") {
+            payload["instructions"] = "Mature Brazilian Portuguese male AI voice, deep resonant baritone, calm theatrical elegance, crisp diction, intelligent and subtly ironic."
+        }
+        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:]

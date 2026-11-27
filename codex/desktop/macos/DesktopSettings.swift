@@ -865,9 +865,86 @@ struct VoiceSettingsSection: View {
                     .fill(WisdTheme.divider(colorScheme))
                     .frame(height: 1)
 
+                // Controles acústicos salvos por voz
+                VStack(alignment: .leading, spacing: 8) {
+                    let idMgr = voice.orchestrator.identityManager
+                    let cfg = idMgr.config
+                    HStack {
+                        Text("Ajustes Acústicos Individuais (\(cfg.identityId.shortName))")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Spacer()
+                        Button("Restaurar padrão") {
+                            idMgr.resetPreferences(for: cfg.identityId)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(WisdTheme.softAccentText)
+                    }
+
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Tom: \(String(format: "%+.1f st", cfg.design.toneSemitones))")
+                                .font(.system(size: 11))
+                            Slider(value: Binding(
+                                get: { cfg.design.toneSemitones },
+                                set: { v in idMgr.updateConfig { $0.design.toneSemitones = (v * 10.0).rounded() / 10.0 } }
+                            ), in: -4.0...4.0, step: 0.2)
+                            .tint(WisdTheme.accent)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Intensidade metálica: \(Int((cfg.design.metallicIntensity * 100).rounded()))%")
+                                .font(.system(size: 11))
+                            Slider(value: Binding(
+                                get: { cfg.design.metallicIntensity },
+                                set: { v in idMgr.updateConfig { $0.design.metallicIntensity = v } }
+                            ), in: 0.0...1.0, step: 0.02)
+                            .tint(WisdTheme.accent)
+                        }
+                    }
+
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Ressonância: \(Int((cfg.design.resonance * 100).rounded()))%")
+                                .font(.system(size: 11))
+                            Slider(value: Binding(
+                                get: { cfg.design.resonance },
+                                set: { v in idMgr.updateConfig { $0.design.resonance = v } }
+                            ), in: 0.0...1.0, step: 0.02)
+                            .tint(WisdTheme.accent)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Expressividade: \(Int((cfg.design.expressivityAmount * 100).rounded()))%")
+                                .font(.system(size: 11))
+                            Slider(value: Binding(
+                                get: { cfg.design.expressivityAmount },
+                                set: { v in
+                                    idMgr.updateConfig { next in
+                                        next.design.expressivityAmount = v
+                                        next.design.expressivity = v < 0.30 ? .subtle : (v > 0.70 ? .warmAndDynamic : .balanced)
+                                    }
+                                }
+                            ), in: 0.0...1.0, step: 0.05)
+                            .tint(WisdTheme.accent)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Volume: \(Int((cfg.design.outputVolume * 100).rounded()))%")
+                                .font(.system(size: 11))
+                            Slider(value: Binding(
+                                get: { cfg.design.outputVolume },
+                                set: { v in idMgr.updateConfig { $0.design.outputVolume = v } }
+                            ), in: 0.25...1.50, step: 0.05)
+                            .tint(WisdTheme.accent)
+                        }
+                    }
+                }
+
+                Rectangle()
+                    .fill(WisdTheme.divider(colorScheme))
+                    .frame(height: 1)
+
                 HStack(spacing: 10) {
                     WisdPrimaryButton(
-                        voice.isSpeaking ? "Parar prévia" : "Testar voz (\(voice.voiceGender.displayName))",
+                        voice.isSpeaking ? "Parar prévia" : "Testar voz (\(voice.orchestrator.identityManager.config.identityId.shortName))",
                         icon: voice.isSpeaking ? "stop.fill" : "play.fill"
                     ) {
                         if voice.isSpeaking {

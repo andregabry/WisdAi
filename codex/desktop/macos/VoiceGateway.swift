@@ -1290,9 +1290,9 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
               raw != "auto" else {
             return nil
         }
-        let exactMaleTokens: Set<String> = ["jarvis", "atlas", "male", "homem", "masculino", "masculina", "m1", "m2", "m3", "m4", "m5"]
+        let exactMaleTokens: Set<String> = ["jarvis", "ultron", "ultron_br", "atlas", "male", "homem", "masculino", "masculina", "m1", "m2", "m3", "m4", "m5"]
         let substringMaleTokens = [
-            "persona:jarvis", "persona:atlas", "supertonic:m",
+            "persona:jarvis", "persona:ultron", "persona:atlas", "supertonic:m",
             "pm_alex", "pm_santa", "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
             "am_michael", "am_onyx", "am_fenrir", "am_adam", "am_echo", "am_eric", "am_liam", "am_puck", "am_santa",
             "em_alex", "em_santa",

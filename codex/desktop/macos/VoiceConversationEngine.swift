@@ -149,6 +149,7 @@ public final class ConversationStateMachine: @unchecked Sendable {
 public enum VoicePersonalityStyle: String, CaseIterable, Identifiable, Codable, Sendable {
     case naturalPartner
     case jarvisExecutive
+    case ultronCinematic
     case conciseExecutive
     case calmMentor
     case creativeBrainstorm
@@ -159,6 +160,7 @@ public enum VoicePersonalityStyle: String, CaseIterable, Identifiable, Codable, 
         switch self {
         case .naturalPartner: return "Parceiro Natural (Padrão)"
         case .jarvisExecutive: return "JARVIS · Estrategista Sereno"
+        case .ultronCinematic: return "Ultron BR · Elegância Cinematográfica"
         case .conciseExecutive: return "Direto & Executivo"
         case .calmMentor: return "Calmo & Didático"
         case .creativeBrainstorm: return "Criativo & Exploratório"
@@ -400,6 +402,7 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
             switch personality {
             case .naturalPartner: return "Participate like an attentive human partner: warm, spontaneous, clear, never robotic or overly formal."
             case .jarvisExecutive: return "Embody JARVIS — WisdAI's composed executive voice: lucid, attentive, calm under pressure, articulate, strategically proactive, with occasional understated poise and dry wit, never theatrical, never verbose, and never echoing generic assistant filler."
+            case .ultronCinematic: return "Embody Ultron BR — an original, deeply intelligent, mature, confident Brazilian Portuguese AI persona: eloquent, composed, perceptively ironic with understated dark-wit and quiet satisfaction when solving complex flaws, breathing naturally between ideas, always crisp, never cartoonish or melodramatic."
             case .conciseExecutive: return "Be crisp, concise, and direct without unnecessary filler."
             case .calmMentor: return "Explain concepts calmly, clearly, and naturally step-by-step."
             case .creativeBrainstorm: return "Collaborate energetically, explore angles, and engage conversationally."
