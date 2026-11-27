@@ -282,8 +282,10 @@ public final class LocalConversationalBrain: ObservableObject {
         if preferredEngineKind == .localLlamaCppMetal || preferredEngineKind == .localMLXServer {
             if let ext = externalLocalReadyProvider?(), ext.ready {
                 backendStatus = (preferredEngineKind == .localMLXServer) ? .mlxLocalServerReady : .llamaCppMetalReady
-                return
+            } else {
+                backendStatus = .compactHeuristicFallback
             }
+            return
         }
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {

@@ -150,6 +150,22 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
     @Published public private(set) var brainStatus: LocalBrainBackendStatus = .compactHeuristicFallback
     @Published public private(set) var hasLocalTTSWarmedUp: Bool = false
+    @Published public var selectedTTSEngine: VoiceTTSEngineKind = VoiceTTSEngineKind(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.ttsEngineKind") ?? "") ?? .autoLocal {
+        didSet {
+            UserDefaults.standard.set(selectedTTSEngine.rawValue, forKey: "wisdai.voice.ttsEngineKind")
+            refreshResolvedPipeline()
+        }
+    }
+    @Published public var selectedKokoroPreset: KokoroVoicePreset = KokoroVoicePreset(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") ?? "") ?? .pfDora {
+        didSet {
+            UserDefaults.standard.set(selectedKokoroPreset.rawValue, forKey: "wisdai.voice.kokoroPreset")
+        }
+    }
+    @Published public var executionArchitecture: VoiceExecutionArchitectureMode = VoiceExecutionArchitectureMode(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.executionArchitecture") ?? "") ?? .neuralHybrid {
+        didSet {
+            UserDefaults.standard.set(executionArchitecture.rawValue, forKey: "wisdai.voice.executionArchitecture")
+        }
+    }
     @Published public private(set) var activeTasksSnapshot: [VoiceTaskSummarySnapshot] = []
     @Published public private(set) var componentStatuses: [VoiceComponentKind: VoiceComponentStatusSnapshot] = {
         var dict: [VoiceComponentKind: VoiceComponentStatusSnapshot] = [:]
@@ -178,6 +194,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     public let echoSuppressor: AcousticEchoSuppressor
     public let knowledgeStore: VoiceSQLiteKnowledgeStore
     public let modelAssetManager: VoiceModelAssetManager
+    public let kokoroTTS: KokoroNeuralTTSProvider
+    public let llamaBrainRuntime: LocalLlamaServerBrainRuntime
+    public let mlxBrainRuntime: LocalMLXClientRuntime
+    public let previewPlayer: VoiceAudioPreviewPlayer
     public var memoryPressureWatcher: VoiceMemoryPressureWatcher?
 
     public let appleSTT: AppleSpeechStreamingSTTProvider
@@ -254,7 +274,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         self.localSTT = UnifiedLocalSTTCoordinator()
         self.echoSuppressor = AcousticEchoSuppressor()
         self.knowledgeStore = VoiceSQLiteKnowledgeStore()
-        self.modelAssetManager = VoiceModelAssetManager()
+        let assets = VoiceModelAssetManager()
+        self.modelAssetManager = assets
+        self.kokoroTTS = KokoroNeuralTTSProvider()
+        self.llamaBrainRuntime = LocalLlamaServerBrainRuntime(assetManager: assets)
+        self.mlxBrainRuntime = LocalMLXClientRuntime()
+        self.previewPlayer = VoiceAudioPreviewPlayer()
 
         self.appleSTT = AppleSpeechStreamingSTTProvider()
         self.deepgramSTT = DeepgramStreamingSTTProvider()
@@ -274,9 +299,16 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         self.memoryPressureWatcher = VoiceMemoryPressureWatcher { [weak self] level in
             guard let self, level != .normal else { return }
             self.memoryStore.compactIfNeeded()
-            self.telemetry.log(category: "MemoryPressure", message: "Pressão de memória (\(level.rawValue)): compactação automática aplicada.")
+            if level == .warning || level == .critical {
+                self.kokoroTTS.unload()
+                self.llamaBrainRuntime.unloadModel()
+                self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.kokoroInt8ModelID, state: nil)
+                self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.kokoroFP32ModelID, state: nil)
+            }
+            self.telemetry.log(category: "MemoryPressure", message: "Pressão de memória (\(level.rawValue)): compactação e descarregamento automático aplicados.")
         }
 
+        wireLocalBrainRuntimes()
         wireAudioEngineCallbacks()
         refreshDependencyInventory()
     }
@@ -334,8 +366,19 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             hasCodexAppServer: self.hasCodexAppServerConnected
         )
         resolvedPipeline = next
-        activeBannerNotice = next.advisoryBanner
-        telemetry.setActiveProviderLabel("\(next.activeSTTName) → \(next.activeTTSName)")
+        var activeTTSLabel = next.activeTTSName
+        var banner = next.advisoryBanner
+        if !next.effectiveProvider.isSpeechToSpeech && !next.isUsingPaidCloud {
+            if selectedTTSEngine == .kokoro82M || selectedTTSEngine == .autoLocal {
+                if behavior.languageVariant == .portuguesePT && selectedTTSEngine == .kokoro82M {
+                    banner = "Kokoro-82M não suporta Português Europeu (pt-PT) nativo; utilizando Apple Natural."
+                } else if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
+                    activeTTSLabel = "Kokoro-82M Neural (\(selectedKokoroPreset.rawValue))"
+                }
+            }
+        }
+        activeBannerNotice = banner
+        telemetry.setActiveProviderLabel("\(next.activeSTTName) → \(activeTTSLabel)")
         updateComponentStatus(
             .agentOrchestrator,
             state: self.hasCodexAppServerConnected ? .ready : .idle,
@@ -378,6 +421,13 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     // MARK: - Session Lifecycle
 
     public func effectiveTTSVoicePreference() -> String {
+        let activeProvider = selectActiveTTSProvider()
+        if activeProvider.providerID == kokoroTTS.providerID {
+            if selectedKokoroPreset.supportedLanguage == behavior.languageVariant {
+                return selectedKokoroPreset.rawValue
+            }
+            return "persona:\(voiceIdentity.persona.rawValue)"
+        }
         if selectedVoiceIdentifier != "auto", !selectedVoiceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return selectedVoiceIdentifier
         }
@@ -508,24 +558,69 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             }
         }
 
-        // Silent parallel warmups (ANE FoundationModels + speechsynthesisd in-memory warm)
+        // Silent parallel warmups (ANE FoundationModels / Local Brain + Kokoro / speechsynthesisd)
         let llmT0 = DispatchTime.now().uptimeNanoseconds
         let instructions = buildLocalBrainInstructions(for: behavior.languageVariant)
         localBrain.prewarm(instructions: instructions)
         brainStatus = localBrain.backendStatus
         let llmMs = Double(DispatchTime.now().uptimeNanoseconds &- llmT0) / 1_000_000.0
+        let llmReady = (localBrain.backendStatus != .compactHeuristicFallback)
         updateComponentStatus(
             .llm,
-            state: localBrain.backendStatus == .appleFoundationModelsReady ? .ready : .degraded,
+            state: llmReady ? .ready : .degraded,
             engineOrModel: localBrain.backendStatus.rawValue,
             latencyMs: llmMs,
-            dependencyHint: localBrain.backendStatus == .appleFoundationModelsReady ? nil : "Apple FoundationModels indisponível; respostas gerais locais não estão disponíveis."
+            dependencyHint: llmReady ? nil : (localBrain.lastErrorDetail ?? "Motor conversacional local indisponível.")
         )
 
         let ptVoices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.lowercased().hasPrefix("pt") }
         installedPTVoicesCount = ptVoices.count
-        if let activeVoice = AppleNaturalPCMStreamingTTSProvider.selectBestNaturalVoice(for: behavior.languageVariant, preferredIdentifier: effectiveTTSVoicePreference()) {
-            updateComponentStatus(.tts, state: .ready, engineOrModel: "\(activeVoice.name) (Apple Natural PCM)")
+        let activeTTS = selectActiveTTSProvider()
+        if activeTTS.providerID == kokoroTTS.providerID {
+            let kokoroDiag = kokoroTTS.currentDiagnostics()
+            updateComponentStatus(
+                .tts,
+                state: .ready,
+                engineOrModel: "Kokoro-82M Neural (\(selectedKokoroPreset.rawValue))",
+                latencyMs: kokoroDiag.loadLatencyMs,
+                lastError: kokoroDiag.lastError
+            )
+            let langNow = behavior.languageVariant
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let installedID = self.kokoroTTS.resolveInstalledPaths()?.modelID
+                if let installedID {
+                    self.modelAssetManager.setRuntimeActivity(modelID: installedID, state: .loading)
+                }
+                do {
+                    let diag = try await self.kokoroTTS.preload(language: langNow)
+                    self.hasLocalTTSWarmedUp = true
+                    if let mid = diag.activeModelID {
+                        self.modelAssetManager.setRuntimeActivity(modelID: mid, state: .operational)
+                    }
+                    self.updateComponentStatus(
+                        .tts,
+                        state: .ready,
+                        engineOrModel: "Kokoro-82M Neural (\(self.selectedKokoroPreset.rawValue))",
+                        latencyMs: diag.loadLatencyMs
+                    )
+                } catch {
+                    if let installedID {
+                        self.modelAssetManager.setRuntimeActivity(modelID: installedID, state: .error, error: error.localizedDescription)
+                    }
+                    self.updateComponentStatus(
+                        .tts,
+                        state: .degraded,
+                        engineOrModel: "Kokoro falhou -> Apple Natural",
+                        lastError: error.localizedDescription
+                    )
+                }
+            }
+        } else if let activeVoice = AppleNaturalPCMStreamingTTSProvider.selectBestNaturalVoice(for: behavior.languageVariant, preferredIdentifier: effectiveTTSVoicePreference()) {
+            let hint = (selectedTTSEngine == .kokoro82M && !kokoroTTS.isReadyOnDisk)
+                ? "Kokoro-82M ainda não instalado no Laboratório de Voz; usando Apple Natural."
+                : ((selectedTTSEngine == .kokoro82M && behavior.languageVariant == .portuguesePT) ? "Kokoro-82M não suporta pt-PT nativo; usando Apple Natural." : nil)
+            updateComponentStatus(.tts, state: .ready, engineOrModel: "\(activeVoice.name) (Apple Natural PCM)", dependencyHint: hint)
         } else {
             updateComponentStatus(
                 .tts,
@@ -535,7 +630,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 dependencyHint: "Instale uma voz em Ajustes do Sistema → Acessibilidade → Conteúdo Falado → Vozes do Sistema."
             )
         }
-        if !hasLocalTTSWarmedUp {
+        if !hasLocalTTSWarmedUp && activeTTS.providerID != kokoroTTS.providerID {
             VoiceTTSWarmupCoordinator.warmupInBackground(
                 provider: appleTTS,
                 language: behavior.languageVariant,
@@ -1547,15 +1642,18 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(floats24k, transcriptText: spanLabel)
                     }
                 } catch {
-                    // Transparent fallback to local clean Apple Natural voice if paid cloud TTS fails.
-                    if tts.requiresPaidOptIn && gateRef.isCurrent(expectedPlayback) {
-                        await MainActor.run {
-                            self.telemetry.log(category: "TTS", message: "Fallback de TTS (\(tts.providerID)): \(error.localizedDescription)")
+                    let isOptionalFallback = tts.requiresPaidOptIn || (selectedTTSEngine == .autoLocal && tts.providerID != appleTTS.providerID)
+                    await MainActor.run {
+                        self.telemetry.log(category: "TTS", message: "Erro/Fallback TTS (\(tts.providerID)): \(error.localizedDescription)")
+                        if tts.providerID == self.kokoroTTS.providerID {
+                            self.updateComponentStatus(.tts, state: .degraded, engineOrModel: "Kokoro falhou -> Apple Natural", lastError: error.localizedDescription)
                         }
+                    }
+                    if isOptionalFallback && gateRef.isCurrent(expectedPlayback) {
                         try? await self.appleTTS.synthesizeChunk(
                             nextChunk.text,
                             language: self.behavior.languageVariant,
-                            voicePreference: self.effectiveTTSVoicePreference(),
+                            voicePreference: "persona:\(self.voiceIdentity.persona.rawValue)",
                             rate: self.effectiveSpeechRate()
                         ) { [weak self] floats24k, spanLabel in
                             guard let self, !Task.isCancelled, gateRef.isCurrent(expectedPlayback) else { return }
@@ -1574,7 +1672,153 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         case .hybridOpenAITTS:
             return openAITTS
         default:
+            break
+        }
+        switch selectedTTSEngine {
+        case .kokoro82M:
+            if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
+                return kokoroTTS
+            }
             return appleTTS
+        case .autoLocal:
+            if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
+                return kokoroTTS
+            }
+            return appleTTS
+        default:
+            return appleTTS
+        }
+    }
+
+    private func wireLocalBrainRuntimes() {
+        localBrain.externalLocalReadyProvider = { [weak self] in
+            guard let self else { return (false, "Indisponível") }
+            switch self.localBrain.preferredEngineKind {
+            case .appleFoundationModels:
+                return (false, "Apple FoundationModels")
+            case .localLlamaCppMetal:
+                return (self.llamaBrainRuntime.isSelectedModelReadyOnDisk, self.llamaBrainRuntime.loadedModelName)
+            case .localMLXServer:
+                return (self.mlxBrainRuntime.isServerReachable, self.mlxBrainRuntime.activeModelName)
+            case .adaptiveAuto:
+                if self.llamaBrainRuntime.isRunning {
+                    return (true, self.llamaBrainRuntime.loadedModelName)
+                }
+                if self.mlxBrainRuntime.isServerReachable {
+                    return (true, self.mlxBrainRuntime.activeModelName)
+                }
+                return (false, "Apple FM / Auto")
+            }
+        }
+
+        localBrain.externalLocalChatHandler = { [weak self] systemPrompt, recentHistory, userText, _, onDelta in
+            guard let self else {
+                throw VoiceGatewayError.cancelled
+            }
+            if self.localBrain.preferredEngineKind == .localMLXServer ||
+                (self.localBrain.preferredEngineKind == .adaptiveAuto && self.mlxBrainRuntime.isServerReachable && !self.llamaBrainRuntime.isRunning) {
+                return try await self.mlxBrainRuntime.streamChatCompletion(
+                    systemPrompt: systemPrompt,
+                    recentHistory: recentHistory,
+                    userText: userText,
+                    onDelta: onDelta
+                )
+            }
+            return try await self.llamaBrainRuntime.streamChatCompletion(
+                systemPrompt: systemPrompt,
+                recentHistory: recentHistory,
+                userText: userText,
+                onDelta: onDelta
+            )
+        }
+        localBrain.refreshBackendAvailability()
+    }
+
+    public func synthesizeAndPreviewVoiceSample(
+        text: String,
+        ttsEngine: VoiceTTSEngineKind,
+        kokoroPreset: KokoroVoicePreset,
+        language: VoiceLanguageVariant,
+        rate: Float? = nil,
+        playAudio: Bool = true,
+        saveToURL: URL? = nil
+    ) async -> (ok: Bool, engineUsed: String, sampleRate: Int, synthMs: Double, wavData: Data?, detail: String) {
+        let adapted = VoiceResponseAdapter.adaptForSpeech(text, profile: behavior, customDictionary: customPronunciation).spokenText
+        let spokenText = adapted.isEmpty ? text : adapted
+        let effectiveRate = rate ?? effectiveSpeechRate()
+
+        if ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && language != .portuguesePT) {
+            if !VoiceTTSEngineKind.kokoro82M.supportsLanguage(language) {
+                return (false, "Kokoro-82M", 24_000, 0, nil, "Kokoro-82M suporta apenas PT-BR, EN-US e ES-ES (pt-PT não suportado nativamente).")
+            }
+            guard kokoroTTS.isReadyOnDisk else {
+                return (false, "Kokoro-82M", 24_000, 0, nil, "Kokoro-82M ainda não está instalado. Autorize e baixe o modelo primeiro.")
+            }
+            do {
+                let res = try await kokoroTTS.synthesizeStandaloneSamples(
+                    text: spokenText,
+                    language: language,
+                    preset: kokoroPreset,
+                    rate: effectiveRate
+                )
+                let wav = CodexVoiceAudioCues.makeWAVContainer(
+                    pcm16Mono: AudioPCMConverter.floatsToPCM16Data(res.samples),
+                    sampleRate: res.sampleRate,
+                    channels: 1
+                )
+                if let saveToURL {
+                    try previewPlayer.saveWAV(samples: res.samples, sampleRate: res.sampleRate, to: saveToURL)
+                }
+                if playAudio {
+                    previewPlayer.playWAVData(wav, label: "Kokoro \(kokoroPreset.rawValue)")
+                }
+                modelAssetManager.setRuntimeActivity(modelID: kokoroTTS.currentDiagnostics().activeModelID ?? VoiceModelCatalog.kokoroInt8ModelID, state: .operational)
+                let durSec = Double(res.samples.count) / Double(res.sampleRate)
+                return (true, "Kokoro-82M (\(kokoroPreset.rawValue))", res.sampleRate, res.synthMs, wav, String(format: "%.2fs gerados em %.0f ms (%d amostras @ 24kHz)", durSec, res.synthMs, res.samples.count))
+            } catch {
+                return (false, "Kokoro-82M", 24_000, 0, nil, error.localizedDescription)
+            }
+        }
+
+        // Apple Natural PCM baseline path
+        final class PreviewSamplesBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var samples: [Float] = []
+            func append(_ floats: [Float]) { lock.withLock { samples.append(contentsOf: floats) } }
+            func snapshot() -> [Float] { lock.withLock { samples } }
+        }
+        let samplesBox = PreviewSamplesBox()
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        do {
+            try await appleTTS.synthesizeChunk(
+                spokenText,
+                language: language,
+                voicePreference: effectiveTTSVoicePreference(),
+                rate: effectiveRate
+            ) { floats, _ in
+                samplesBox.append(floats)
+            }
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+            let all = samplesBox.snapshot()
+            guard !all.isEmpty else {
+                return (false, "Apple Natural PCM", 24_000, elapsed, nil, "Nenhuma amostra gerada pela voz do macOS para \(language.displayName).")
+            }
+            let wav = CodexVoiceAudioCues.makeWAVContainer(
+                pcm16Mono: AudioPCMConverter.floatsToPCM16Data(all),
+                sampleRate: 24_000,
+                channels: 1
+            )
+            if let saveToURL {
+                try previewPlayer.saveWAV(samples: all, sampleRate: 24_000, to: saveToURL)
+            }
+            if playAudio {
+                previewPlayer.playWAVData(wav, label: "Apple Natural (\(language.shortCode))")
+            }
+            let durSec = Double(all.count) / 24_000.0
+            return (true, "Apple Natural PCM", 24_000, elapsed, wav, String(format: "%.2fs gerados em %.0f ms (%d amostras @ 24kHz)", durSec, elapsed, all.count))
+        } catch {
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+            return (false, "Apple Natural PCM", 24_000, elapsed, nil, error.localizedDescription)
         }
     }
 
@@ -1587,6 +1831,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         ttsQueueTask = nil
         queuedSpeechChunks.removeAll()
         speechSegmenter.reset()
+        kokoroTTS.cancelAll()
         appleTTS.cancelAll()
         elevenLabsTTS.cancelAll()
         openAITTS.cancelAll()
@@ -1697,45 +1942,32 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             localBrain.prewarm(instructions: buildLocalBrainInstructions(for: behavior.languageVariant))
             brainStatus = localBrain.backendStatus
             let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+            let ready = brainStatus != .compactHeuristicFallback
             updateComponentStatus(
                 .llm,
-                state: brainStatus == .appleFoundationModelsReady ? .ready : .degraded,
+                state: ready ? .ready : .degraded,
                 engineOrModel: brainStatus.rawValue,
                 latencyMs: ms,
-                dependencyHint: brainStatus == .appleFoundationModelsReady ? nil : "Apple FoundationModels indisponível; respostas gerais locais não estão disponíveis."
+                dependencyHint: ready ? nil : (localBrain.lastErrorDetail ?? "Motor conversacional local indisponível.")
             )
 
         case .tts:
             updateComponentStatus(.tts, state: .initializing, engineOrModel: "Sintetizando amostra…")
-            final class SynthDiagCount: @unchecked Sendable {
-                private let lock = NSLock()
-                var total = 0
-                func add(_ n: Int) { lock.withLock { total += n } }
-            }
-            let counter = SynthDiagCount()
-            let engineRunningNow = audioEngine.isRunning
-            let jitterRef = audioEngine.outputJitterBuffer
-            do {
-                try await appleTTS.synthesizeChunk(
-                    "Teste de voz local WisdAI operacional.",
-                    language: behavior.languageVariant,
-                    voicePreference: effectiveTTSVoicePreference(),
-                    rate: effectiveSpeechRate()
-                ) { floats, span in
-                    counter.add(floats.count)
-                    if engineRunningNow {
-                        _ = jitterRef.pushFloatSamples(floats, transcriptText: span)
-                    }
-                }
-                let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
-                let vName = AppleNaturalPCMStreamingTTSProvider.selectBestNaturalVoice(for: behavior.languageVariant, preferredIdentifier: effectiveTTSVoicePreference())?.name ?? "Apple Voice"
-                let ok = counter.total > 1200
-                updateComponentStatus(.tts, state: ok ? .ready : .error, engineOrModel: "\(vName) (\(counter.total) amostras)", latencyMs: ms)
-                telemetry.log(category: "DiagTTS", message: "TTS gerou \(counter.total) amostras @ 24kHz em \(String(format: "%.0f", ms)) ms.")
-            } catch {
-                let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
-                updateComponentStatus(.tts, state: .error, engineOrModel: "Apple Natural PCM", latencyMs: ms, lastError: error.localizedDescription)
-            }
+            let sample = await synthesizeAndPreviewVoiceSample(
+                text: "Teste de voz WisdAI operacional.",
+                ttsEngine: selectedTTSEngine,
+                kokoroPreset: selectedKokoroPreset,
+                language: behavior.languageVariant,
+                playAudio: audioEngine.isRunning
+            )
+            updateComponentStatus(
+                .tts,
+                state: sample.ok ? .ready : .error,
+                engineOrModel: sample.engineUsed,
+                latencyMs: sample.synthMs,
+                lastError: sample.ok ? nil : sample.detail
+            )
+            telemetry.log(category: "DiagTTS", message: sample.detail)
 
         case .agentOrchestrator:
             refreshResolvedPipeline()
