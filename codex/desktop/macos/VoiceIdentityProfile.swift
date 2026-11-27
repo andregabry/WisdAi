@@ -43,7 +43,7 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
     public var kokoroStyleVectorID: String {
         switch self {
         case .aurora: return "pf_dora"
-        case .atlas: return "pm_santa"
+        case .atlas: return "pm_alex"
         case .aria: return "pf_dora"
         }
     }
@@ -231,12 +231,12 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
         }
     }
 
-    /// Upstream Kokoro espeak-ng language token
+    /// Upstream sherpa-onnx / espeak-ng voice identifiers for kokoro-multi-lang-v1_0
     public var kokoroLangCode: String {
         switch self {
-        case .pfDora, .pmAlex, .pmSanta: return "p"
-        case .afHeart, .afBella, .afNova, .amFenrir, .amMichael: return "a"
-        case .efDora, .emAlex, .emSanta: return "e"
+        case .pfDora, .pmAlex, .pmSanta: return "pt-br"
+        case .afHeart, .afBella, .afNova, .amFenrir, .amMichael: return "en-us"
+        case .efDora, .emAlex, .emSanta: return "es"
         }
     }
 

@@ -141,6 +141,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             if let data = try? JSONEncoder().encode(voiceIdentity) {
                 UserDefaults.standard.set(data, forKey: "wisdai.voice.identity.v1")
             }
+            hasExplicitKokoroPresetOverride = false
+            if let synced = KokoroVoicePreset.defaultPreset(for: voiceIdentity.persona, language: behavior.languageVariant) {
+                isSyncingKokoroFromPersona = true
+                selectedKokoroPreset = synced
+                isSyncingKokoroFromPersona = false
+            }
             VoiceTTSWarmupCoordinator.warmupInBackground(
                 provider: appleTTS,
                 language: behavior.languageVariant,
@@ -158,9 +164,14 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
     @Published public var selectedKokoroPreset: KokoroVoicePreset = KokoroVoicePreset(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") ?? "") ?? .pfDora {
         didSet {
-            UserDefaults.standard.set(selectedKokoroPreset.rawValue, forKey: "wisdai.voice.kokoroPreset")
+            if !isSyncingKokoroFromPersona {
+                hasExplicitKokoroPresetOverride = true
+                UserDefaults.standard.set(selectedKokoroPreset.rawValue, forKey: "wisdai.voice.kokoroPreset")
+            }
         }
     }
+    private var hasExplicitKokoroPresetOverride: Bool = UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") != nil
+    private var isSyncingKokoroFromPersona: Bool = false
     @Published public var executionArchitecture: VoiceExecutionArchitectureMode = VoiceExecutionArchitectureMode(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.executionArchitecture") ?? "") ?? .neuralHybrid {
         didSet {
             UserDefaults.standard.set(executionArchitecture.rawValue, forKey: "wisdai.voice.executionArchitecture")
@@ -423,7 +434,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     public func effectiveTTSVoicePreference() -> String {
         let activeProvider = selectActiveTTSProvider()
         if activeProvider.providerID == kokoroTTS.providerID {
-            if selectedKokoroPreset.supportedLanguage == behavior.languageVariant {
+            if hasExplicitKokoroPresetOverride && selectedKokoroPreset.supportedLanguage == behavior.languageVariant {
                 return selectedKokoroPreset.rawValue
             }
             return "persona:\(voiceIdentity.persona.rawValue)"

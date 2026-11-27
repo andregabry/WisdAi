@@ -296,6 +296,9 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         if cleaned.hasPrefix("persona:") {
             let suffix = String(cleaned.dropFirst("persona:".count))
             if let persona = WisdVoicePersona(rawValue: suffix) {
+                if language == .portugueseBR, let exactStyle = KokoroVoicePreset(rawValue: persona.kokoroStyleVectorID) {
+                    return exactStyle
+                }
                 return KokoroVoicePreset.defaultPreset(for: persona, language: language)
             }
         }
@@ -364,15 +367,19 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         let voicesPath = paths.modelDir.appendingPathComponent("voices.bin").path
         let tokensPath = paths.modelDir.appendingPathComponent("tokens.txt").path
         let dataDirPath = paths.modelDir.appendingPathComponent("espeak-ng-data").path
+        let lexiconUS = paths.modelDir.appendingPathComponent("lexicon-us-en.txt")
 
         var config = SherpaOfflineTtsConfigC()
-        config.model.num_threads = 2
+        config.model.num_threads = 4
         config.model.debug = 0
         config.model.provider = arena.cString("cpu")
         config.model.kokoro.model = arena.cString(paths.modelFile.path)
         config.model.kokoro.voices = arena.cString(voicesPath)
         config.model.kokoro.tokens = arena.cString(tokensPath)
         config.model.kokoro.data_dir = arena.cString(dataDirPath)
+        if langCode == "en-us" && fm.fileExists(atPath: lexiconUS.path) {
+            config.model.kokoro.lexicon = arena.cString(lexiconUS.path)
+        }
         config.model.kokoro.length_scale = 1.0
         config.model.kokoro.lang = arena.cString(langCode)
         config.max_num_sentences = 1

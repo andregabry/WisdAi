@@ -323,9 +323,17 @@ public struct TechnicalPronunciationDictionary: Equatable, Codable, Sendable {
                 "macOS": "Mac O S",
                 "UUID": "U U I D"
             ])
-        case .englishUS, .spanishES:
+        case .englishUS:
             return TechnicalPronunciationDictionary(entries: [
-                "WisdAI": "Wisd A I",
+                "WisdAI": "Wiz D A I",
+                "SQLite": "S Q Lite",
+                "CLI": "C L I",
+                "UI": "U I",
+                "macOS": "Mac O S"
+            ])
+        case .spanishES:
+            return TechnicalPronunciationDictionary(entries: [
+                "WisdAI": "Uisd A I",
                 "SQLite": "S Q Lite",
                 "CLI": "C L I",
                 "UI": "U I",

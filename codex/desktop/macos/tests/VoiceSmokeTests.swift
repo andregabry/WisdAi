@@ -18,6 +18,8 @@ struct VoiceSmokeTests {
         testAcousticEchoSuppressorAndQuarantineFTS5()
         testVoiceIdentityInvarianceAndNewStateMachineStates()
         await testPhase1And2RegressionFixesAndMemoryHygiene()
+        await testV2CatalogConsentStatesAndS2SHonesty()
+        await testV2KokoroNeuralSynthesisAndLlamaCppRuntime()
         await testNativeAudioEngineDeadlockFreeStartStop()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
@@ -610,5 +612,160 @@ struct VoiceSmokeTests {
         precondition(remaining.count == 2 && remaining[0].text.contains("autenticação"), "Histórico legítimo precisa permanecer intacto")
 
         print("PASS: Phase 1 & 2 fixes (routing, echo hangover, honest brain unavailability, trace opt-in, safe memory hygiene)")
+    }
+
+    @MainActor
+    static func testV2CatalogConsentStatesAndS2SHonesty() async {
+        let mgr = VoiceModelAssetManager()
+        mgr.refreshStorageInfo()
+
+        // Consent lock: requesting download must set awaitingConsent WITHOUT downloading automatically
+        mgr.requestDownloadConsent(for: VoiceModelCatalog.gemma3SmallID)
+        precondition(mgr.pendingConsentReason != nil, "Consentimento explícito precisa ser solicitado antes de baixar")
+        precondition(mgr.installStates[VoiceModelCatalog.gemma3SmallID] == .awaitingConsent)
+        mgr.declineConsent()
+        precondition(mgr.pendingConsentReason == nil)
+
+        // Language honesty: Kokoro covers pt-BR / en-US / es-ES, explicitly NOT pt-PT
+        precondition(VoiceTTSEngineKind.kokoro82M.supportsLanguage(.portugueseBR))
+        precondition(!VoiceTTSEngineKind.kokoro82M.supportsLanguage(.portuguesePT))
+        precondition(KokoroNeuralTTSProvider.resolvePreset(language: .portuguesePT, voicePreference: "pf_dora") == nil)
+
+        // Capabilities honesty: no fabricated emotion control & F5-TTS NC license warning present
+        precondition(!VoiceTTSEngineKind.kokoro82M.supportsExplicitEmotionSlider)
+        let f5 = VoiceModelCatalog.descriptor(id: "f5-tts-noncommercial")
+        precondition(f5?.licenseName == "CC-BY-NC-4.0" && f5?.licenseWarning != nil)
+
+        // Hardware profile & S2S gate honesty on Essential 8 GB
+        let s2s8GB = NativeS2SRuntimeProbe.evaluate(hardwareTier: .essential8GB)
+        precondition(!s2s8GB.isSupportedOnThisMac && s2s8GB.blockerReason != nil)
+        print("PASS: V2 catalog states, consent gating, pt-PT honesty, F5-TTS NC warning & S2S hardware gate")
+    }
+
+    @MainActor
+    static func testV2KokoroNeuralSynthesisAndLlamaCppRuntime() async {
+        let mgr = VoiceModelAssetManager()
+        let kokoro = KokoroNeuralTTSProvider()
+        if kokoro.isReadyOnDisk {
+            precondition(mgr.installStates[VoiceModelCatalog.sherpaRuntimeID] == .available)
+            precondition(mgr.installStates[VoiceModelCatalog.kokoroInt8ModelID] == .available)
+
+            // Preload and verify cold load + PT-BR / EN-US / ES-ES synthesis + honest pt-PT rejection
+            do {
+                let diag = try await kokoro.preload(language: .portugueseBR)
+                precondition(diag.isLoaded && diag.sampleRateHz == 24_000 && diag.numSpeakers >= 50)
+                let ptBR = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Olá! O motor neural local do WisdAI está operacional em português do Brasil.",
+                    language: .portugueseBR,
+                    preset: .pfDora,
+                    rate: 1.0
+                )
+                precondition(ptBR.samples.count > 24_000, "Kokoro pt-BR precisa gerar áudio > 1s")
+
+                let ptMale = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Já acionei o Codex em segundo plano. Podemos continuar conversando.",
+                    language: .portugueseBR,
+                    preset: .pmAlex,
+                    rate: 1.0
+                )
+                precondition(ptMale.samples.count > 12_000)
+
+                let enUS = try await kokoro.synthesizeStandaloneSamples(
+                    text: "WisdAI neural voice engine is speaking naturally in English.",
+                    language: .englishUS,
+                    preset: .afHeart,
+                    rate: 1.0
+                )
+                precondition(enUS.samples.count > 12_000)
+
+                let esES = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Hola, el motor neuronal de WisdAI funciona con claridad en español.",
+                    language: .spanishES,
+                    preset: .efDora,
+                    rate: 1.0
+                )
+                precondition(esES.samples.count > 12_000)
+
+                // Mid-synthesis cancel check (barge-in path)
+                final class CancelCountBox: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var count = 0
+                    func add(_ n: Int) { lock.withLock { count += n } }
+                    var total: Int { lock.withLock { count } }
+                }
+                let cancelBox = CancelCountBox()
+                let longSynthTask = Task {
+                    try? await kokoro.synthesizeChunk(
+                        "Primeira frase longa para testar cancelamento durante a geração contínua. Segunda frase adicional para interromper.",
+                        language: .portugueseBR,
+                        voicePreference: KokoroVoicePreset.pfDora.rawValue,
+                        rate: 1.0
+                    ) { floats, _ in cancelBox.add(floats.count) }
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+                kokoro.cancelAll()
+                longSynthTask.cancel()
+                await longSynthTask.value
+                // New synthesis works cleanly after cancellation
+                let afterReset = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Tudo certo.",
+                    language: .portugueseBR,
+                    preset: .pfDora,
+                    rate: 1.0
+                )
+                precondition(!afterReset.samples.isEmpty && cancelBox.total >= 0)
+
+                var ptPTRejected = false
+                do {
+                    try await kokoro.synthesizeChunk("Teste", language: .portuguesePT, voicePreference: "pf_dora", rate: 1.0) { _, _ in }
+                } catch {
+                    ptPTRejected = true
+                }
+                precondition(ptPTRejected, "Kokoro precisa rejeitar honestamente pt-PT")
+                kokoro.unload()
+                print(String(format: "PASS: Real Kokoro-82M neural synthesis (load=%.0fms, ptBR=%.0fms/%d@24kHz, en=%.0fms, es=%.0fms)",
+                             diag.loadLatencyMs ?? 0, ptBR.synthMs, ptBR.samples.count, enUS.synthMs, esES.synthMs))
+            } catch {
+                preconditionFailure("Kokoro instalado falhou na síntese real: \(error)")
+            }
+        } else {
+            print("SKIP_OPTIONAL: Kokoro-82M weights not installed on disk")
+        }
+
+        let llama = LocalLlamaServerBrainRuntime(assetManager: mgr)
+        if llama.isSelectedModelReadyOnDisk {
+            do {
+                let port = try await llama.ensureServerReady(modelID: VoiceModelCatalog.qwen3SmallID)
+                precondition(port > 0 && llama.isRunning)
+                final class DeltaBox: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var count = 0
+                    func inc() { lock.withLock { count += 1 } }
+                    var total: Int { lock.withLock { count } }
+                }
+                let deltas = DeltaBox()
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let reply = try await llama.streamChatCompletion(
+                    systemPrompt: "Responda em português brasileiro em 1 frase curta e objetiva.",
+                    recentHistory: [],
+                    userText: "Qual a vantagem de usar áudio streaming em baixa latência?"
+                ) { chunk in
+                    if !chunk.isEmpty { deltas.inc() }
+                }
+                let totalMs = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+                precondition(!reply.isEmpty && deltas.total > 0 && !reply.contains("<think>"), "Qwen3 via llama.cpp deve responder em streaming sem tags <think> expostas: \(reply)")
+                let loadMs = llama.lastLoadDurationMs ?? 0
+                let ttftMs = llama.lastTTFTMs ?? 0
+                llama.unloadModel()
+                precondition(!llama.isRunning)
+                print(String(format: "PASS: Real llama.cpp Metal + Qwen3-1.7B inference (load=%.0fms, TTFT=%.0fms, total=%.0fms, replyChars=%d)",
+                             loadMs, ttftMs, totalMs, reply.count))
+            } catch {
+                llama.unloadModel()
+                preconditionFailure("llama.cpp Metal instalado falhou na inferência real: \(error)")
+            }
+        } else {
+            print("SKIP_OPTIONAL: llama.cpp / Qwen3 GGUF weights not installed on disk")
+        }
     }
 }
