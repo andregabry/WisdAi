@@ -20,6 +20,7 @@ struct VoiceSmokeTests {
         await testPhase1And2RegressionFixesAndMemoryHygiene()
         await testV2CatalogConsentStatesAndS2SHonesty()
         await testV2KokoroNeuralSynthesisAndLlamaCppRuntime()
+        await testV2ValidationHardeningAndSevenPointTelemetry()
         await testNativeAudioEngineDeadlockFreeStartStop()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
@@ -767,5 +768,82 @@ struct VoiceSmokeTests {
         } else {
             print("SKIP_OPTIONAL: llama.cpp / Qwen3 GGUF weights not installed on disk")
         }
+    }
+
+    @MainActor
+    static func testV2ValidationHardeningAndSevenPointTelemetry() async {
+        // 1. Security hardening checks: loopback restriction, sanitized env, extended redactor & receipt integrity
+        precondition(LocalLlamaServerBrainRuntime.isStrictLoopbackURL(URL(string: "http://127.0.0.1:8080/v1/chat/completions")!))
+        precondition(!LocalLlamaServerBrainRuntime.isStrictLoopbackURL(URL(string: "http://0.0.0.0:8080/v1/chat/completions")!))
+        precondition(!LocalLlamaServerBrainRuntime.isStrictLoopbackURL(URL(string: "https://api.openai.com/v1/chat/completions")!))
+
+        let cleanEnv = LocalLlamaServerBrainRuntime.sanitizedSubprocessEnvironment(
+            dyldLibraryPath: "/tmp/libs",
+            baseEnv: ["PATH": "/usr/bin", "HOME": "/Users/test", "OPENAI_API_KEY": "sk-secret123456789", "GEMINI_API_KEY": "AIzaSySecret123456789"]
+        )
+        precondition(cleanEnv["OPENAI_API_KEY"] == nil && cleanEnv["GEMINI_API_KEY"] == nil)
+        precondition(cleanEnv["DYLD_LIBRARY_PATH"] == "/tmp/libs")
+
+        let redacted = VoiceLogRedactor.redact("Keys: sk-ant-1234567890abcd ghp_1234567890abcdef1234 hf_1234567890abcdef1234")
+        precondition(!redacted.contains("sk-ant-") && !redacted.contains("ghp_") && !redacted.contains("hf_"))
+
+        // 2. Installed models pass cryptographic receipt & tree integrity check
+        let mgr = VoiceModelAssetManager()
+        if let qwen = VoiceModelCatalog.descriptor(id: VoiceModelCatalog.qwen3SmallID), mgr.isModelInstalledOnDisk(qwen) {
+            let integrity = mgr.verifyInstalledIntegrityOnDemand(for: VoiceModelCatalog.llamaRuntimeID)
+            precondition(integrity.ok, "Runtime llama-cpp precisa passar integridade: \(integrity.detail)")
+            let kokoroIntegrity = mgr.verifyInstalledIntegrityOnDemand(for: VoiceModelCatalog.kokoroInt8ModelID)
+            precondition(kokoroIntegrity.ok, "Kokoro INT8 precisa passar integridade: \(kokoroIntegrity.detail)")
+        }
+
+        // 3. Adaptive intelligence escalation parsing & read-only codebase question routing
+        let rawEsc = "Não consigo ler os arquivos diretamente neste modelo. [CONSULTAR_ESPECIALISTA: Listar estrutura de autenticação em somente leitura]"
+        let parsed = LocalConversationalBrain.extractSpecialistEscalation(from: rawEsc)
+        precondition(!parsed.spokenText.contains("CONSULTAR_ESPECIALISTA"))
+        precondition(parsed.specialistQuery?.contains("autenticação") == true)
+
+        let partialEsc = "Vou pedir ajuda agora [CONSULTAR_ESPECIALISTA: Analisando"
+        let cleanPartial = LocalConversationalBrain.sanitizeStreamingControlTags(partialEsc)
+        precondition(!cleanPartial.contains("[") && cleanPartial.contains("Vou pedir ajuda agora"))
+
+        let repoInspect = LocalQueryComplexityAnalyzer.route(
+            utterance: "Quais arquivos existem neste projeto para o motor de voz?",
+            currentLanguage: .portugueseBR
+        )
+        if case .delegateToSpecialist(_, _, let risk, _) = repoInspect {
+            precondition(risk == .low, "Consulta de arquivos do projeto deve ir em modo somente leitura (.low)")
+        } else {
+            preconditionFailure("Pergunta de inspeção do repositório deve escalar em somente leitura")
+        }
+
+        // 4. Filter strips real thread 53C9FCCE Molina/Comendo entries cleanly without deleting history blindly
+        let sampleCont = [
+            CodexContinuityItem(role: "user", text: "Alô como você vai"),
+            CodexContinuityItem(role: "assistant", text: "Alô! Tudo ótimo por aqui!"),
+            CodexContinuityItem(role: "user", text: "Molina"),
+            CodexContinuityItem(role: "assistant", text: "Olá! Parece que você está mencionando o nome \"Molina\"."),
+            CodexContinuityItem(role: "user", text: "Molina. Comendo"),
+            CodexContinuityItem(role: "assistant", text: "Olá, entendi. Posso ajudar com algo sobre comida ou \"Molina\"?"),
+            CodexContinuityItem(role: "user", text: "Molina. Comendo. ."),
+            CodexContinuityItem(role: "assistant", text: "Entendi, você está comendo. Posso ajudar com comida ou \"Molina\"?")
+        ]
+        let cleanedCont = VoiceMemoryHygieneAnalyzer.filterCleanContextItems(sampleCont)
+        precondition(cleanedCont.count == 2)
+        precondition(!cleanedCont.contains(where: { $0.text.lowercased().contains("molina") || $0.text.lowercased().contains("comida") }))
+
+        // 5. 7-checkpoint jitter buffer render & audible interruption tracking
+        let jitter = AdaptiveJitterBuffer(sampleRate: 24_000, maxDurationSeconds: 2.0)
+        jitter.resetForNewResponse()
+        precondition(jitter.firstRenderTimestampNsForResponse() == nil)
+        _ = jitter.pushFloatSamples([Float](repeating: 0.15, count: 4800), transcriptText: "Teste")
+        var scratch = [Float](repeating: 0, count: 512)
+        _ = scratch.withUnsafeMutableBufferPointer { jitter.renderPull(into: $0.baseAddress!, frameCount: 512) }
+        precondition(jitter.firstRenderTimestampNsForResponse() != nil, "Deve registrar timestamp real de primeira renderização CoreAudio")
+        let flushSnap = jitter.flushAndCaptureHeardSnapshot()
+        _ = scratch.withUnsafeMutableBufferPointer { jitter.renderPull(into: $0.baseAddress!, frameCount: 512) }
+        let zeroAfterFlush = jitter.firstSilentRenderAfterFlushTimestampNs(matchingFlush: flushSnap.flushTimestampUptimeNs)
+        precondition(zeroAfterFlush != nil && zeroAfterFlush! >= flushSnap.flushTimestampUptimeNs, "Deve registrar silêncio efetivo no callback de saída pós-flush")
+
+        print("PASS: Security hardening, read-only escalation, Molina filter integrity & 7-stage audio timestamps")
     }
 }

@@ -11,8 +11,14 @@ import SQLite3
 public enum VoiceLogRedactor {
     private static let patterns: [(regex: NSRegularExpression, replacement: String)] = {
         let defs: [(String, String)] = [
+            ("sk-ant-[A-Za-z0-9_-]{8,}", "[REDACTED_ANTHROPIC_KEY]"),
             ("sk-[A-Za-z0-9_-]{8,}", "[REDACTED_OPENAI_KEY]"),
             ("AIza[A-Za-z0-9_-]{12,}", "[REDACTED_GOOGLE_KEY]"),
+            ("ghp_[A-Za-z0-9]{16,}", "[REDACTED_GITHUB_TOKEN]"),
+            ("github_pat_[A-Za-z0-9_]{20,}", "[REDACTED_GITHUB_PAT]"),
+            ("hf_[A-Za-z0-9]{16,}", "[REDACTED_HF_TOKEN]"),
+            ("xox[baprs]-[A-Za-z0-9-]{12,}", "[REDACTED_SLACK_TOKEN]"),
+            ("AKIA[0-9A-Z]{16}", "[REDACTED_AWS_KEY]"),
             ("Bearer\\s+[A-Za-z0-9._\\-]{8,}", "Bearer [REDACTED_TOKEN]"),
             ("Token\\s+[A-Za-z0-9._\\-]{8,}", "Token [REDACTED_TOKEN]"),
             ("xi-api-key[\"':=\\s]+[A-Za-z0-9._\\-]{8,}", "xi-api-key: [REDACTED]"),
@@ -458,6 +464,18 @@ public enum ProcessResourceProbe {
             cpuCoreCount: ProcessInfo.processInfo.activeProcessorCount
         )
     }
+
+    public static func physicalFootprintMB(forPID pid: pid_t) -> Double {
+        guard pid > 0 else { return 0 }
+        var info = rusage_info_current()
+        let rc = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rPtr in
+                proc_pid_rusage(pid, RUSAGE_INFO_V4, rPtr)
+            }
+        }
+        guard rc == 0 else { return 0 }
+        return Double(info.ri_phys_footprint) / (1024.0 * 1024.0)
+    }
 }
 
 public enum VoicePipelineTraceStage: String, CaseIterable, Codable, Sendable {
@@ -486,13 +504,21 @@ public struct VoicePipelineTraceEvent: Identifiable, Equatable, Sendable {
 @MainActor
 public final class VoiceTelemetryRecorder: ObservableObject {
     @Published public private(set) var sttStats: LatencySummaryStats = .empty
+    @Published public private(set) var sttSettlingStats: LatencySummaryStats = .empty
     @Published public private(set) var llmFirstChunkStats: LatencySummaryStats = .empty
+    @Published public private(set) var firstClauseStats: LatencySummaryStats = .empty
     @Published public private(set) var ttsFirstAudioStats: LatencySummaryStats = .empty
+    @Published public private(set) var ttsTotalSynthesisStats: LatencySummaryStats = .empty
+    @Published public private(set) var firstAudiblePlaybackStats: LatencySummaryStats = .empty
+    @Published public private(set) var e2eFromSpeechEndAudibleStats: LatencySummaryStats = .empty
     @Published public private(set) var e2eResponseStats: LatencySummaryStats = .empty
     @Published public private(set) var bargeInStopStats: LatencySummaryStats = .empty
+    @Published public private(set) var bargeInAudibleStopStats: LatencySummaryStats = .empty
     @Published public private(set) var reconnectCount: Int = 0
     @Published public private(set) var activeProviderLabel: String = "Apple Speech + Natural PCM"
     @Published public private(set) var resourceSnapshot: ProcessResourceSnapshot = ProcessResourceProbe.sample()
+    @Published public private(set) var llamaServerMemoryMB: Double = 0
+    @Published public private(set) var totalVoiceStackMemoryMB: Double = ProcessResourceProbe.sample().residentMemoryMB
     @Published public private(set) var diagnosticLogs: [VoiceDiagnosticEvent] = []
     /// Disabled by default per privacy policy; local-only in-memory pipeline trace when explicitly enabled by user.
     @Published public var enablePipelineDiagnosticsTrace: Bool = false {
@@ -505,10 +531,16 @@ public final class VoiceTelemetryRecorder: ObservableObject {
     @Published public private(set) var pipelineTraceEvents: [VoicePipelineTraceEvent] = []
 
     private var sttSamples: [Double] = []
+    private var sttSettlingSamples: [Double] = []
     private var llmSamples: [Double] = []
+    private var firstClauseSamples: [Double] = []
     private var ttsSamples: [Double] = []
+    private var ttsTotalSynthSamples: [Double] = []
+    private var firstAudibleSamples: [Double] = []
+    private var e2eSpeechEndAudibleSamples: [Double] = []
     private var e2eSamples: [Double] = []
     private var bargeInSamples: [Double] = []
+    private var bargeInAudibleSamples: [Double] = []
     private let maxSamples = 64
 
     public init() {}
@@ -541,9 +573,13 @@ public final class VoiceTelemetryRecorder: ObservableObject {
         pipelineTraceEvents.removeAll(keepingCapacity: false)
     }
 
-    public func recordSTTLatency(ms: Double) {
+    public func recordSTTLatency(ms: Double, settlingMs: Double? = nil) {
         appendSample(ms, into: &sttSamples)
         sttStats = LatencySummaryStats.compute(from: sttSamples)
+        if let settlingMs {
+            appendSample(settlingMs, into: &sttSettlingSamples)
+            sttSettlingStats = LatencySummaryStats.compute(from: sttSettlingSamples)
+        }
     }
 
     public func recordLLMFirstChunkLatency(ms: Double) {
@@ -551,9 +587,28 @@ public final class VoiceTelemetryRecorder: ObservableObject {
         llmFirstChunkStats = LatencySummaryStats.compute(from: llmSamples)
     }
 
+    public func recordFirstClauseLatency(ms: Double) {
+        appendSample(ms, into: &firstClauseSamples)
+        firstClauseStats = LatencySummaryStats.compute(from: firstClauseSamples)
+    }
+
     public func recordTTSFirstAudioLatency(ms: Double) {
         appendSample(ms, into: &ttsSamples)
         ttsFirstAudioStats = LatencySummaryStats.compute(from: ttsSamples)
+    }
+
+    public func recordTTSTotalSynthesisLatency(ms: Double) {
+        appendSample(ms, into: &ttsTotalSynthSamples)
+        ttsTotalSynthesisStats = LatencySummaryStats.compute(from: ttsTotalSynthSamples)
+    }
+
+    public func recordFirstAudiblePlaybackLatency(fromCommitMs: Double, fromSpeechEndMs: Double? = nil) {
+        appendSample(fromCommitMs, into: &firstAudibleSamples)
+        firstAudiblePlaybackStats = LatencySummaryStats.compute(from: firstAudibleSamples)
+        if let fromSpeechEndMs {
+            appendSample(fromSpeechEndMs, into: &e2eSpeechEndAudibleSamples)
+            e2eFromSpeechEndAudibleStats = LatencySummaryStats.compute(from: e2eSpeechEndAudibleSamples)
+        }
     }
 
     public func recordEndToEndResponseLatency(ms: Double) {
@@ -564,7 +619,13 @@ public final class VoiceTelemetryRecorder: ObservableObject {
     public func recordBargeInStopLatency(ms: Double) {
         appendSample(ms, into: &bargeInSamples)
         bargeInStopStats = LatencySummaryStats.compute(from: bargeInSamples)
-        log(category: "BargeIn", message: String(format: "Interrupção concluída em %.1f ms", ms))
+        log(category: "BargeIn", message: String(format: "Flush de buffer concluído em %.2f ms", ms))
+    }
+
+    public func recordBargeInAudibleStopLatency(ms: Double) {
+        appendSample(ms, into: &bargeInAudibleSamples)
+        bargeInAudibleStopStats = LatencySummaryStats.compute(from: bargeInAudibleSamples)
+        log(category: "BargeInAudível", message: String(format: "Interrupção efetivamente audível concluída em %.1f ms", ms))
     }
 
     public func recordReconnect(reason: String) {
@@ -572,8 +633,12 @@ public final class VoiceTelemetryRecorder: ObservableObject {
         log(category: "Reconnect", message: reason)
     }
 
-    public func refreshResources() {
-        resourceSnapshot = ProcessResourceProbe.sample()
+    public func refreshResources(llamaServerPID: pid_t? = nil) {
+        let appSnap = ProcessResourceProbe.sample()
+        resourceSnapshot = appSnap
+        let llamaMB = llamaServerPID.map { ProcessResourceProbe.physicalFootprintMB(forPID: $0) } ?? 0
+        llamaServerMemoryMB = llamaMB
+        totalVoiceStackMemoryMB = appSnap.residentMemoryMB + llamaMB
     }
 
     public func log(category: String, message: String) {
@@ -855,6 +920,7 @@ public final class VoiceSQLiteKnowledgeStore: @unchecked Sendable {
 public enum VoiceMemoryContaminationSource: String, Codable, Sendable {
     case continuityStore = "Continuidade de Voz (~/.codex)"
     case knowledgeFTS5 = "Banco FTS5 Local"
+    case chatHistorySQLite = "Histórico do Chat (SQLite)"
 }
 
 public struct VoiceMemoryContaminationCandidate: Identifiable, Equatable, Sendable {
@@ -959,7 +1025,8 @@ public enum VoiceMemoryHygieneAnalyzer {
 
     public static func scan(
         knowledgeStore: VoiceSQLiteKnowledgeStore,
-        continuityStore: CodexRealtimeContinuityStore
+        continuityStore: CodexRealtimeContinuityStore,
+        additionalChatThreads: [(threadID: String, items: [CodexContinuityItem])] = []
     ) -> [VoiceMemoryContaminationCandidate] {
         var candidates: [VoiceMemoryContaminationCandidate] = []
 
@@ -979,7 +1046,23 @@ public enum VoiceMemoryHygieneAnalyzer {
             }
         }
 
-        // 2. Local SQLite FTS5 voice_facts
+        // 2. Chat history SQLite threads (if provided by host workspace/ChatStorage)
+        for (threadID, items) in additionalChatThreads.sorted(by: { $0.threadID < $1.threadID }) {
+            let dirty = detectContaminatedIndices(in: items)
+            for idx in dirty.keys.sorted() {
+                let item = items[idx]
+                candidates.append(VoiceMemoryContaminationCandidate(
+                    id: "chat|\(threadID)|\(idx)|\(item.text.hashValue)",
+                    source: .chatHistorySQLite,
+                    threadOrScope: threadID,
+                    roleOrTier: item.role,
+                    text: item.text,
+                    reason: dirty[idx] ?? "Anomalia estrutural de transcrição"
+                ))
+            }
+        }
+
+        // 3. Local SQLite FTS5 voice_facts
         let facts = knowledgeStore.listAllFacts(limit: 250)
         var seenNorm: [String: Int] = [:]
         for f in facts {
@@ -1016,7 +1099,8 @@ public enum VoiceMemoryHygieneAnalyzer {
     public static func removeReviewedCandidates(
         _ selected: [VoiceMemoryContaminationCandidate],
         knowledgeStore: VoiceSQLiteKnowledgeStore,
-        continuityStore: CodexRealtimeContinuityStore
+        continuityStore: CodexRealtimeContinuityStore,
+        chatHistoryRemover: ((_ threadID: String, _ matchingNormalizedTexts: Set<String>) -> Int)? = nil
     ) -> Int {
         var removedCount = 0
         let ftsIDs = selected
@@ -1028,6 +1112,14 @@ public enum VoiceMemoryHygieneAnalyzer {
         for (threadID, group) in byThread {
             let texts = Set(group.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) })
             removedCount += continuityStore.removeMatchingItems(threadId: threadID, matchingNormalizedTexts: texts)
+        }
+
+        if let chatHistoryRemover {
+            let chatByThread = Dictionary(grouping: selected.filter { $0.source == .chatHistorySQLite }, by: \.threadOrScope)
+            for (threadID, group) in chatByThread {
+                let texts = Set(group.map { normalizeForComparison($0.text) })
+                removedCount += chatHistoryRemover(threadID, texts)
+            }
         }
         return removedCount
     }

@@ -623,7 +623,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         CodexVoiceAudioCues.shared.play(.realtimeStart, enabled: voiceSoundsEnabled)
 
         orchestrator.selectedVoiceIdentifier = (selectedVoiceID != "auto") ? selectedVoiceID : "auto"
-        orchestrator.behavior.speechRate = Float(speechSpeed)
+        speechSpeed = Double(orchestrator.behavior.speechRate)
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.orchestrator.startSessionWithContinuity(

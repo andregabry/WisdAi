@@ -760,6 +760,38 @@ private struct VerifiedAssetReceipt: Codable {
     let verifiedAtISO8601: String
 }
 
+public enum WisdVoiceBuildInfo {
+    public static var version: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.7.1"
+    }
+
+    public static var buildNumber: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "dev"
+    }
+
+    public static var gitCommit: String {
+        (Bundle.main.infoDictionary?["WisdAIGitCommit"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "source"
+    }
+
+    public static var gitBranch: String {
+        (Bundle.main.infoDictionary?["WisdAIGitBranch"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "feature/voice-intelligence-v2"
+    }
+
+    public static var buildTimestamp: String {
+        (Bundle.main.infoDictionary?["WisdAIBuildTimestamp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    public static var shortCommit: String {
+        let c = gitCommit
+        return c.count > 7 ? String(c.prefix(7)) : c
+    }
+
+    public static var summary: String {
+        let base = "WisdAI v\(version) (\(buildNumber)) · \(gitBranch)@\(shortCommit)"
+        return buildTimestamp.isEmpty ? base : "\(base) · \(buildTimestamp)"
+    }
+}
+
 // MARK: - Consent-Gated Downloader, SHA-256 Verifier & Storage Manager
 
 @MainActor
@@ -886,18 +918,77 @@ public final class VoiceModelAssetManager: NSObject, ObservableObject {
         if model.archiveFormat == .builtIn { return true }
         let root = storageRootURL(for: model)
         let receiptURL = root.appendingPathComponent(".wisdai-verified.json")
-        guard FileManager.default.fileExists(atPath: receiptURL.path),
-              let entryURL = entryPointURL(for: model) else {
+        guard let receiptData = try? Data(contentsOf: receiptURL),
+              let receipt = try? JSONDecoder().decode(VerifiedAssetReceipt.self, from: receiptData),
+              receipt.modelID == model.id else {
             return false
         }
-        if FileManager.default.fileExists(atPath: entryURL.path) {
-            return true
+        if let expectedHash = model.expectedSHA256,
+           receipt.sha256.lowercased() != expectedHash.lowercased() {
+            return false
         }
-        // Check recursively for llama-server in case tarball structure nests bin/
-        if model.id == VoiceModelCatalog.llamaRuntimeID {
-            return findBinaryNamed("llama-server", under: root) != nil
+        guard let entryURL = resolvedEntryPointURL(for: model, under: root) else {
+            return false
         }
-        return false
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: entryURL.path),
+              let size = attrs[.size] as? NSNumber,
+              size.int64Value > 0 else {
+            return false
+        }
+        return true
+    }
+
+    private func resolvedEntryPointURL(for model: LocalVoiceModelDescriptor, under root: URL) -> URL? {
+        if let entryURL = entryPointURL(for: model),
+           FileManager.default.fileExists(atPath: entryURL.path),
+           isContained(url: entryURL, within: root) {
+            return entryURL
+        }
+        if model.id == VoiceModelCatalog.llamaRuntimeID,
+           let bin = findBinaryNamed("llama-server", under: root),
+           isContained(url: bin, within: root) {
+            return bin
+        }
+        return nil
+    }
+
+    public func verifyInstalledIntegrityOnDemand(for modelID: String) -> (ok: Bool, detail: String) {
+        guard let model = VoiceModelCatalog.descriptor(id: modelID) else {
+            return (false, "Modelo desconhecido: \(modelID)")
+        }
+        if model.archiveFormat == .builtIn {
+            return (true, "Componente nativo macOS.")
+        }
+        let root = storageRootURL(for: model)
+        let receiptURL = root.appendingPathComponent(".wisdai-verified.json")
+        guard let receiptData = try? Data(contentsOf: receiptURL),
+              let receipt = try? JSONDecoder().decode(VerifiedAssetReceipt.self, from: receiptData),
+              receipt.modelID == model.id else {
+            return (false, "Recibo .wisdai-verified.json ausente ou corrompido para \(model.id).")
+        }
+        if let expectedHash = model.expectedSHA256,
+           receipt.sha256.lowercased() != expectedHash.lowercased() {
+            return (false, "Recibo SHA-256 diverge do catálogo oficial para \(model.id).")
+        }
+        do {
+            try validateExtractedTree(under: root)
+        } catch {
+            return (false, "Validação de árvore/symlinks falhou: \(error.localizedDescription)")
+        }
+        guard let entryURL = resolvedEntryPointURL(for: model, under: root) else {
+            return (false, "Arquivo principal de \(model.id) ausente em \(root.lastPathComponent).")
+        }
+        if model.archiveFormat == .rawFile, let expectedHash = model.expectedSHA256 {
+            do {
+                let actual = try computeSHA256Hex(fileAt: entryURL)
+                guard actual.lowercased() == expectedHash.lowercased() else {
+                    return (false, "SHA-256 do arquivo em disco diverge do esperado.")
+                }
+            } catch {
+                return (false, "Falha ao calcular SHA-256 de \(entryURL.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        return (true, "Integridade verificada (SHA-256 \(receipt.sha256.prefix(12))…).")
     }
 
     public func findBinaryNamed(_ name: String, under directory: URL) -> URL? {
@@ -1061,26 +1152,33 @@ public final class VoiceModelAssetManager: NSObject, ObservableObject {
     private func installVerifiedFile(tempFile: URL, for model: LocalVoiceModelDescriptor, verifiedHash: String) throws {
         let fm = FileManager.default
         let destRoot = storageRootURL(for: model)
-        if fm.fileExists(atPath: destRoot.path) {
-            try fm.removeItem(at: destRoot)
+        let stagingParent = destRoot.deletingLastPathComponent()
+        try fm.createDirectory(at: stagingParent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let stagingRoot = stagingParent.appendingPathComponent(".staging-\(model.id)-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fm.removeItem(at: stagingRoot)
         }
-        try fm.createDirectory(at: destRoot, withIntermediateDirectories: true)
+        try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
 
         switch model.archiveFormat {
         case .rawFile:
-            guard let targetURL = entryPointURL(for: model) else {
+            guard let rel = model.relativeEntryPoint else {
                 throw NSError(domain: "VoiceModelAsset", code: 3, userInfo: [NSLocalizedDescriptionKey: "Caminho de destino inválido."])
             }
+            let targetURL = stagingRoot.appendingPathComponent(rel)
+            try validateSafeRelativePath(rel)
             try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.moveItem(at: tempFile, to: targetURL)
         case .tarBz2, .tarGz:
+            try validateArchiveEntries(archiveURL: tempFile, format: model.archiveFormat)
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
             proc.arguments = model.archiveFormat == .tarBz2
-                ? ["-xjf", tempFile.path, "-C", destRoot.path]
-                : ["-xzf", tempFile.path, "-C", destRoot.path]
+                ? ["--no-same-owner", "--no-same-permissions", "-xjf", tempFile.path, "-C", stagingRoot.path]
+                : ["--no-same-owner", "--no-same-permissions", "-xzf", tempFile.path, "-C", stagingRoot.path]
             let errPipe = Pipe()
             proc.standardError = errPipe
+            proc.standardOutput = FileHandle.nullDevice
             try proc.run()
             proc.waitUntilExit()
             guard proc.terminationStatus == 0 else {
@@ -1089,6 +1187,7 @@ public final class VoiceModelAssetManager: NSObject, ObservableObject {
                     NSLocalizedDescriptionKey: "Falha ao extrair arquivo (\(proc.terminationStatus)): \(errText)"
                 ])
             }
+            try validateExtractedTree(under: stagingRoot)
         case .builtIn, .externalManual:
             break
         }
@@ -1100,7 +1199,113 @@ public final class VoiceModelAssetManager: NSObject, ObservableObject {
             verifiedAtISO8601: ISO8601DateFormatter().string(from: Date())
         )
         let data = try JSONEncoder().encode(receipt)
-        try data.write(to: destRoot.appendingPathComponent(".wisdai-verified.json"), options: [.atomic])
+        try data.write(to: stagingRoot.appendingPathComponent(".wisdai-verified.json"), options: [.atomic])
+
+        if fm.fileExists(atPath: destRoot.path) {
+            try fm.removeItem(at: destRoot)
+        }
+        try fm.moveItem(at: stagingRoot, to: destRoot)
+    }
+
+    private func validateSafeRelativePath(_ relPath: String) throws {
+        let trimmed = relPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("/") else {
+            throw NSError(domain: "VoiceModelAsset", code: 10, userInfo: [
+                NSLocalizedDescriptionKey: "Caminho inválido/absoluto bloqueado por segurança: \(relPath)"
+            ])
+        }
+        let parts = trimmed.split(separator: "/").map(String.init)
+        if parts.contains("..") {
+            throw NSError(domain: "VoiceModelAsset", code: 11, userInfo: [
+                NSLocalizedDescriptionKey: "Path traversal (..) bloqueado no pacote: \(relPath)"
+            ])
+        }
+    }
+
+    private func validateArchiveEntries(archiveURL: URL, format: LocalArchiveFormat) throws {
+        func runTarList(_ flag: String) throws -> String {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+            p.arguments = [flag, archiveURL.path]
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            p.standardOutput = outPipe
+            p.standardError = errPipe
+            try p.run()
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            guard p.terminationStatus == 0, let txt = String(data: outData, encoding: .utf8) else {
+                let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                throw NSError(domain: "VoiceModelAsset", code: 12, userInfo: [
+                    NSLocalizedDescriptionKey: "Falha ao inspecionar cabeçalho do arquivo compactado: \(errText)"
+                ])
+            }
+            return txt
+        }
+
+        // Exact path check (handles spaces safely via `-tf`)
+        let rawPaths = try runTarList(format == .tarBz2 ? "-tjf" : "-tzf")
+        for line in rawPaths.split(whereSeparator: \.isNewline) {
+            try validateArchiveMemberName(String(line))
+        }
+
+        // Entry type & symlink/hardlink target check via `-tvf`
+        let verboseList = try runTarList(format == .tarBz2 ? "-tvjf" : "-tvzf")
+        for rawLine in verboseList.split(whereSeparator: \.isNewline) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            let typeChar = line.first ?? "-"
+            if typeChar == "b" || typeChar == "c" || typeChar == "p" || typeChar == "s" || typeChar == "h" {
+                throw NSError(domain: "VoiceModelAsset", code: 13, userInfo: [
+                    NSLocalizedDescriptionKey: "Entrada especial/hardlink não permitida no arquivo: \(line)"
+                ])
+            }
+            if typeChar == "l", let linkSep = line.range(of: " -> ") {
+                let targetName = String(line[linkSep.upperBound...]).trimmingCharacters(in: .whitespaces)
+                if targetName.hasPrefix("/") || targetName.split(separator: "/").contains("..") {
+                    throw NSError(domain: "VoiceModelAsset", code: 14, userInfo: [
+                        NSLocalizedDescriptionKey: "Symlink inseguro bloqueado no pacote: -> \(targetName)"
+                    ])
+                }
+            }
+        }
+    }
+
+    private func validateArchiveMemberName(_ member: String) throws {
+        var clean = member.trimmingCharacters(in: .whitespacesAndNewlines)
+        while clean.hasPrefix("./") { clean.removeFirst(2) }
+        guard !clean.hasPrefix("/") else {
+            throw NSError(domain: "VoiceModelAsset", code: 15, userInfo: [
+                NSLocalizedDescriptionKey: "Caminho absoluto no arquivo bloqueado: \(member)"
+            ])
+        }
+        if clean.split(separator: "/").contains("..") {
+            throw NSError(domain: "VoiceModelAsset", code: 16, userInfo: [
+                NSLocalizedDescriptionKey: "Path traversal (..) no arquivo bloqueado: \(member)"
+            ])
+        }
+    }
+
+    private func validateExtractedTree(under root: URL) throws {
+        let resolvedRoot = root.resolvingSymlinksInPath().path
+        let fm = FileManager.default
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isSymbolicLinkKey], options: []) else {
+            return
+        }
+        for case let itemURL as URL in en {
+            let resolvedItem = itemURL.resolvingSymlinksInPath().path
+            guard resolvedItem == resolvedRoot || resolvedItem.hasPrefix(resolvedRoot + "/") else {
+                throw NSError(domain: "VoiceModelAsset", code: 17, userInfo: [
+                    NSLocalizedDescriptionKey: "Symlink/arquivo fora do diretório permitido bloqueado: \(itemURL.lastPathComponent)"
+                ])
+            }
+        }
+    }
+
+    private func isContained(url: URL, within root: URL) -> Bool {
+        let resolvedRoot = root.resolvingSymlinksInPath().path
+        let resolvedItem = url.resolvingSymlinksInPath().path
+        return resolvedItem == resolvedRoot || resolvedItem.hasPrefix(resolvedRoot + "/")
     }
 
     public func uninstallModel(id: String) {

@@ -86,7 +86,22 @@ struct VoiceLaboratoryView: View {
         .onAppear {
             assetManager.refreshStorageInfo()
             localBrain.refreshBackendAvailability()
-            telemetry.refreshResources()
+            orchestrator.refreshResolvedPipeline()
+            telemetry.refreshResources(llamaServerPID: llamaRuntime.currentProcessID)
+        }
+        .onChange(of: localBrain.preferredEngineKind) { _, _ in
+            localBrain.refreshBackendAvailability()
+            orchestrator.refreshResolvedPipeline()
+        }
+        .onChange(of: llamaRuntime.selectedModelID) { _, newID in
+            if llamaRuntime.isRunning && llamaRuntime.loadedModelID != newID {
+                llamaRuntime.unloadModel()
+            }
+            localBrain.refreshBackendAvailability()
+            orchestrator.refreshResolvedPipeline()
+        }
+        .onChange(of: orchestrator.selectedTTSEngine) { _, _ in
+            orchestrator.refreshResolvedPipeline()
         }
     }
 
@@ -103,13 +118,16 @@ struct VoiceLaboratoryView: View {
                 Text("Cérebro ativo: \(localBrain.backendStatus.rawValue) · Voz: \(orchestrator.telemetry.activeProviderLabel) · Hardware: \(assetManager.selectedHardwareTier.displayName)")
                     .font(.system(size: 11.5))
                     .foregroundStyle(DesktopStyle.muted)
+                Text(WisdVoiceBuildInfo.summary)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(DesktopStyle.muted.opacity(0.85))
             }
             Spacer()
             Button("Atualizar Status") {
                 assetManager.refreshStorageInfo()
                 localBrain.refreshBackendAvailability()
                 orchestrator.refreshResolvedPipeline()
-                telemetry.refreshResources()
+                telemetry.refreshResources(llamaServerPID: llamaRuntime.currentProcessID)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
@@ -374,6 +392,22 @@ struct VoiceLaboratoryView: View {
                     .controlSize(.small)
                     .disabled(isSynthesizingSample || sampleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
+                    if orchestrator.behavior.languageVariant == .portugueseBR && orchestrator.kokoroTTS.isReadyOnDisk {
+                        Button("Ouvir pf_dora") {
+                            synthesizePresetSample(.pfDora)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isSynthesizingSample)
+
+                        Button("Ouvir pm_alex") {
+                            synthesizePresetSample(.pmAlex)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isSynthesizingSample)
+                    }
+
                     Button("Comparar Kokoro vs Apple") {
                         runComparativeABTest()
                     }
@@ -406,6 +440,12 @@ struct VoiceLaboratoryView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
+                }
+
+                if orchestrator.behavior.languageVariant == .portugueseBR {
+                    Text("Avaliação PT-BR ativa: pf_dora e pm_alex disponíveis para comparação A/B e uso imediato em sessão; seleção final permanece aberta até aprovação.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(DesktopStyle.muted)
                 }
 
                 if let sampleResultMessage {
@@ -497,8 +537,13 @@ struct VoiceLaboratoryView: View {
                                         HStack(spacing: 6) {
                                             if model.category == .llm {
                                                 Button("Selecionar") {
+                                                    if llamaRuntime.isRunning && llamaRuntime.loadedModelID != model.id {
+                                                        llamaRuntime.unloadModel()
+                                                    }
                                                     llamaRuntime.selectedModelID = model.id
                                                     localBrain.preferredEngineKind = .localLlamaCppMetal
+                                                    localBrain.refreshBackendAvailability()
+                                                    orchestrator.refreshResolvedPipeline()
                                                 }
                                                 .buttonStyle(.bordered)
                                                 .controlSize(.mini)
@@ -538,27 +583,26 @@ struct VoiceLaboratoryView: View {
 
     private var telemetryAndTraceSection: some View {
         let res = telemetry.resourceSnapshot
-        let kokoroDiag = orchestrator.kokoroTTS.currentDiagnostics()
 
         return VStack(alignment: .leading, spacing: 10) {
             Text("Métricas Reais de Desempenho & Recursos do Sistema")
                 .font(.system(size: 12.5, weight: .semibold))
 
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                metricTile(title: "STT Latência", value: formatStats(telemetry.sttStats))
-                metricTile(title: "LLM TTFT", value: formatStats(telemetry.llmFirstChunkStats))
-                metricTile(title: "TTS Primeiro Áudio", value: formatStats(telemetry.ttsFirstAudioStats))
-                metricTile(title: "Resposta Fim-a-Fim", value: formatStats(telemetry.e2eResponseStats))
-                metricTile(title: "Parada Barge-In", value: formatStats(telemetry.bargeInStopStats))
-                metricTile(
-                    title: "Kokoro Carga / Síntese",
-                    value: "\(kokoroDiag.loadLatencyMs.map { String(format: "%.0f ms", $0) } ?? "-") / \(kokoroDiag.lastSynthesisMs.map { String(format: "%.0f ms", $0) } ?? "-")"
-                )
+                metricTile(title: "Fim Fala → STT Final", value: formatStats(telemetry.sttStats))
+                metricTile(title: "LLM TTFT (Commit)", value: formatStats(telemetry.llmFirstChunkStats))
+                metricTile(title: "1ª Cláusula Pronta", value: formatStats(telemetry.firstClauseStats))
+                metricTile(title: "TTS 1º Chunk PCM", value: formatStats(telemetry.ttsFirstAudioStats))
+                metricTile(title: "TTS Síntese Total", value: formatStats(telemetry.ttsTotalSynthesisStats))
+                metricTile(title: "1º Áudio Reproduzido", value: formatStats(telemetry.firstAudiblePlaybackStats))
+                metricTile(title: "Fim Fala → Voz Audível", value: formatStats(telemetry.e2eFromSpeechEndAudibleStats))
+                metricTile(title: "Barge-In Flush", value: formatStats(telemetry.bargeInStopStats))
+                metricTile(title: "Barge-In Audível Real", value: formatStats(telemetry.bargeInAudibleStopStats))
             }
 
             HStack(spacing: 12) {
-                Text(String(format: "Processo RAM: %.1f MB · CPU: %.1f%% (%d núcleos) · GPU Metal: %@ (máx %llu MB) · Disco: %.1f GB",
-                            res.residentMemoryMB, res.cpuPercent, res.cpuCoreCount, res.gpuName, res.gpuMaxRecommendedMB, assetManager.availableDiskGB))
+                Text(String(format: "App+Kokoro: %.1f MB · llama-server: %.1f MB · Total Voz: %.1f MB · CPU: %.1f%% (%d núcleos) · GPU Metal: %@ (máx %llu MB) · Disco: %.1f GB",
+                            res.residentMemoryMB, telemetry.llamaServerMemoryMB, telemetry.totalVoiceStackMemoryMB, res.cpuPercent, res.cpuCoreCount, res.gpuName, res.gpuMaxRecommendedMB, assetManager.availableDiskGB))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(DesktopStyle.muted)
             }
@@ -773,6 +817,23 @@ struct VoiceLaboratoryView: View {
         }
     }
 
+    private func synthesizePresetSample(_ preset: KokoroVoicePreset) {
+        isSynthesizingSample = true
+        comparisonSummary = nil
+        Task {
+            let res = await orchestrator.synthesizeAndPreviewVoiceSample(
+                text: sampleText,
+                ttsEngine: .kokoro82M,
+                kokoroPreset: preset,
+                language: .portugueseBR,
+                playAudio: true
+            )
+            sampleResultMessage = "Avaliação \(preset.rawValue): \(res.detail)"
+            lastGeneratedWAV = res.wavData
+            isSynthesizingSample = false
+        }
+    }
+
     private func runComparativeABTest() {
         isSynthesizingSample = true
         Task {
@@ -808,9 +869,11 @@ struct VoiceLaboratoryView: View {
     }
 
     private func scanMemoryHygiene() {
+        let extraThreads = orchestrator.onScanAdditionalChatThreads?() ?? []
         let found = VoiceMemoryHygieneAnalyzer.scan(
             knowledgeStore: orchestrator.knowledgeStore,
-            continuityStore: CodexRealtimeContinuityStore.shared
+            continuityStore: CodexRealtimeContinuityStore.shared,
+            additionalChatThreads: extraThreads
         )
         hygieneCandidates = found
         selectedHygieneIDs = Set(found.map(\.id))
@@ -824,12 +887,15 @@ struct VoiceLaboratoryView: View {
         let removed = VoiceMemoryHygieneAnalyzer.removeReviewedCandidates(
             toRemove,
             knowledgeStore: orchestrator.knowledgeStore,
-            continuityStore: CodexRealtimeContinuityStore.shared
+            continuityStore: CodexRealtimeContinuityStore.shared,
+            chatHistoryRemover: orchestrator.onRemoveAdditionalChatItems
         )
         hygieneStatusMessage = "\(removed) registro(s) contaminado(s) removido(s) com segurança. Histórico legítimo preservado."
+        let extraThreads = orchestrator.onScanAdditionalChatThreads?() ?? []
         let updated = VoiceMemoryHygieneAnalyzer.scan(
             knowledgeStore: orchestrator.knowledgeStore,
-            continuityStore: CodexRealtimeContinuityStore.shared
+            continuityStore: CodexRealtimeContinuityStore.shared,
+            additionalChatThreads: extraThreads
         )
         hygieneCandidates = updated
         selectedHygieneIDs = Set(updated.map(\.id))

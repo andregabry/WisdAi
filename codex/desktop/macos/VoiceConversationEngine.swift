@@ -667,6 +667,10 @@ public final class AcousticVADTracker: @unchecked Sendable {
         }
     }
 
+    public var currentSpeechOnsetUptimeNs: UInt64? {
+        lock.withLock { voiceActiveStartNs }
+    }
+
     public func reset() {
         lock.withLock {
             voiceActiveStartNs = nil
@@ -830,6 +834,7 @@ public struct BargeInOutcome: Equatable, Sendable {
     public let heardAssistantText: String
     public let discardedAssistantTail: String
     public let cancelledBufferedSamples: Int
+    public let flushTimestampUptimeNs: UInt64
 }
 
 @MainActor
@@ -863,7 +868,8 @@ public final class BargeInCoordinator {
             playedMilliseconds: snapshot.playedMilliseconds,
             heardAssistantText: snapshot.heardTranscriptPrefix,
             discardedAssistantTail: snapshot.unplayedTranscriptTail,
-            cancelledBufferedSamples: snapshot.discardedBufferedSamples
+            cancelledBufferedSamples: snapshot.discardedBufferedSamples,
+            flushTimestampUptimeNs: snapshot.flushTimestampUptimeNs
         )
     }
 }

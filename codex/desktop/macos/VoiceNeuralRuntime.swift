@@ -626,6 +626,7 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
     }
 
     private var process: Process?
+    nonisolated(unsafe) private var activePIDForDeinit: pid_t = 0
     private var activePort: UInt16 = 0
     private var idleUnloadTask: Task<Void, Never>?
     private let assetManager: VoiceModelAssetManager
@@ -635,7 +636,35 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
     }
 
     deinit {
-        process?.terminate()
+        if activePIDForDeinit > 0 {
+            kill(activePIDForDeinit, SIGTERM)
+        }
+    }
+
+    public var currentProcessID: pid_t? {
+        guard let proc = process, proc.isRunning else { return nil }
+        return proc.processIdentifier
+    }
+
+    public static func isStrictLoopbackURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "127.0.0.1" || host == "::1"
+    }
+
+    public static func sanitizedSubprocessEnvironment(dyldLibraryPath: String, baseEnv: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var clean: [String: String] = [
+            "PATH": baseEnv["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+            "DYLD_LIBRARY_PATH": dyldLibraryPath
+        ]
+        for key in ["HOME", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL"] {
+            if let val = baseEnv[key], !val.isEmpty {
+                clean[key] = val
+            }
+        }
+        return clean
     }
 
     public var isSelectedModelReadyOnDisk: Bool {
@@ -701,7 +730,7 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
         proc.executableURL = resolved.serverURL
         let ctxSize = assetManager.hardwareProfile == .low8GB ? "2048" : "4096"
         let threads = assetManager.hardwareProfile == .low8GB ? "4" : "6"
-        proc.arguments = [
+        var serverArgs = [
             "-m", resolved.ggufURL.path,
             "--host", "127.0.0.1",
             "--port", "\(port)",
@@ -710,12 +739,14 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
             "--threads", threads,
             "--no-webui"
         ]
-        var env = ProcessInfo.processInfo.environment
-        env["DYLD_LIBRARY_PATH"] = resolved.binDir.path
-        proc.environment = env
+        if resolved.descriptor.id.contains("qwen3") {
+            serverArgs.append(contentsOf: ["--reasoning", "off", "--reasoning-budget", "0"])
+        }
+        proc.arguments = serverArgs
+        proc.environment = Self.sanitizedSubprocessEnvironment(dyldLibraryPath: resolved.binDir.path)
         let errPipe = Pipe()
         proc.standardError = errPipe
-        proc.standardOutput = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
 
         do {
             try proc.run()
@@ -727,6 +758,7 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
         }
 
         self.process = proc
+        self.activePIDForDeinit = proc.processIdentifier
         self.activePort = port
 
         // Poll /health for up to 30 seconds
@@ -764,9 +796,21 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
     public func unloadModel() {
         idleUnloadTask?.cancel()
         idleUnloadTask = nil
-        if let proc = process, proc.isRunning {
-            proc.terminate()
+        if let proc = process {
+            let pid = proc.processIdentifier
+            if proc.isRunning {
+                proc.terminate()
+                let deadline = DispatchTime.now().uptimeNanoseconds + 350_000_000
+                while proc.isRunning && DispatchTime.now().uptimeNanoseconds < deadline {
+                    usleep(20_000)
+                }
+                if proc.isRunning && pid > 0 {
+                    kill(pid, SIGKILL)
+                    proc.waitUntilExit()
+                }
+            }
         }
+        activePIDForDeinit = 0
         process = nil
         activePort = 0
         isRunning = false
@@ -788,11 +832,19 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
     }
 
     private func probeHealth(port: UInt16) async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return false }
+        guard let url = URL(string: "http://127.0.0.1:\(port)/health"),
+              Self.isStrictLoopbackURL(url) else { return false }
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        cfg.urlCache = nil
+        let session = URLSession(configuration: cfg)
+        defer { session.invalidateAndCancel() }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1.0
         do {
-            let (_, resp) = try await URLSession.shared.data(for: req)
+            let (_, resp) = try await session.data(for: req)
             return (resp as? HTTPURLResponse)?.statusCode == 200
         } catch {
             return false
@@ -877,15 +929,23 @@ public final class LocalMLXClientRuntime: ObservableObject {
 
     public func probeAvailability() async -> Bool {
         guard (1024...65535).contains(port),
-              let url = URL(string: "http://127.0.0.1:\(port)/v1/models") else {
+              let url = URL(string: "http://127.0.0.1:\(port)/v1/models"),
+              LocalLlamaServerBrainRuntime.isStrictLoopbackURL(url) else {
             isServerReachable = false
             lastError = "Porta MLX inválida."
             return false
         }
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        cfg.urlCache = nil
+        let session = URLSession(configuration: cfg)
+        defer { session.invalidateAndCancel() }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1.5
         do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await session.data(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 isServerReachable = false
                 lastError = "Servidor MLX loopback não respondeu HTTP 200."
@@ -947,6 +1007,9 @@ private enum OpenAILoopbackSSEClient {
         onTTFT: @escaping @MainActor (Double) -> Void,
         onDelta: @escaping @MainActor (String) -> Void
     ) async throws -> String {
+        guard LocalLlamaServerBrainRuntime.isStrictLoopbackURL(endpointURL) else {
+            throw VoiceGatewayError.protocolError("Bloqueio de segurança: endpoint local deve estar estritamente em loopback 127.0.0.1 / ::1.")
+        }
         var req = URLRequest(url: endpointURL)
         req.httpMethod = "POST"
         req.timeoutInterval = timeoutSeconds
@@ -955,14 +1018,17 @@ private enum OpenAILoopbackSSEClient {
             "model": modelName,
             "messages": messages,
             "stream": true,
-            "temperature": 0.65,
-            "max_tokens": 380
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "max_tokens": 440
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: bodyObj)
 
         let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
         cfg.httpCookieStorage = nil
         cfg.urlCredentialStorage = nil
+        cfg.urlCache = nil
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel() }
 

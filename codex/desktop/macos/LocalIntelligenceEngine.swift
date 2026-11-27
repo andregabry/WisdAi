@@ -90,6 +90,14 @@ public enum LocalQueryComplexityAnalyzer {
         "edit the file", "run tests", "fix the bug"
     ]
 
+    private static let workspaceInspectionPhrases = [
+        "neste projeto", "nesse projeto", "neste repositório", "nesse repositório",
+        "no código do projeto", "no código deste", "no arquivo ", "na classe ",
+        "quais arquivos", "quantos arquivos", "o que tem no arquivo", "consulte o especialista",
+        "consulte um agente", "consulte o agente", "chame um especialista",
+        "in this project", "in this repository", "which files are in", "check with a specialist"
+    ]
+
     private static let conceptualQuestionPrefixes = [
         "o que é ", "o que e ", "o que significa ", "como funciona ", "qual a diferença ",
         "qual é a diferença ", "explique o que ", "por que ", "porque ", "você acha ",
@@ -177,8 +185,9 @@ public enum LocalQueryComplexityAnalyzer {
         // 3. Explicit agent delegation or explicit actionable workspace request (never accidental on mere agent name mention or conceptual chat)
         let agentHint = detectAgentHint(in: lower)
         let hasDirectDelegateVerb = directDelegatePhrases.contains(where: { lower.contains($0) })
-        let isPureConceptualQuestion = conceptualQuestionPrefixes.contains(where: { lower.hasPrefix($0) }) && !hasDirectDelegateVerb
-        let hasWorkspaceAction = !isPureConceptualQuestion && workspaceActionPatterns.contains(where: { lower.contains($0) })
+        let hasWorkspaceInspection = workspaceInspectionPhrases.contains(where: { lower.contains($0) })
+        let isPureConceptualQuestion = conceptualQuestionPrefixes.contains(where: { lower.hasPrefix($0) }) && !hasDirectDelegateVerb && !hasWorkspaceInspection
+        let hasWorkspaceAction = !isPureConceptualQuestion && (workspaceActionPatterns.contains(where: { lower.contains($0) }) || hasWorkspaceInspection)
         let isHighRisk = destructivePatterns.contains(where: { lower.contains($0) })
 
         if hasDirectDelegateVerb || hasWorkspaceAction || isHighRisk {
@@ -259,6 +268,7 @@ public final class LocalConversationalBrain: ObservableObject {
     @Published public var preferredEngineKind: VoiceBrainEngineKind = VoiceBrainEngineKind(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.brainEngineKind") ?? "") ?? .adaptiveAuto {
         didSet {
             UserDefaults.standard.set(preferredEngineKind.rawValue, forKey: "wisdai.voice.brainEngineKind")
+            refreshBackendAvailability()
         }
     }
 
@@ -373,20 +383,36 @@ public final class LocalConversationalBrain: ObservableObject {
         }()
 
         if useExternalFirst, let handler = externalLocalChatHandler {
-            do {
-                backendStatus = (preferredEngineKind == .localMLXServer) ? .mlxLocalServerReady : .llamaCppMetalReady
-                let reply = try await handler(enrichedInstructions, recentTurns, userText, language, onDelta)
-                let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !clean.isEmpty && !Task.isCancelled {
-                    recordOpening(from: clean)
-                    return clean
-                }
-            } catch {
+            for attempt in 0..<2 {
                 if Task.isCancelled { return "" }
-                lastErrorDetail = "Motor local selecionado falhou: \(error.localizedDescription)"
-                if preferredEngineKind != .adaptiveAuto {
-                    refreshBackendAvailability()
-                    return emitUnavailableNotice(language: language, detail: lastErrorDetail, onDelta: onDelta)
+                do {
+                    backendStatus = (preferredEngineKind == .localMLXServer) ? .mlxLocalServerReady : .llamaCppMetalReady
+                    let instructionsForAttempt = attempt == 0 ? enrichedInstructions : systemInstructions
+                    let reply = try await handler(instructionsForAttempt, recentTurns, userText, language, onDelta)
+                    let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !clean.isEmpty && !Task.isCancelled {
+                        recordOpening(from: clean)
+                        return clean
+                    }
+                    if attempt == 0 {
+                        lastErrorDetail = "Resposta vazia transitória do motor local; tentando novamente."
+                        continue
+                    }
+                    lastErrorDetail = "Motor local retornou resposta vazia após nova tentativa."
+                    if preferredEngineKind != .adaptiveAuto {
+                        refreshBackendAvailability()
+                        return emitUnavailableNotice(language: language, detail: lastErrorDetail, onDelta: onDelta)
+                    }
+                } catch {
+                    if Task.isCancelled { return "" }
+                    lastErrorDetail = "Motor local selecionado falhou: \(error.localizedDescription)"
+                    if attempt == 0 {
+                        continue
+                    }
+                    if preferredEngineKind != .adaptiveAuto {
+                        refreshBackendAvailability()
+                        return emitUnavailableNotice(language: language, detail: lastErrorDetail, onDelta: onDelta)
+                    }
                 }
             }
         }
@@ -498,6 +524,36 @@ public final class LocalConversationalBrain: ObservableObject {
             return "Tem uma tarefa ativa agora: \(descriptions)."
         }
         return "Existem \(tasks.count) tarefas em execução: \(descriptions)."
+    }
+
+    public static func sanitizeStreamingControlTags(_ text: String) -> String {
+        if let range = text.range(of: "[CONSULTAR_ESPECIALISTA:", options: .caseInsensitive) {
+            return String(text[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let partialBracket = text.range(of: "[CONSULTAR", options: .caseInsensitive) {
+            return String(text[..<partialBracket.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
+    public static func extractSpecialistEscalation(from rawReply: String) -> (spokenText: String, specialistQuery: String?) {
+        let pattern = "\\[CONSULTAR_ESPECIALISTA:\\s*(.+?)\\]"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return (sanitizeStreamingControlTags(rawReply), nil)
+        }
+        let nsRange = NSRange(rawReply.startIndex..<rawReply.endIndex, in: rawReply)
+        var query: String? = nil
+        if let match = regex.firstMatch(in: rawReply, range: nsRange),
+           match.numberOfRanges >= 2,
+           let qRange = Range(match.range(at: 1), in: rawReply) {
+            let trimmedQ = String(rawReply[qRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedQ.isEmpty {
+                query = trimmedQ
+            }
+        }
+        let clean = regex.stringByReplacingMatches(in: rawReply, options: [], range: nsRange, withTemplate: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (sanitizeStreamingControlTags(clean), query)
     }
 
     private func deterministicNaturalFallback(for input: String, language: VoiceLanguageVariant, errorDetail: String? = nil) -> String {

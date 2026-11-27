@@ -192,6 +192,32 @@ public enum CoreAudioDeviceCatalog {
         return .unavailable
     }
 
+    public static func outputDeviceLatencyMs(deviceID: AudioDeviceID?) -> Double {
+        let targetID: AudioDeviceID = {
+            if let deviceID, deviceID != 0 { return deviceID }
+            return defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice)
+        }()
+        guard targetID != 0 else { return 0 }
+        func uint32Prop(_ selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope) -> UInt32 {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: scope,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var val: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            let status = AudioObjectGetPropertyData(targetID, &addr, 0, nil, &size, &val)
+            return status == noErr ? val : 0
+        }
+        let devLatency = uint32Prop(kAudioDevicePropertyLatency, scope: kAudioDevicePropertyScopeOutput)
+        let safety = uint32Prop(kAudioDevicePropertySafetyOffset, scope: kAudioDevicePropertyScopeOutput)
+        let ioFrames = uint32Prop(kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeOutput)
+        let sr = nominalSampleRate(deviceID: targetID)
+        guard sr > 0 else { return 0 }
+        let totalFrames = Double(devLatency + safety + ioFrames)
+        return (totalFrames / sr) * 1000.0
+    }
+
     private static func stringProperty(deviceID: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
@@ -355,6 +381,21 @@ public struct JitterBufferFlushSnapshot: Equatable, Sendable {
     public let heardTranscriptPrefix: String
     public let unplayedTranscriptTail: String
     public let discardedBufferedSamples: Int
+    public let flushTimestampUptimeNs: UInt64
+
+    public init(
+        playedMilliseconds: Double,
+        heardTranscriptPrefix: String,
+        unplayedTranscriptTail: String,
+        discardedBufferedSamples: Int,
+        flushTimestampUptimeNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        self.playedMilliseconds = playedMilliseconds
+        self.heardTranscriptPrefix = heardTranscriptPrefix
+        self.unplayedTranscriptTail = unplayedTranscriptTail
+        self.discardedBufferedSamples = discardedBufferedSamples
+        self.flushTimestampUptimeNs = flushTimestampUptimeNs
+    }
 }
 
 public enum JitterPushStatus: Equatable, Sendable {
@@ -392,6 +433,10 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
     private var fadeInRemaining: Int = 0
     private var lastRenderedRMS: Float = 0
     private var lastRenderUptimeNs: UInt64 = 0
+    private var hasRecordedFirstRenderForResponse: Bool = false
+    private var firstRenderUptimeNsForResponse: UInt64 = 0
+    private var lastFlushUptimeNs: UInt64 = 0
+    private var firstSilentRenderAfterFlushUptimeNs: UInt64 = 0
 
     public init(sampleRate: Double = 24_000, maxDurationSeconds: Double = 6.0) {
         self.sampleRate = max(8_000, sampleRate)
@@ -483,6 +528,9 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         let prebufferSamples = Int((targetPrebufferMs / 1000.0) * sampleRate)
         if isBuffering {
             if bufferedCount < prebufferSamples && bufferedCount < frameCount {
+                if bufferedCount == 0 && lastFlushUptimeNs > 0 && firstSilentRenderAfterFlushUptimeNs == 0 {
+                    firstSilentRenderAfterFlushUptimeNs = DispatchTime.now().uptimeNanoseconds
+                }
                 os_unfair_lock_unlock(&lock)
                 output.initialize(repeating: 0, count: frameCount)
                 outputLevelOut?.pointee = 0
@@ -499,6 +547,9 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
                 isBuffering = true
             }
             lastRenderedRMS = 0
+            if lastFlushUptimeNs > 0 && firstSilentRenderAfterFlushUptimeNs == 0 {
+                firstSilentRenderAfterFlushUptimeNs = DispatchTime.now().uptimeNanoseconds
+            }
             os_unfair_lock_unlock(&lock)
             output.initialize(repeating: 0, count: frameCount)
             outputLevelOut?.pointee = 0
@@ -534,13 +585,19 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         var rms: Float = 0
         vDSP_rmsqv(output, 1, &rms, vDSP_Length(available))
         lastRenderedRMS = rms
-        lastRenderUptimeNs = DispatchTime.now().uptimeNanoseconds
+        let renderNowNs = DispatchTime.now().uptimeNanoseconds
+        lastRenderUptimeNs = renderNowNs
+        if !hasRecordedFirstRenderForResponse {
+            hasRecordedFirstRenderForResponse = true
+            firstRenderUptimeNsForResponse = renderNowNs
+        }
         os_unfair_lock_unlock(&lock)
         outputLevelOut?.pointee = rms
         return available
     }
 
     public func flushAndCaptureHeardSnapshot() -> JitterBufferFlushSnapshot {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
         os_unfair_lock_lock(&lock)
         let discarded = bufferedCount
         let playedMs = (Double(totalPlayedSamples) / sampleRate) * 1000.0
@@ -551,6 +608,8 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         isBuffering = true
         fadeInRemaining = 0
         lastRenderedRMS = 0
+        lastFlushUptimeNs = nowNs
+        firstSilentRenderAfterFlushUptimeNs = 0
         spans.removeAll(keepingCapacity: false)
         totalQueuedSamples = totalPlayedSamples
         os_unfair_lock_unlock(&lock)
@@ -559,7 +618,8 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
             playedMilliseconds: playedMs,
             heardTranscriptPrefix: heard,
             unplayedTranscriptTail: unplayed,
-            discardedBufferedSamples: discarded
+            discardedBufferedSamples: discarded,
+            flushTimestampUptimeNs: nowNs
         )
     }
 
@@ -577,8 +637,27 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         fadeInRemaining = 0
         lastRenderedRMS = 0
         lastRenderUptimeNs = 0
+        hasRecordedFirstRenderForResponse = false
+        firstRenderUptimeNsForResponse = 0
+        lastFlushUptimeNs = 0
+        firstSilentRenderAfterFlushUptimeNs = 0
         spans.removeAll(keepingCapacity: false)
         os_unfair_lock_unlock(&lock)
+    }
+
+    public func firstRenderTimestampNsForResponse() -> UInt64? {
+        os_unfair_lock_lock(&lock)
+        let ts = hasRecordedFirstRenderForResponse ? firstRenderUptimeNsForResponse : 0
+        os_unfair_lock_unlock(&lock)
+        return ts > 0 ? ts : nil
+    }
+
+    public func firstSilentRenderAfterFlushTimestampNs(matchingFlush flushNs: UInt64) -> UInt64? {
+        os_unfair_lock_lock(&lock)
+        let matches = (lastFlushUptimeNs == flushNs && firstSilentRenderAfterFlushUptimeNs >= flushNs)
+        let ts = matches ? firstSilentRenderAfterFlushUptimeNs : 0
+        os_unfair_lock_unlock(&lock)
+        return ts > 0 ? ts : nil
     }
 
     public var playbackReferenceState: (bufferedMs: Double, renderedRMS: Float, renderAgeMs: Double) {
@@ -1111,6 +1190,11 @@ public final class VoiceNativeAudioEngine: ObservableObject {
     @discardableResult
     public func bargeInFlushPlayback() -> JitterBufferFlushSnapshot {
         return outputJitterBuffer.flushAndCaptureHeardSnapshot()
+    }
+
+    public var currentOutputHardwareLatencyMs: Double {
+        let activeOutID = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID })?.id
+        return CoreAudioDeviceCatalog.outputDeviceLatencyMs(deviceID: activeOutID)
     }
 
     public func telemetrySnapshot() -> AudioEngineRuntimeTelemetry {

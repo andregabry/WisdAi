@@ -36,8 +36,14 @@ if [ -f "$host_binary" ]; then
     codesign --force --sign - "$app/Contents/MacOS/codex-code-mode-host"
 fi
 cp "$source_dir/Info.plist" "$app/Contents/"
+git_commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf 'unknown')
+git_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'unknown')
+build_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+/usr/libexec/PlistBuddy -c "Add :WisdAIGitCommit string $git_commit" "$app/Contents/Info.plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :WisdAIGitCommit $git_commit" "$app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :WisdAIGitBranch string $git_branch" "$app/Contents/Info.plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :WisdAIGitBranch $git_branch" "$app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :WisdAIBuildTimestamp string $build_ts" "$app/Contents/Info.plist" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :WisdAIBuildTimestamp $build_ts" "$app/Contents/Info.plist"
 cp "$source_dir/Resources/"* "$app/Contents/Resources/" 2>/dev/null || true
-cp "$repo/LICENSE" "$repo/NOTICE" "$app/Contents/Resources/"
+cp "$repo/LICENSE" "$repo/NOTICE" "$app/Contents/Resources/" 2>/dev/null || cp "$repo/codex/LICENSE" "$repo/codex/NOTICE" "$app/Contents/Resources/" 2>/dev/null || true
 codesign --force --sign - "$app/Contents/MacOS/codex"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
