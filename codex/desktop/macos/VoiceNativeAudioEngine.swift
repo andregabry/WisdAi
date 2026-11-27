@@ -151,6 +151,9 @@ public enum CoreAudioDeviceCatalog {
             let name = stringProperty(deviceID: devID, selector: kAudioObjectPropertyName) ?? "Dispositivo \(devID)"
             let uid = stringProperty(deviceID: devID, selector: kAudioDevicePropertyDeviceUID) ?? "dev-\(devID)"
             let rate = nominalSampleRate(deviceID: devID)
+            if name.hasPrefix("CADefaultDeviceAggregate") || uid.hasPrefix("CADefaultDeviceAggregate") || !isDeviceAlive(deviceID: devID) || rate <= 0 {
+                return nil
+            }
             let transport = transportKind(deviceID: devID, name: name)
             return AudioDeviceDescriptor(
                 id: devID,
@@ -164,6 +167,21 @@ public enum CoreAudioDeviceCatalog {
                 isDefaultOutput: devID == defaultOut
             )
         }
+    }
+
+    public static func isDeviceAlive(deviceID: AudioDeviceID) -> Bool {
+        guard deviceID != 0 else { return false }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var alive: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &alive) == noErr else {
+            return false
+        }
+        return alive != 0
     }
 
     public static func defaultDeviceID(selector: AudioObjectPropertySelector) -> AudioDeviceID {
@@ -231,21 +249,22 @@ public enum CoreAudioDeviceCatalog {
         return cfStr as String
     }
 
-    private static func nominalSampleRate(deviceID: AudioDeviceID) -> Double {
+    public static func nominalSampleRate(deviceID: AudioDeviceID) -> Double {
+        guard deviceID != 0 else { return 0 }
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var rate: Float64 = 48_000
+        var rate: Float64 = 0
         var size = UInt32(MemoryLayout<Float64>.size)
         guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate) == noErr, rate > 0 else {
-            return 48_000
+            return 0
         }
         return rate
     }
 
-    private static func channelCount(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+    public static func channelCount(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,
             mScope: scope,
@@ -835,12 +854,74 @@ public enum AudioPCMConverter {
     }
 }
 
-// MARK: - Voice Engine Diagnostics & Status
+// MARK: - Voice Engine Diagnostics, Lifecycle Authority & Status
 
 public enum VoiceProcessingHardwareStatus: String, Sendable {
     case activeAECAndNS = "AEC + AGC + Supressão de Ruído Ativos"
     case bypassedBluetoothOrFallback = "Bypass seguro (Bluetooth / Fallback)"
     case inactive = "Inativo"
+}
+
+public enum AudioEngineLifecycleState: String, Codable, Sendable {
+    case idle = "Ocioso"
+    case stopping = "Encerrando"
+    case validatingDevices = "Validando Dispositivos"
+    case waitingHALRecovery = "Aguardando CoreAudio HAL"
+    case preparingGraph = "Configurando Grafo de Áudio"
+    case starting = "Iniciando Motor"
+    case running = "Operacional (VPIO Full-Duplex)"
+    case degradedCompatibility = "Compatibilidade Degradada (AEC Software)"
+    case reconfiguring = "Reconfigurando Rota"
+    case recovering = "Em Recuperação Controlada"
+    case failed = "Falha de Inicialização"
+}
+
+public enum AudioEngineOperationKind: String, Codable, Sendable {
+    case none = "Nenhuma"
+    case validatePermissions = "Validar Permissão de Microfone"
+    case validateDevices = "Validar Dispositivos e Formatos CoreAudio"
+    case teardownPreviousEngine = "Encerrar Motor Anterior"
+    case waitHALReady = "Aguardar Estabilização CoreAudio HAL"
+    case bindAudioUnitDevice = "Aplicar Dispositivo AUHAL"
+    case attachOutputSource = "Conectar AVAudioSourceNode -> MainMixer"
+    case enableVoiceProcessingIO = "Ativar VoiceProcessingIO (AEC Hardware)"
+    case validateEngineFormats = "Validar Formatos dos Nós"
+    case installInputTap = "Instalar Tap de Captura"
+    case prepareEngine = "AVAudioEngine.prepare()"
+    case startEngine = "AVAudioEngine.start()"
+    case installConfigObserver = "Registrar Observador de Configuração"
+    case handleConfigChange = "Processar Mudança de Rota"
+    case splitEngineFallback = "Modo Compatibilidade Separado (In+Out)"
+    case stopEngine = "Parar e Limpar Grafo"
+}
+
+public struct AudioEngineFailureRecord: Equatable, Sendable {
+    public let operation: AudioEngineOperationKind
+    public let domain: String
+    public let osStatus: Int32
+    public let message: String
+    public let timestampISO: String
+
+    public init(operation: AudioEngineOperationKind, error: Error, timestampISO: String = ISO8601DateFormatter().string(from: Date())) {
+        let ns = error as NSError
+        self.operation = operation
+        self.domain = ns.domain
+        self.osStatus = Int32(ns.code)
+        self.message = ns.localizedDescription
+        self.timestampISO = timestampISO
+    }
+
+    public init(operation: AudioEngineOperationKind, domain: String, osStatus: Int32, message: String, timestampISO: String = ISO8601DateFormatter().string(from: Date())) {
+        self.operation = operation
+        self.domain = domain
+        self.osStatus = osStatus
+        self.message = message
+        self.timestampISO = timestampISO
+    }
+
+    public var formattedSummary: String {
+        "[\(operation.rawValue)] \(message) (domain=\(domain), OSStatus=\(osStatus))"
+    }
 }
 
 public struct AudioEngineRuntimeTelemetry: Equatable, Sendable {
@@ -858,9 +939,22 @@ public struct AudioEngineRuntimeTelemetry: Equatable, Sendable {
     public let outputTargetPrebufferMs: Double
     public let recoveryCount: Int
     public let lastFaultDescription: String?
+    public let lifecycleState: AudioEngineLifecycleState
+    public let audioUnitState: String
+    public let inputSampleRateHz: Double
+    public let inputChannels: Int
+    public let outputSampleRateHz: Double
+    public let outputChannels: Int
+    public let vpioActive: Bool
+    public let tapInstalled: Bool
+    public let nodeGraphSummary: String
+    public let lastOperation: AudioEngineOperationKind
+    public let lastFailure: AudioEngineFailureRecord?
+    public let restartCount: Int
+    public let isSplitEngineCompatibility: Bool
 }
 
-// MARK: - Full-Duplex Native Audio Engine (CoreAudio + AVAudioEngine)
+// MARK: - Single Serialized Authority for Full-Duplex Native Audio Engine (CoreAudio + AVAudioEngine)
 
 @MainActor
 public final class VoiceNativeAudioEngine: ObservableObject {
@@ -873,6 +967,15 @@ public final class VoiceNativeAudioEngine: ObservableObject {
     @Published public private(set) var systemMicrophoneMode: SystemMicrophoneIsolationMode = .standard
     @Published public private(set) var liveLevels: CodexOrbAudioLevels = .zero
     @Published public private(set) var lastFault: String?
+    @Published public private(set) var lifecycleState: AudioEngineLifecycleState = .idle
+    @Published public private(set) var lastOperation: AudioEngineOperationKind = .none
+    @Published public private(set) var lastFailure: AudioEngineFailureRecord?
+    @Published public private(set) var activeVPIOEnabled: Bool = false
+    @Published public private(set) var isTapInstalled: Bool = false
+    @Published public private(set) var attachedNodeGraphSummary: String = "Inativo (sem nós)"
+    @Published public private(set) var audioUnitStateSummary: String = "Não inicializado"
+    @Published public private(set) var restartCount: Int = 0
+    @Published public private(set) var isUsingSplitEngineFallback: Bool = false
 
     public let memoryProfile: HardwareMemoryProfile
     public let captureRingBuffer: PreallocatedFloatRingBuffer
@@ -886,18 +989,36 @@ public final class VoiceNativeAudioEngine: ObservableObject {
     public var onDeviceTopologyChanged: (() -> Void)?
 
     private var engine: AVAudioEngine?
+    private var splitCaptureEngine: AVAudioEngine?
     private var outputSourceNode: AVAudioSourceNode?
     private var configObserver: NSObjectProtocol?
+    private var splitCaptureConfigObserver: NSObjectProtocol?
     private var deviceListenerInstalled = false
     private var recoveryCount = 0
     private var vpioUnsupportedRoutes: Set<String> = []
     private var wantCapture = false
     private var wantPlayback = false
     private var wantVoiceProcessing = true
-    private var pendingReconnectWorkItem: DispatchWorkItem?
+
+    // Serialized lifecycle authority state (prevents concurrent start/stop/reset/recovery races)
+    private var lifecycleGeneration: UInt64 = 0
+    private var captureCallbackGeneration: UInt64 = 0
+    private var activeEngineHasTap = false
+    private var activeEngineHasVPIO = false
+    private var isApplyingInternalConfiguration = false
+    private var lifecycleTailTask: Task<Void, Never>?
+    private var pendingRecoveryTask: Task<Void, Never>?
+    private var recentRecoveryUptimeNs: [UInt64] = []
+    private var lastVPIOTeardownUptimeNs: UInt64 = 0
+    private var measuredInputRateHz: Double = 0
+    private var measuredInputChannels: Int = 0
+    private var measuredOutputRateHz: Double = 0
+    private var measuredOutputChannels: Int = 0
 
     private let processingQueue = DispatchQueue(label: "local.wisdai.voice.audio.dsp", qos: .userInteractive)
     private let renderOutputRate: Double = 24_000
+    private let maxAutoRecoveriesInWindow = 3
+    private let recoveryWindowNs: UInt64 = 12_000_000_000
 
     public init(memoryProfile: HardwareMemoryProfile = .detect()) {
         self.memoryProfile = memoryProfile
@@ -921,9 +1042,18 @@ public final class VoiceNativeAudioEngine: ObservableObject {
         if let obs = configObserver {
             NotificationCenter.default.removeObserver(obs)
         }
+        if let splitObs = splitCaptureConfigObserver {
+            NotificationCenter.default.removeObserver(splitObs)
+        }
     }
 
-    public func refreshDevices() {
+    @discardableResult
+    public func refreshDevices() -> Bool {
+        let prevInUIDs = inputDevices.map(\.uid)
+        let prevOutUIDs = outputDevices.map(\.uid)
+        let prevDefIn = inputDevices.first(where: \.isDefaultInput)?.uid
+        let prevDefOut = outputDevices.first(where: \.isDefaultOutput)?.uid
+
         let all = CoreAudioDeviceCatalog.enumerateDevices()
         inputDevices = all.filter { $0.inputChannels > 0 }
         outputDevices = all.filter { $0.outputChannels > 0 }
@@ -949,19 +1079,28 @@ public final class VoiceNativeAudioEngine: ObservableObject {
                     ?? outputDevices.first?.uid
             }
         }
+
+        let newDefIn = inputDevices.first(where: \.isDefaultInput)?.uid
+        let newDefOut = outputDevices.first(where: \.isDefaultOutput)?.uid
+        return prevInUIDs != inputDevices.map(\.uid)
+            || prevOutUIDs != outputDevices.map(\.uid)
+            || prevDefIn != newDefIn
+            || prevDefOut != newDefOut
     }
 
     public func selectInputDevice(uid: String) {
+        guard !uid.isEmpty, selectedInputDeviceUID != uid else { return }
         selectedInputDeviceUID = uid
-        if isRunning {
-            scheduleEngineRecovery(reason: "Troca de dispositivo de entrada")
+        if isRunning || lifecycleState == .recovering || lifecycleState == .reconfiguring {
+            scheduleEngineRecovery(reason: "Troca de dispositivo de entrada", resetBudget: true)
         }
     }
 
     public func selectOutputDevice(uid: String) {
+        guard !uid.isEmpty, selectedOutputDeviceUID != uid else { return }
         selectedOutputDeviceUID = uid
-        if isRunning {
-            scheduleEngineRecovery(reason: "Troca de dispositivo de saída")
+        if isRunning || lifecycleState == .recovering || lifecycleState == .reconfiguring {
+            scheduleEngineRecovery(reason: "Troca de dispositivo de saída", resetBudget: true)
         }
     }
 
@@ -984,125 +1123,509 @@ public final class VoiceNativeAudioEngine: ObservableObject {
     }
 
     public func startFullDuplex(enableCapture: Bool = true, enablePlayback: Bool = true, enableVoiceProcessing: Bool = true) throws {
+        pendingRecoveryTask?.cancel()
+        pendingRecoveryTask = nil
+        lifecycleGeneration &+= 1
+        let expectedGen = lifecycleGeneration
+        if isRunning {
+            restartCount += 1
+        }
         wantCapture = enableCapture
         wantPlayback = enablePlayback
         wantVoiceProcessing = enableVoiceProcessing
-        stopEngineOnly()
-        refreshDevices()
-
-        let activeOutDev = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID }) ?? outputDevices.first(where: \.isDefaultOutput)
-        let activeInDev = inputDevices.first(where: { $0.uid == selectedInputDeviceUID }) ?? inputDevices.first(where: \.isDefaultInput)
-        let routeKey = "\(activeInDev?.uid ?? "none")|\(activeOutDev?.uid ?? "none")"
-        let isBluetoothRoute = (activeInDev?.isBluetooth == true) || (activeOutDev?.isBluetooth == true)
-        let isVirtualOrContinuity = (activeInDev?.transport == .continuityOrVirtual)
-        let allowVP = enableVoiceProcessing && enableCapture && !isBluetoothRoute && !isVirtualOrContinuity && !vpioUnsupportedRoutes.contains(routeKey)
-
-        do {
-            try configureAndStartEngine(
-                enableCapture: enableCapture,
-                enablePlayback: enablePlayback,
-                tryVoiceProcessing: allowVP,
-                inputDeviceID: activeInDev?.id,
-                outputDeviceID: activeOutDev?.id
-            )
-            if !allowVP && enableVoiceProcessing && vpioUnsupportedRoutes.contains(routeKey) {
-                lastFault = "AEC hardware VPIO indisponível neste hardware; supressão acústica por software ativa."
-            } else {
-                lastFault = nil
-            }
-        } catch {
-            if allowVP {
-                vpioUnsupportedRoutes.insert(routeKey)
-                let firstError = error.localizedDescription
-                do {
-                    try configureAndStartEngine(
-                        enableCapture: enableCapture,
-                        enablePlayback: enablePlayback,
-                        tryVoiceProcessing: false,
-                        inputDeviceID: activeInDev?.id,
-                        outputDeviceID: activeOutDev?.id
-                    )
-                    lastFault = "AEC hardware indisponível (\(firstError)); supressão acústica por software ativa."
-                } catch {
-                    lastFault = "Falha primária VPIO (\(firstError)) e falha padrão (\(error.localizedDescription))."
-                    throw error
-                }
-            } else {
-                lastFault = error.localizedDescription
-                throw error
-            }
-        }
+        try performStartupSequenceSync(
+            enableCapture: enableCapture,
+            enablePlayback: enablePlayback,
+            enableVoiceProcessing: enableVoiceProcessing,
+            expectedGeneration: expectedGen
+        )
     }
 
-    /// Non-blocking async startup that awaits CoreAudio HAL output format recovery (~430ms after any VPIO teardown)
-    /// without ever blocking the Main Thread.
+    /// Serialized non-blocking startup that enforces single lifecycle ownership,
+    /// pre-validates CoreAudio devices & formats, awaits HAL recovery safely,
+    /// fixes VPIO graph order, and degrades cleanly to split-engine compatibility when required.
     public func startFullDuplexAsync(enableCapture: Bool = true, enablePlayback: Bool = true, enableVoiceProcessing: Bool = true) async throws {
-        wantCapture = enableCapture
-        wantPlayback = enablePlayback
-        wantVoiceProcessing = enableVoiceProcessing
-        stopEngineOnly()
-        refreshDevices()
-
-        let activeOutDev = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID }) ?? outputDevices.first(where: \.isDefaultOutput)
-        let activeInDev = inputDevices.first(where: { $0.uid == selectedInputDeviceUID }) ?? inputDevices.first(where: \.isDefaultInput)
-        let routeKey = "\(activeInDev?.uid ?? "none")|\(activeOutDev?.uid ?? "none")"
-        let isBluetoothRoute = (activeInDev?.isBluetooth == true) || (activeOutDev?.isBluetooth == true)
-        let isVirtualOrContinuity = (activeInDev?.transport == .continuityOrVirtual)
-        let allowVP = enableVoiceProcessing && enableCapture && !isBluetoothRoute && !isVirtualOrContinuity && !vpioUnsupportedRoutes.contains(routeKey)
-
-        if enablePlayback {
-            await waitForValidOutputHWFormat(maxWaitMs: 750)
-        }
-
-        do {
-            try configureAndStartEngine(
+        pendingRecoveryTask?.cancel()
+        pendingRecoveryTask = nil
+        lifecycleGeneration &+= 1
+        let myGeneration = lifecycleGeneration
+        try await runSerializedLifecycleOperation { [weak self] in
+            guard let self else { throw CancellationError() }
+            guard self.lifecycleGeneration == myGeneration else { throw CancellationError() }
+            if self.isRunning {
+                self.restartCount += 1
+            }
+            self.wantCapture = enableCapture
+            self.wantPlayback = enablePlayback
+            self.wantVoiceProcessing = enableVoiceProcessing
+            try await self.performStartupSequenceAsync(
                 enableCapture: enableCapture,
                 enablePlayback: enablePlayback,
-                tryVoiceProcessing: allowVP,
-                inputDeviceID: activeInDev?.id,
-                outputDeviceID: activeOutDev?.id
+                enableVoiceProcessing: enableVoiceProcessing,
+                expectedGeneration: myGeneration
             )
-            if !allowVP && enableVoiceProcessing && vpioUnsupportedRoutes.contains(routeKey) {
-                lastFault = "AEC hardware VPIO indisponível nesta rota; supressão acústica por software ativa."
-            } else if !isBluetoothRoute && !isVirtualOrContinuity {
-                lastFault = nil
-            }
-        } catch {
-            if allowVP {
-                vpioUnsupportedRoutes.insert(routeKey)
-                let firstError = error.localizedDescription
-                if enablePlayback {
-                    await waitForValidOutputHWFormat(maxWaitMs: 750)
-                }
-                do {
-                    try configureAndStartEngine(
-                        enableCapture: enableCapture,
-                        enablePlayback: enablePlayback,
-                        tryVoiceProcessing: false,
-                        inputDeviceID: activeInDev?.id,
-                        outputDeviceID: activeOutDev?.id
-                    )
-                    lastFault = "AEC hardware indisponível (\(firstError)); supressão acústica por software ativa."
-                } catch {
-                    lastFault = "Falha primária VPIO (\(firstError)) e falha padrão (\(error.localizedDescription))."
-                    throw error
-                }
-            } else {
-                lastFault = error.localizedDescription
-                throw error
-            }
         }
     }
 
-    private func waitForValidOutputHWFormat(maxWaitMs: Int) async {
-        let steps = max(1, maxWaitMs / 35)
-        for _ in 0..<steps {
-            let probe = AVAudioEngine()
-            let fmt = probe.outputNode.outputFormat(forBus: 0)
-            if fmt.sampleRate > 0 && fmt.channelCount > 0 {
+    private func runSerializedLifecycleOperation(_ work: @escaping @MainActor () async throws -> Void) async throws {
+        let previous = lifecycleTailTask
+        var capturedError: Error?
+        let next = Task { @MainActor in
+            if let previous {
+                _ = await previous.result
+            }
+            do {
+                try await work()
+            } catch {
+                capturedError = error
+            }
+        }
+        lifecycleTailTask = next
+        await next.value
+        if let capturedError {
+            throw capturedError
+        }
+    }
+
+    private func validateHardwarePreconditions(
+        enableCapture: Bool,
+        enablePlayback: Bool
+    ) throws -> (inputDev: AudioDeviceDescriptor?, outputDev: AudioDeviceDescriptor?) {
+        if enableCapture {
+            lastOperation = .validatePermissions
+            guard Self.microphonePermissionAuthorized() else {
+                let err = NSError(
+                    domain: "VoiceNativeAudioEngine",
+                    code: -12937,
+                    userInfo: [NSLocalizedDescriptionKey: "Permissão de microfone macOS não autorizada."]
+                )
+                recordFailure(operation: .validatePermissions, error: err)
+                throw err
+            }
+        }
+
+        lastOperation = .validateDevices
+        lifecycleState = .validatingDevices
+        _ = refreshDevices()
+
+        let activeOutDev = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID }) ?? outputDevices.first(where: \.isDefaultOutput)
+        let activeInDev = inputDevices.first(where: { $0.uid == selectedInputDeviceUID }) ?? inputDevices.first(where: \.isDefaultInput)
+
+        if enableCapture {
+            guard let inDev = activeInDev,
+                  CoreAudioDeviceCatalog.isDeviceAlive(deviceID: inDev.id),
+                  inDev.inputChannels > 0,
+                  CoreAudioDeviceCatalog.nominalSampleRate(deviceID: inDev.id) > 0 else {
+                let err = NSError(
+                    domain: "VoiceNativeAudioEngine",
+                    code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "Nenhum microfone ativo com formato de áudio válido foi encontrado."]
+                )
+                recordFailure(operation: .validateDevices, error: err)
+                throw err
+            }
+        }
+        if enablePlayback {
+            guard let outDev = activeOutDev,
+                  CoreAudioDeviceCatalog.isDeviceAlive(deviceID: outDev.id),
+                  outDev.outputChannels > 0,
+                  CoreAudioDeviceCatalog.nominalSampleRate(deviceID: outDev.id) > 0 else {
+                let err = NSError(
+                    domain: "VoiceNativeAudioEngine",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Nenhum dispositivo de saída de áudio ativo com formato válido foi encontrado."]
+                )
+                recordFailure(operation: .validateDevices, error: err)
+                throw err
+            }
+        }
+        return (activeInDev, activeOutDev)
+    }
+
+    private func recordFailure(operation: AudioEngineOperationKind, error: Error) {
+        let rec = AudioEngineFailureRecord(operation: operation, error: error)
+        lastFailure = rec
+        lastOperation = operation
+        audioUnitStateSummary = "Falha: OSStatus=\(rec.osStatus) em \(operation.rawValue)"
+    }
+
+    private func waitForHALFormatsReady(
+        requireCapture: Bool,
+        requirePlayback: Bool,
+        maxWaitMs: Int,
+        expectedGeneration: UInt64
+    ) async throws {
+        lastOperation = .waitHALReady
+        lifecycleState = .waitingHALRecovery
+
+        // Check if we recently tore down VPIO (which puts CoreAudio HAL output into 0Hz/0ch transiently)
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        let needsSettleAfterVPIO = lastVPIOTeardownUptimeNs > 0 && (nowNs &- lastVPIOTeardownUptimeNs) < 900_000_000
+
+        let steps = max(1, maxWaitMs / 40)
+        for step in 0..<steps {
+            guard lifecycleGeneration == expectedGeneration, !Task.isCancelled else {
+                throw CancellationError()
+            }
+            if step == 0 && !needsSettleAfterVPIO {
+                if halProbeFormatsValid(requireCapture: requireCapture, requirePlayback: requirePlayback) {
+                    return
+                }
+            } else if step > 0 || !needsSettleAfterVPIO {
+                if halProbeFormatsValid(requireCapture: requireCapture, requirePlayback: requirePlayback) {
+                    return
+                }
+            }
+            try await Task.sleep(nanoseconds: 40_000_000)
+        }
+    }
+
+    private func halProbeFormatsValid(requireCapture: Bool, requirePlayback: Bool) -> Bool {
+        let probe = AVAudioEngine()
+        if requirePlayback {
+            let outFmt = probe.outputNode.outputFormat(forBus: 0)
+            guard outFmt.sampleRate > 0 && outFmt.channelCount > 0 else { return false }
+        }
+        if requireCapture {
+            let inFmt = probe.inputNode.outputFormat(forBus: 0)
+            guard inFmt.sampleRate > 0 && inFmt.channelCount > 0 else { return false }
+        }
+        return true
+    }
+
+    private func performStartupSequenceSync(
+        enableCapture: Bool,
+        enablePlayback: Bool,
+        enableVoiceProcessing: Bool,
+        expectedGeneration: UInt64
+    ) throws {
+        teardownEnginesCleanly()
+        let devs = try validateHardwarePreconditions(enableCapture: enableCapture, enablePlayback: enablePlayback)
+        guard lifecycleGeneration == expectedGeneration else { throw CancellationError() }
+
+        let activeInDev = devs.inputDev
+        let activeOutDev = devs.outputDev
+        let routeKey = "\(activeInDev?.uid ?? "none")|\(activeOutDev?.uid ?? "none")"
+        let isBluetoothRoute = (activeInDev?.isBluetooth == true) || (activeOutDev?.isBluetooth == true)
+        let isVirtualOrContinuity = (activeInDev?.transport == .continuityOrVirtual) || (activeOutDev?.transport == .continuityOrVirtual)
+        let allowVP = enableVoiceProcessing && enableCapture && !isBluetoothRoute && !isVirtualOrContinuity && !vpioUnsupportedRoutes.contains(routeKey)
+
+        if enableCapture && enablePlayback && isVirtualOrContinuity {
+            do {
+                try configureAndStartSplitEngines(
+                    inputDev: activeInDev,
+                    outputDev: activeOutDev,
+                    expectedGeneration: expectedGeneration
+                )
+                lastFault = "Modo de compatibilidade separado (Continuity/Virtual) sem AEC hardware VPIO; supressão acústica por software ativa."
+                return
+            } catch {
+                // Fall through to built-in fallback below
+                try attemptBuiltInFallbackIfDistinct(
+                    failedIn: activeInDev,
+                    failedOut: activeOutDev,
+                    enableCapture: enableCapture,
+                    enablePlayback: enablePlayback,
+                    enableVoiceProcessing: enableVoiceProcessing,
+                    primaryError: error,
+                    expectedGeneration: expectedGeneration
+                )
                 return
             }
-            try? await Task.sleep(nanoseconds: 35_000_000)
+        }
+
+        do {
+            try configureAndStartSingleEngine(
+                enableCapture: enableCapture,
+                enablePlayback: enablePlayback,
+                tryVoiceProcessing: allowVP,
+                inputDeviceID: activeInDev?.id,
+                outputDeviceID: activeOutDev?.id,
+                expectedGeneration: expectedGeneration
+            )
+            lastFailure = nil
+            if !allowVP && enableVoiceProcessing && (isBluetoothRoute || vpioUnsupportedRoutes.contains(routeKey)) {
+                lastFault = "AEC hardware VPIO indisponível nesta rota; modo de compatibilidade com supressão acústica por software ativo."
+            } else {
+                lastFault = nil
+            }
+        } catch {
+            if allowVP {
+                vpioUnsupportedRoutes.insert(routeKey)
+                let firstError = error.localizedDescription
+                teardownEnginesCleanly()
+                Thread.sleep(forTimeInterval: 0.12)
+                do {
+                    try configureAndStartSingleEngine(
+                        enableCapture: enableCapture,
+                        enablePlayback: enablePlayback,
+                        tryVoiceProcessing: false,
+                        inputDeviceID: activeInDev?.id,
+                        outputDeviceID: activeOutDev?.id,
+                        expectedGeneration: expectedGeneration
+                    )
+                    lastFailure = nil
+                    lastFault = "AEC hardware VPIO indisponível (\(firstError)); supressão acústica por software ativa."
+                    return
+                } catch let fallbackErr {
+                    if enableCapture && enablePlayback {
+                        teardownEnginesCleanly()
+                        Thread.sleep(forTimeInterval: 0.08)
+                        do {
+                            try configureAndStartSplitEngines(
+                                inputDev: activeInDev,
+                                outputDev: activeOutDev,
+                                expectedGeneration: expectedGeneration
+                            )
+                            lastFailure = nil
+                            lastFault = "Modo de compatibilidade separado ativo após recusa duplex VPIO/AUHAL (\(fallbackErr.localizedDescription))."
+                            return
+                        } catch let splitErr {
+                            try attemptBuiltInFallbackIfDistinct(
+                                failedIn: activeInDev,
+                                failedOut: activeOutDev,
+                                enableCapture: enableCapture,
+                                enablePlayback: enablePlayback,
+                                enableVoiceProcessing: enableVoiceProcessing,
+                                primaryError: splitErr,
+                                expectedGeneration: expectedGeneration
+                            )
+                            return
+                        }
+                    }
+                    lifecycleState = .failed
+                    lastFault = "Falha VPIO (\(firstError)) e fallback (\(fallbackErr.localizedDescription))."
+                    throw fallbackErr
+                }
+            } else if enableCapture && enablePlayback {
+                teardownEnginesCleanly()
+                Thread.sleep(forTimeInterval: 0.08)
+                do {
+                    try configureAndStartSplitEngines(
+                        inputDev: activeInDev,
+                        outputDev: activeOutDev,
+                        expectedGeneration: expectedGeneration
+                    )
+                    lastFailure = nil
+                    lastFault = "Modo de compatibilidade separado ativo (dispositivos independentes; AEC por software)."
+                    return
+                } catch let splitErr {
+                    try attemptBuiltInFallbackIfDistinct(
+                        failedIn: activeInDev,
+                        failedOut: activeOutDev,
+                        enableCapture: enableCapture,
+                        enablePlayback: enablePlayback,
+                        enableVoiceProcessing: enableVoiceProcessing,
+                        primaryError: splitErr,
+                        expectedGeneration: expectedGeneration
+                    )
+                    return
+                }
+            } else {
+                lifecycleState = .failed
+                lastFault = error.localizedDescription
+                throw error
+            }
+        }
+    }
+
+    private func attemptBuiltInFallbackIfDistinct(
+        failedIn: AudioDeviceDescriptor?,
+        failedOut: AudioDeviceDescriptor?,
+        enableCapture: Bool,
+        enablePlayback: Bool,
+        enableVoiceProcessing: Bool,
+        primaryError: Error,
+        expectedGeneration: UInt64
+    ) throws {
+        let builtInIn = inputDevices.first(where: { $0.transport == .builtIn }) ?? inputDevices.first(where: \.isDefaultInput)
+        let builtInOut = outputDevices.first(where: { $0.transport == .builtIn }) ?? outputDevices.first(where: \.isDefaultOutput)
+        let isDistinct = (builtInIn?.id != failedIn?.id) || (builtInOut?.id != failedOut?.id)
+        guard isDistinct else {
+            lifecycleState = .failed
+            lastFault = primaryError.localizedDescription
+            throw primaryError
+        }
+        teardownEnginesCleanly()
+        do {
+            try configureAndStartSingleEngine(
+                enableCapture: enableCapture,
+                enablePlayback: enablePlayback,
+                tryVoiceProcessing: enableVoiceProcessing && enableCapture,
+                inputDeviceID: builtInIn?.id,
+                outputDeviceID: builtInOut?.id,
+                expectedGeneration: expectedGeneration
+            )
+            if let uid = builtInIn?.uid { selectedInputDeviceUID = uid }
+            if let uid = builtInOut?.uid { selectedOutputDeviceUID = uid }
+            lastFailure = nil
+            lastFault = "Dispositivo anterior recusou inicialização (\(primaryError.localizedDescription)); restaurado para hardware integrado do Mac."
+        } catch {
+            lifecycleState = .failed
+            lastFault = error.localizedDescription
+            throw error
+        }
+    }
+
+    private func performStartupSequenceAsync(
+        enableCapture: Bool,
+        enablePlayback: Bool,
+        enableVoiceProcessing: Bool,
+        expectedGeneration: UInt64
+    ) async throws {
+        teardownEnginesCleanly()
+        let devs = try validateHardwarePreconditions(enableCapture: enableCapture, enablePlayback: enablePlayback)
+        guard lifecycleGeneration == expectedGeneration, !Task.isCancelled else { throw CancellationError() }
+
+        let activeInDev = devs.inputDev
+        let activeOutDev = devs.outputDev
+        let routeKey = "\(activeInDev?.uid ?? "none")|\(activeOutDev?.uid ?? "none")"
+        let isBluetoothRoute = (activeInDev?.isBluetooth == true) || (activeOutDev?.isBluetooth == true)
+        let isVirtualOrContinuity = (activeInDev?.transport == .continuityOrVirtual) || (activeOutDev?.transport == .continuityOrVirtual)
+        let allowVP = enableVoiceProcessing && enableCapture && !isBluetoothRoute && !isVirtualOrContinuity && !vpioUnsupportedRoutes.contains(routeKey)
+
+        try await waitForHALFormatsReady(
+            requireCapture: enableCapture,
+            requirePlayback: enablePlayback,
+            maxWaitMs: 1200,
+            expectedGeneration: expectedGeneration
+        )
+        guard lifecycleGeneration == expectedGeneration, !Task.isCancelled else { throw CancellationError() }
+
+        // Continuity / Virtual inputs paired with separate Mac speakers require independent engines on macOS AUHAL
+        if enableCapture && enablePlayback && isVirtualOrContinuity {
+            do {
+                try configureAndStartSplitEngines(
+                    inputDev: activeInDev,
+                    outputDev: activeOutDev,
+                    expectedGeneration: expectedGeneration
+                )
+                lastFailure = nil
+                lastFault = "Modo de compatibilidade separado (Continuity/Virtual) sem AEC hardware VPIO; supressão acústica por software ativa."
+                return
+            } catch let splitErr {
+                try attemptBuiltInFallbackIfDistinct(
+                    failedIn: activeInDev,
+                    failedOut: activeOutDev,
+                    enableCapture: enableCapture,
+                    enablePlayback: enablePlayback,
+                    enableVoiceProcessing: enableVoiceProcessing,
+                    primaryError: splitErr,
+                    expectedGeneration: expectedGeneration
+                )
+                return
+            }
+        }
+
+        do {
+            try configureAndStartSingleEngine(
+                enableCapture: enableCapture,
+                enablePlayback: enablePlayback,
+                tryVoiceProcessing: allowVP,
+                inputDeviceID: activeInDev?.id,
+                outputDeviceID: activeOutDev?.id,
+                expectedGeneration: expectedGeneration
+            )
+            lastFailure = nil
+            if !allowVP && enableVoiceProcessing && (isBluetoothRoute || vpioUnsupportedRoutes.contains(routeKey)) {
+                lastFault = "AEC hardware VPIO indisponível nesta rota; supressão acústica por software ativa."
+            } else {
+                lastFault = nil
+            }
+        } catch let firstErr {
+            if allowVP {
+                vpioUnsupportedRoutes.insert(routeKey)
+                teardownEnginesCleanly()
+                try await waitForHALFormatsReady(
+                    requireCapture: enableCapture,
+                    requirePlayback: enablePlayback,
+                    maxWaitMs: 1200,
+                    expectedGeneration: expectedGeneration
+                )
+                guard lifecycleGeneration == expectedGeneration, !Task.isCancelled else { throw CancellationError() }
+                do {
+                    try configureAndStartSingleEngine(
+                        enableCapture: enableCapture,
+                        enablePlayback: enablePlayback,
+                        tryVoiceProcessing: false,
+                        inputDeviceID: activeInDev?.id,
+                        outputDeviceID: activeOutDev?.id,
+                        expectedGeneration: expectedGeneration
+                    )
+                    lastFailure = nil
+                    lastFault = "AEC hardware VPIO indisponível (\(firstErr.localizedDescription)); supressão acústica por software ativa."
+                    return
+                } catch let fallbackErr {
+                    if enableCapture && enablePlayback {
+                        teardownEnginesCleanly()
+                        try await waitForHALFormatsReady(
+                            requireCapture: enableCapture,
+                            requirePlayback: enablePlayback,
+                            maxWaitMs: 900,
+                            expectedGeneration: expectedGeneration
+                        )
+                        guard lifecycleGeneration == expectedGeneration, !Task.isCancelled else { throw CancellationError() }
+                        do {
+                            try configureAndStartSplitEngines(
+                                inputDev: activeInDev,
+                                outputDev: activeOutDev,
+                                expectedGeneration: expectedGeneration
+                            )
+                            lastFailure = nil
+                            lastFault = "Modo de compatibilidade separado ativo após recusa duplex (\(fallbackErr.localizedDescription))."
+                            return
+                        } catch let splitErr {
+                            try attemptBuiltInFallbackIfDistinct(
+                                failedIn: activeInDev,
+                                failedOut: activeOutDev,
+                                enableCapture: enableCapture,
+                                enablePlayback: enablePlayback,
+                                enableVoiceProcessing: enableVoiceProcessing,
+                                primaryError: splitErr,
+                                expectedGeneration: expectedGeneration
+                            )
+                            return
+                        }
+                    }
+                    lifecycleState = .failed
+                    lastFault = "Falha primária VPIO (\(firstErr.localizedDescription)) e falha padrão (\(fallbackErr.localizedDescription))."
+                    throw fallbackErr
+                }
+            } else if enableCapture && enablePlayback {
+                teardownEnginesCleanly()
+                try await waitForHALFormatsReady(
+                    requireCapture: enableCapture,
+                    requirePlayback: enablePlayback,
+                    maxWaitMs: 900,
+                    expectedGeneration: expectedGeneration
+                )
+                guard lifecycleGeneration == expectedGeneration, !Task.isCancelled else { throw CancellationError() }
+                do {
+                    try configureAndStartSplitEngines(
+                        inputDev: activeInDev,
+                        outputDev: activeOutDev,
+                        expectedGeneration: expectedGeneration
+                    )
+                    lastFailure = nil
+                    lastFault = "Modo de compatibilidade separado ativo (rotas independentes; AEC por software)."
+                    return
+                } catch let splitErr {
+                    try attemptBuiltInFallbackIfDistinct(
+                        failedIn: activeInDev,
+                        failedOut: activeOutDev,
+                        enableCapture: enableCapture,
+                        enablePlayback: enablePlayback,
+                        enableVoiceProcessing: enableVoiceProcessing,
+                        primaryError: splitErr,
+                        expectedGeneration: expectedGeneration
+                    )
+                    return
+                }
+            } else {
+                lifecycleState = .failed
+                lastFault = firstErr.localizedDescription
+                throw firstErr
+            }
         }
     }
 
@@ -1188,15 +1711,24 @@ public final class VoiceNativeAudioEngine: ObservableObject {
     }
 
     public func stop() {
+        pendingRecoveryTask?.cancel()
+        pendingRecoveryTask = nil
+        lifecycleGeneration &+= 1
         wantCapture = false
         wantPlayback = false
-        pendingReconnectWorkItem?.cancel()
-        pendingReconnectWorkItem = nil
-        stopEngineOnly()
+        lifecycleState = .stopping
+        lastOperation = .stopEngine
+        teardownEnginesCleanly()
         captureRingBuffer.flush()
         _ = outputJitterBuffer.flushAndCaptureHeardSnapshot()
         _ = auxiliaryVocalizationBuffer.flushAndCaptureHeardSnapshot()
         processingStatus = .inactive
+        activeVPIOEnabled = false
+        isTapInstalled = false
+        isUsingSplitEngineFallback = false
+        attachedNodeGraphSummary = "Inativo (sem nós)"
+        audioUnitStateSummary = "Parado"
+        lifecycleState = .idle
         liveLevels = .zero
     }
 
@@ -1251,12 +1783,19 @@ public final class VoiceNativeAudioEngine: ObservableObject {
 
     public func telemetrySnapshot() -> AudioEngineRuntimeTelemetry {
         let jStats = outputJitterBuffer.stats
-        let inName = inputDevices.first(where: { $0.uid == selectedInputDeviceUID })?.name ?? "Padrão"
-        let outName = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID })?.name ?? "Padrão"
+        let inDev = inputDevices.first(where: { $0.uid == selectedInputDeviceUID })
+        let outDev = outputDevices.first(where: { $0.uid == selectedOutputDeviceUID })
+        let inName = inDev?.name ?? "Padrão"
+        let outName = outDev?.name ?? "Padrão"
+        let liveOutRate = isRunning ? (measuredOutputRateHz > 0 ? measuredOutputRateHz : (outDev?.nominalSampleRate ?? 48_000)) : (outDev?.nominalSampleRate ?? 48_000)
+        let liveOutCh = isRunning ? measuredOutputChannels : (outDev?.outputChannels ?? 0)
+        let liveInRate = isRunning ? (measuredInputRateHz > 0 ? measuredInputRateHz : (inDev?.nominalSampleRate ?? 48_000)) : (inDev?.nominalSampleRate ?? 0)
+        let liveInCh = isRunning ? measuredInputChannels : (inDev?.inputChannels ?? 0)
+
         return AudioEngineRuntimeTelemetry(
             isRunning: isRunning,
             isFullDuplex: wantCapture && wantPlayback,
-            hardwareSampleRate: engine?.outputNode.outputFormat(forBus: 0).sampleRate ?? 48_000,
+            hardwareSampleRate: liveOutRate,
             processingStatus: processingStatus,
             systemMicMode: systemMicrophoneMode,
             inputDeviceName: inName,
@@ -1267,137 +1806,231 @@ public final class VoiceNativeAudioEngine: ObservableObject {
             outputBufferedMs: jStats.bufferedMs,
             outputTargetPrebufferMs: jStats.targetPrebufferMs,
             recoveryCount: recoveryCount,
-            lastFaultDescription: lastFault
+            lastFaultDescription: lastFault,
+            lifecycleState: lifecycleState,
+            audioUnitState: audioUnitStateSummary,
+            inputSampleRateHz: liveInRate,
+            inputChannels: liveInCh,
+            outputSampleRateHz: liveOutRate,
+            outputChannels: liveOutCh,
+            vpioActive: activeVPIOEnabled,
+            tapInstalled: isTapInstalled,
+            nodeGraphSummary: attachedNodeGraphSummary,
+            lastOperation: lastOperation,
+            lastFailure: lastFailure,
+            restartCount: restartCount,
+            isSplitEngineCompatibility: isUsingSplitEngineFallback
         )
     }
 
-    private func configureAndStartEngine(
+    private func makeOutputSourceNode(sourceFmt: AVAudioFormat) -> AVAudioSourceNode {
+        let jitterRef = outputJitterBuffer
+        let auxJitterRef = auxiliaryVocalizationBuffer
+        var scratch = [Float](repeating: 0, count: 4096)
+        var auxScratch = [Float](repeating: 0, count: 4096)
+
+        return AVAudioSourceNode(format: sourceFmt) { _, _, frameCount, audioBufferList -> OSStatus in
+            let frames = Int(frameCount)
+            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard let firstBuf = abl.first, let outPtr = firstBuf.mData?.assumingMemoryBound(to: Float.self) else {
+                return noErr
+            }
+            let needed = min(frames, scratch.count)
+            var rms: Float = 0
+            let pulledMain = scratch.withUnsafeMutableBufferPointer { buf in
+                guard let base = buf.baseAddress else { return 0 }
+                return jitterRef.renderPull(into: base, frameCount: needed, outputLevelOut: &rms)
+            }
+            if pulledMain > 0 {
+                // Priority 3 (main reply) strictly suppresses Priority 4 (auxiliary backchannel).
+                if auxJitterRef.stats.bufferedMs > 0 {
+                    _ = auxJitterRef.flushAndCaptureHeardSnapshot()
+                }
+                outPtr.update(from: scratch, count: pulledMain)
+                if frames > pulledMain {
+                    outPtr.advanced(by: pulledMain).initialize(repeating: 0, count: frames - pulledMain)
+                }
+                return noErr
+            }
+
+            var auxRms: Float = 0
+            let pulledAux = auxScratch.withUnsafeMutableBufferPointer { buf in
+                guard let base = buf.baseAddress else { return 0 }
+                return auxJitterRef.renderPull(into: base, frameCount: needed, outputLevelOut: &auxRms)
+            }
+            if pulledAux > 0 {
+                outPtr.update(from: auxScratch, count: pulledAux)
+            }
+            if frames > pulledAux {
+                outPtr.advanced(by: pulledAux).initialize(repeating: 0, count: frames - pulledAux)
+            }
+            return noErr
+        }
+    }
+
+    private func installCaptureTap(on inputNode: AVAudioInputNode, captureGen: UInt64) {
+        let ringRef = captureRingBuffer
+        let dspQueue = processingQueue
+
+        // Guard against format-mismatch NSException by passing nil when tapping hardware bus.
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
+            guard let chData = buffer.floatChannelData else { return }
+            let n = Int(buffer.frameLength)
+            guard n > 0 else { return }
+            ringRef.push(samples: chData[0], count: n)
+
+            let copied = AudioPCMConverter.mixToMono(buffer: buffer)
+            let sr = buffer.format.sampleRate
+            dspQueue.async { [weak self] in
+                let levels = AudioPCMConverter.measureLevels(samples: copied)
+                let jBuffered = self?.outputJitterBuffer.stats.bufferedMs ?? 0
+                let outActiveLevel: Float = jBuffered > 1.0 ? max(0.18, levels.mid) : 0
+                let normMic = min(1.0, levels.rms * 5.2)
+                let orb = CodexOrbAudioLevels(
+                    overall: max(normMic, outActiveLevel),
+                    low: levels.low,
+                    mid: levels.mid,
+                    high: levels.high,
+                    micLevel: normMic
+                )
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.isRunning,
+                          self.captureCallbackGeneration == captureGen else { return }
+                    self.liveLevels = orb
+                    // Always update VAD + echo reference BEFORE forwarding raw audio to STT.
+                    self.onInputAudioChunk?(copied, sr)
+                    self.onRawAudioBufferForSpeech?(buffer)
+                }
+            }
+        }
+    }
+
+    private func configureAndStartSingleEngine(
         enableCapture: Bool,
         enablePlayback: Bool,
         tryVoiceProcessing: Bool,
         inputDeviceID: AudioDeviceID?,
-        outputDeviceID: AudioDeviceID?
+        outputDeviceID: AudioDeviceID?,
+        expectedGeneration: UInt64
     ) throws {
+        guard lifecycleGeneration == expectedGeneration else { throw CancellationError() }
+
+        lifecycleState = .preparingGraph
         let newEngine = AVAudioEngine()
         var vpEnabled = false
+        var installedTap = false
+
+        func cleanupFailedEngine() {
+            if installedTap {
+                newEngine.inputNode.removeTap(onBus: 0)
+            }
+            newEngine.stop()
+            if vpEnabled {
+                try? newEngine.inputNode.setVoiceProcessingEnabled(false)
+                lastVPIOTeardownUptimeNs = DispatchTime.now().uptimeNanoseconds
+            }
+            newEngine.reset()
+        }
 
         let systemDefaultOut = CoreAudioDeviceCatalog.defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice)
         let systemDefaultIn = CoreAudioDeviceCatalog.defaultDeviceID(selector: kAudioHardwarePropertyDefaultInputDevice)
 
         if enablePlayback, let outID = outputDeviceID, outID != 0, outID != systemDefaultOut {
-            applyAudioUnitDevice(outID, to: newEngine.outputNode)
+            lastOperation = .bindAudioUnitDevice
+            let st = applyAudioUnitDevice(outID, to: newEngine.outputNode)
+            if st != noErr {
+                let err = NSError(domain: NSOSStatusErrorDomain, code: Int(st), userInfo: [NSLocalizedDescriptionKey: "Falha ao selecionar dispositivo de saída no AudioUnit (OSStatus \(st))."])
+                recordFailure(operation: .bindAudioUnitDevice, error: err)
+                cleanupFailedEngine()
+                throw err
+            }
         }
         if enableCapture, let inID = inputDeviceID, inID != 0, inID != systemDefaultIn {
-            applyAudioUnitDevice(inID, to: newEngine.inputNode)
+            lastOperation = .bindAudioUnitDevice
+            let st = applyAudioUnitDevice(inID, to: newEngine.inputNode)
+            if st != noErr {
+                let err = NSError(domain: NSOSStatusErrorDomain, code: Int(st), userInfo: [NSLocalizedDescriptionKey: "Falha ao selecionar microfone no AudioUnit (OSStatus \(st))."])
+                recordFailure(operation: .bindAudioUnitDevice, error: err)
+                cleanupFailedEngine()
+                throw err
+            }
+        }
+
+        // CRITICAL macOS CoreAudio/AVFAudio graph rule:
+        // Attach & connect output AVAudioSourceNode -> mainMixerNode FIRST before calling
+        // `inputNode.setVoiceProcessingEnabled(true)` so VPIO builds its aggregate output graph
+        // with valid connected mixer routing instead of failing kAudioUnitErr_FailedInitialization (-10875).
+        var attachedSource: AVAudioSourceNode?
+        if enablePlayback {
+            lastOperation = .attachOutputSource
+            guard let sourceFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: renderOutputRate, channels: 1, interleaved: false) else {
+                let err = NSError(domain: "VoiceNativeAudioEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "Formato de saída inválido."])
+                recordFailure(operation: .attachOutputSource, error: err)
+                cleanupFailedEngine()
+                throw err
+            }
+            let sourceNode = makeOutputSourceNode(sourceFmt: sourceFmt)
+            newEngine.attach(sourceNode)
+            newEngine.connect(sourceNode, to: newEngine.mainMixerNode, format: sourceFmt)
+            _ = newEngine.outputNode.outputFormat(forBus: 0)
+            attachedSource = sourceNode
         }
 
         if enableCapture && tryVoiceProcessing {
+            lastOperation = .enableVoiceProcessingIO
             do {
+                isApplyingInternalConfiguration = true
+                defer { isApplyingInternalConfiguration = false }
                 try newEngine.inputNode.setVoiceProcessingEnabled(true)
                 newEngine.inputNode.isVoiceProcessingAGCEnabled = true
                 newEngine.inputNode.isVoiceProcessingBypassed = false
                 vpEnabled = true
             } catch {
                 try? newEngine.inputNode.setVoiceProcessingEnabled(false)
-                vpEnabled = false
+                lastVPIOTeardownUptimeNs = DispatchTime.now().uptimeNanoseconds
+                recordFailure(operation: .enableVoiceProcessingIO, error: error)
+                cleanupFailedEngine()
+                throw error
             }
         }
 
+        lastOperation = .validateEngineFormats
+        var outFmtSampleRate: Double = 0
+        var outFmtChannels: Int = 0
         if enablePlayback {
-            let jitterRef = outputJitterBuffer
-            let auxJitterRef = auxiliaryVocalizationBuffer
-            guard let sourceFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: renderOutputRate, channels: 1, interleaved: false) else {
-                throw NSError(domain: "VoiceNativeAudioEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "Formato de saída inválido."])
+            let outFmt = newEngine.outputNode.outputFormat(forBus: 0)
+            let mixFmt = newEngine.mainMixerNode.outputFormat(forBus: 0)
+            guard outFmt.sampleRate > 0, outFmt.channelCount > 0,
+                  mixFmt.sampleRate > 0, mixFmt.channelCount > 0 else {
+                let err = NSError(domain: "VoiceNativeAudioEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "Formato de saída CoreAudio inválido (\(outFmt.sampleRate) Hz / \(outFmt.channelCount) ch)."])
+                recordFailure(operation: .validateEngineFormats, error: err)
+                cleanupFailedEngine()
+                throw err
             }
-            var scratch = [Float](repeating: 0, count: 4096)
-            var auxScratch = [Float](repeating: 0, count: 4096)
-            var lastPullRms: Float = 0
-
-            let sourceNode = AVAudioSourceNode(format: sourceFmt) { _, _, frameCount, audioBufferList -> OSStatus in
-                let frames = Int(frameCount)
-                let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                guard let firstBuf = abl.first, let outPtr = firstBuf.mData?.assumingMemoryBound(to: Float.self) else {
-                    return noErr
-                }
-                let needed = min(frames, scratch.count)
-                var rms: Float = 0
-                let pulledMain = scratch.withUnsafeMutableBufferPointer { buf in
-                    guard let base = buf.baseAddress else { return 0 }
-                    return jitterRef.renderPull(into: base, frameCount: needed, outputLevelOut: &rms)
-                }
-                if pulledMain > 0 {
-                    // Priority 3 (main reply) strictly suppresses Priority 4 (auxiliary backchannel).
-                    if auxJitterRef.stats.bufferedMs > 0 {
-                        _ = auxJitterRef.flushAndCaptureHeardSnapshot()
-                    }
-                    outPtr.update(from: scratch, count: pulledMain)
-                    if frames > pulledMain {
-                        outPtr.advanced(by: pulledMain).initialize(repeating: 0, count: frames - pulledMain)
-                    }
-                    lastPullRms = rms
-                    return noErr
-                }
-
-                var auxRms: Float = 0
-                let pulledAux = auxScratch.withUnsafeMutableBufferPointer { buf in
-                    guard let base = buf.baseAddress else { return 0 }
-                    return auxJitterRef.renderPull(into: base, frameCount: needed, outputLevelOut: &auxRms)
-                }
-                if pulledAux > 0 {
-                    outPtr.update(from: auxScratch, count: pulledAux)
-                }
-                if frames > pulledAux {
-                    outPtr.advanced(by: pulledAux).initialize(repeating: 0, count: frames - pulledAux)
-                }
-                lastPullRms = auxRms
-                return noErr
-            }
-            self.outputSourceNode = sourceNode
-            newEngine.attach(sourceNode)
-            newEngine.connect(sourceNode, to: newEngine.mainMixerNode, format: sourceFmt)
-            _ = lastPullRms
+            outFmtSampleRate = outFmt.sampleRate
+            outFmtChannels = Int(outFmt.channelCount)
         }
 
+        var inFmtSampleRate: Double = 0
+        var inFmtChannels: Int = 0
         if enableCapture {
             let inputNode = newEngine.inputNode
             let hwFormat = inputNode.outputFormat(forBus: 0)
             guard hwFormat.sampleRate > 0 && hwFormat.channelCount > 0 else {
-                throw NSError(domain: "VoiceNativeAudioEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "Dispositivo de microfone sem formato válido."])
+                let err = NSError(domain: "VoiceNativeAudioEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "Dispositivo de microfone sem formato válido (\(hwFormat.sampleRate) Hz / \(hwFormat.channelCount) ch)."])
+                recordFailure(operation: .validateEngineFormats, error: err)
+                cleanupFailedEngine()
+                throw err
             }
-            let ringRef = captureRingBuffer
-            let dspQueue = processingQueue
+            inFmtSampleRate = hwFormat.sampleRate
+            inFmtChannels = Int(hwFormat.channelCount)
 
-            // Guard against format-mismatch NSException by passing nil when tapping hardware bus.
-            inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
-                guard let chData = buffer.floatChannelData else { return }
-                let n = Int(buffer.frameLength)
-                guard n > 0 else { return }
-                ringRef.push(samples: chData[0], count: n)
-
-                let copied = AudioPCMConverter.mixToMono(buffer: buffer)
-                let sr = buffer.format.sampleRate
-                dspQueue.async { [weak self] in
-                    let levels = AudioPCMConverter.measureLevels(samples: copied)
-                    let jBuffered = self?.outputJitterBuffer.stats.bufferedMs ?? 0
-                    let outActiveLevel: Float = jBuffered > 1.0 ? max(0.18, levels.mid) : 0
-                    let normMic = min(1.0, levels.rms * 5.2)
-                    let orb = CodexOrbAudioLevels(
-                        overall: max(normMic, outActiveLevel),
-                        low: levels.low,
-                        mid: levels.mid,
-                        high: levels.high,
-                        micLevel: normMic
-                    )
-                    Task { @MainActor [weak self] in
-                        guard let self, self.isRunning else { return }
-                        self.liveLevels = orb
-                        // Always update VAD + echo reference BEFORE forwarding raw audio to STT.
-                        self.onInputAudioChunk?(copied, sr)
-                        self.onRawAudioBufferForSpeech?(buffer)
-                    }
-                }
-            }
+            lastOperation = .installInputTap
+            captureCallbackGeneration &+= 1
+            installCaptureTap(on: inputNode, captureGen: captureCallbackGeneration)
+            installedTap = true
         }
 
         if let obs = configObserver {
@@ -1406,47 +2039,222 @@ public final class VoiceNativeAudioEngine: ObservableObject {
         }
 
         do {
+            lifecycleState = .starting
+            isApplyingInternalConfiguration = true
+            defer { isApplyingInternalConfiguration = false }
+            lastOperation = .prepareEngine
             newEngine.prepare()
+            lastOperation = .startEngine
             try newEngine.start()
         } catch {
-            if enableCapture {
-                newEngine.inputNode.removeTap(onBus: 0)
-            }
-            if vpEnabled {
-                try? newEngine.inputNode.setVoiceProcessingEnabled(false)
-            }
-            newEngine.stop()
-            newEngine.reset()
+            recordFailure(operation: lastOperation, error: error)
+            cleanupFailedEngine()
             throw error
         }
 
         // IMPORTANT: Register observer with `queue: nil` ONLY AFTER `start()` succeeds.
         // Using `queue: .main` caused an ABBA deadlock between `AVAudioEngine dealloc` (`_dispatch_sync_f_slow`)
         // on the main thread and `IOUnitConfigurationChanged` (`-[NSOperation waitUntilFinished]`) on CoreAudio's engine queue.
+        lastOperation = .installConfigObserver
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: newEngine,
             queue: nil
         ) { [weak self, weak newEngine] _ in
             DispatchQueue.main.async {
-                guard let self, let newEngine, self.engine === newEngine else { return }
-                self.scheduleEngineRecovery(reason: "Alteração de rota/hardware de áudio")
+                guard let self,
+                      let newEngine,
+                      !self.isApplyingInternalConfiguration,
+                      self.engine === newEngine,
+                      self.lifecycleState != .stopping,
+                      self.lifecycleState != .failed else { return }
+                self.scheduleEngineRecovery(reason: "Alteração de rota/hardware de áudio", resetBudget: false)
             }
         }
 
         self.engine = newEngine
+        self.splitCaptureEngine = nil
+        self.outputSourceNode = attachedSource
+        self.activeEngineHasTap = installedTap
+        self.activeEngineHasVPIO = vpEnabled
+        self.isUsingSplitEngineFallback = false
         self.isRunning = true
+        self.activeVPIOEnabled = vpEnabled
+        self.isTapInstalled = installedTap
+        self.measuredInputRateHz = inFmtSampleRate
+        self.measuredInputChannels = inFmtChannels
+        self.measuredOutputRateHz = outFmtSampleRate
+        self.measuredOutputChannels = outFmtChannels
+        self.audioUnitStateSummary = vpEnabled ? "Initialized/Running (VPIO OSStatus=0)" : "Initialized/Running (AUHAL OSStatus=0)"
+        self.attachedNodeGraphSummary = [
+            enablePlayback ? "SourceNode(24kHz)->MainMixer->OutputNode(\(Int(outFmtSampleRate))Hz/\(outFmtChannels)ch)" : nil,
+            enableCapture ? "InputTap(\(Int(inFmtSampleRate))Hz/\(inFmtChannels)ch)" : nil,
+            vpEnabled ? "[VPIO=ON]" : (enableCapture ? "[VPIO=Bypass/SoftwareAEC]" : nil)
+        ].compactMap { $0 }.joined(separator: " + ")
+
         if !enableCapture {
             self.processingStatus = .inactive
+            self.lifecycleState = .running
+        } else if vpEnabled {
+            self.processingStatus = .activeAECAndNS
+            self.lifecycleState = .running
         } else {
-            self.processingStatus = vpEnabled ? .activeAECAndNS : .bypassedBluetoothOrFallback
+            self.processingStatus = .bypassedBluetoothOrFallback
+            self.lifecycleState = wantVoiceProcessing ? .degradedCompatibility : .running
         }
     }
 
-    private func applyAudioUnitDevice(_ deviceID: AudioDeviceID, to node: AVAudioIONode) {
-        guard let unit = node.audioUnit else { return }
+    private func configureAndStartSplitEngines(
+        inputDev: AudioDeviceDescriptor?,
+        outputDev: AudioDeviceDescriptor?,
+        expectedGeneration: UInt64
+    ) throws {
+        guard lifecycleGeneration == expectedGeneration else { throw CancellationError() }
+        lastOperation = .splitEngineFallback
+        lifecycleState = .preparingGraph
+
+        let playbackEng = AVAudioEngine()
+        let captureEng = AVAudioEngine()
+        var tapInstalledOnSplit = false
+
+        func cleanupBoth() {
+            if tapInstalledOnSplit {
+                captureEng.inputNode.removeTap(onBus: 0)
+            }
+            captureEng.stop()
+            captureEng.reset()
+            playbackEng.stop()
+            playbackEng.reset()
+        }
+
+        let systemDefaultOut = CoreAudioDeviceCatalog.defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice)
+        let systemDefaultIn = CoreAudioDeviceCatalog.defaultDeviceID(selector: kAudioHardwarePropertyDefaultInputDevice)
+
+        if let outID = outputDev?.id, outID != 0, outID != systemDefaultOut {
+            let st = applyAudioUnitDevice(outID, to: playbackEng.outputNode)
+            if st != noErr {
+                let err = NSError(domain: NSOSStatusErrorDomain, code: Int(st), userInfo: [NSLocalizedDescriptionKey: "Split playback device bind falhou (OSStatus \(st))."])
+                recordFailure(operation: .splitEngineFallback, error: err)
+                cleanupBoth()
+                throw err
+            }
+        }
+        guard let sourceFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: renderOutputRate, channels: 1, interleaved: false) else {
+            let err = NSError(domain: "VoiceNativeAudioEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "Formato de saída inválido em modo separado."])
+            recordFailure(operation: .splitEngineFallback, error: err)
+            cleanupBoth()
+            throw err
+        }
+        let sourceNode = makeOutputSourceNode(sourceFmt: sourceFmt)
+        playbackEng.attach(sourceNode)
+        playbackEng.connect(sourceNode, to: playbackEng.mainMixerNode, format: sourceFmt)
+
+        let outFmt = playbackEng.outputNode.outputFormat(forBus: 0)
+        guard outFmt.sampleRate > 0 && outFmt.channelCount > 0 else {
+            let err = NSError(domain: "VoiceNativeAudioEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "Saída sem formato válido em modo separado."])
+            recordFailure(operation: .splitEngineFallback, error: err)
+            cleanupBoth()
+            throw err
+        }
+
+        do {
+            isApplyingInternalConfiguration = true
+            defer { isApplyingInternalConfiguration = false }
+            playbackEng.prepare()
+            try playbackEng.start()
+        } catch {
+            recordFailure(operation: .splitEngineFallback, error: error)
+            cleanupBoth()
+            throw error
+        }
+
+        if let inID = inputDev?.id, inID != 0, inID != systemDefaultIn {
+            let st = applyAudioUnitDevice(inID, to: captureEng.inputNode)
+            if st != noErr {
+                let err = NSError(domain: NSOSStatusErrorDomain, code: Int(st), userInfo: [NSLocalizedDescriptionKey: "Split capture device bind falhou (OSStatus \(st))."])
+                recordFailure(operation: .splitEngineFallback, error: err)
+                cleanupBoth()
+                throw err
+            }
+        }
+        let hwFormat = captureEng.inputNode.outputFormat(forBus: 0)
+        guard hwFormat.sampleRate > 0 && hwFormat.channelCount > 0 else {
+            let err = NSError(domain: "VoiceNativeAudioEngine", code: -3, userInfo: [NSLocalizedDescriptionKey: "Entrada sem formato válido em modo separado."])
+            recordFailure(operation: .splitEngineFallback, error: err)
+            cleanupBoth()
+            throw err
+        }
+
+        captureCallbackGeneration &+= 1
+        installCaptureTap(on: captureEng.inputNode, captureGen: captureCallbackGeneration)
+        tapInstalledOnSplit = true
+
+        do {
+            isApplyingInternalConfiguration = true
+            defer { isApplyingInternalConfiguration = false }
+            captureEng.prepare()
+            try captureEng.start()
+        } catch {
+            recordFailure(operation: .splitEngineFallback, error: error)
+            cleanupBoth()
+            throw error
+        }
+
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: playbackEng,
+            queue: nil
+        ) { [weak self, weak playbackEng] _ in
+            DispatchQueue.main.async {
+                guard let self,
+                      let playbackEng,
+                      !self.isApplyingInternalConfiguration,
+                      self.engine === playbackEng,
+                      self.lifecycleState != .stopping,
+                      self.lifecycleState != .failed else { return }
+                self.scheduleEngineRecovery(reason: "Alteração na rota de saída (modo separado)", resetBudget: false)
+            }
+        }
+        splitCaptureConfigObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: captureEng,
+            queue: nil
+        ) { [weak self, weak captureEng] _ in
+            DispatchQueue.main.async {
+                guard let self,
+                      let captureEng,
+                      !self.isApplyingInternalConfiguration,
+                      self.splitCaptureEngine === captureEng,
+                      self.lifecycleState != .stopping,
+                      self.lifecycleState != .failed else { return }
+                self.scheduleEngineRecovery(reason: "Alteração na rota de entrada (modo separado)", resetBudget: false)
+            }
+        }
+
+        self.engine = playbackEng
+        self.splitCaptureEngine = captureEng
+        self.outputSourceNode = sourceNode
+        self.activeEngineHasTap = true
+        self.activeEngineHasVPIO = false
+        self.isUsingSplitEngineFallback = true
+        self.isRunning = true
+        self.activeVPIOEnabled = false
+        self.isTapInstalled = true
+        self.measuredInputRateHz = hwFormat.sampleRate
+        self.measuredInputChannels = Int(hwFormat.channelCount)
+        self.measuredOutputRateHz = outFmt.sampleRate
+        self.measuredOutputChannels = Int(outFmt.channelCount)
+        self.processingStatus = .bypassedBluetoothOrFallback
+        self.lifecycleState = .degradedCompatibility
+        self.audioUnitStateSummary = "SplitEngine Running (Playback AU + Capture AU OSStatus=0)"
+        self.attachedNodeGraphSummary = "SplitOut(SourceNode->Mixer->\(Int(outFmt.sampleRate))Hz/\(outFmt.channelCount)ch) + SplitIn(Tap \(Int(hwFormat.sampleRate))Hz/\(hwFormat.channelCount)ch) [VPIO=OFF/SoftwareAEC]"
+    }
+
+    @discardableResult
+    private func applyAudioUnitDevice(_ deviceID: AudioDeviceID, to node: AVAudioIONode) -> OSStatus {
+        guard let unit = node.audioUnit else { return -10875 }
         var dev = deviceID
-        AudioUnitSetProperty(
+        return AudioUnitSetProperty(
             unit,
             kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global,
@@ -1456,42 +2264,128 @@ public final class VoiceNativeAudioEngine: ObservableObject {
         )
     }
 
-    private func stopEngineOnly() {
-        // Remove NotificationCenter observer FIRST so engine dealloc never deadlocks on IOUnitConfigurationChanged.
+    private func teardownEnginesCleanly() {
+        lastOperation = .teardownPreviousEngine
+        captureCallbackGeneration &+= 1
+        // Remove NotificationCenter observers FIRST so engine dealloc never deadlocks on IOUnitConfigurationChanged.
         if let obs = configObserver {
             NotificationCenter.default.removeObserver(obs)
             configObserver = nil
         }
+        if let splitObs = splitCaptureConfigObserver {
+            NotificationCenter.default.removeObserver(splitObs)
+            splitCaptureConfigObserver = nil
+        }
+
+        let prevConfigFlag = isApplyingInternalConfiguration
+        isApplyingInternalConfiguration = true
+        defer { isApplyingInternalConfiguration = prevConfigFlag }
+
+        let hadTap = activeEngineHasTap
+        let hadVPIO = activeEngineHasVPIO
+        let wasSplit = isUsingSplitEngineFallback
+
+        if let splitCap = splitCaptureEngine {
+            if hadTap {
+                splitCap.inputNode.removeTap(onBus: 0)
+            }
+            splitCap.stop()
+            splitCap.reset()
+        }
+
         if let eng = engine {
-            if wantCapture {
+            if !wasSplit && hadTap {
                 eng.inputNode.removeTap(onBus: 0)
             }
             eng.stop()
+            if hadVPIO {
+                try? eng.inputNode.setVoiceProcessingEnabled(false)
+                lastVPIOTeardownUptimeNs = DispatchTime.now().uptimeNanoseconds
+            }
             eng.reset()
         }
+
         outputSourceNode = nil
+        splitCaptureEngine = nil
         engine = nil
+        activeEngineHasTap = false
+        activeEngineHasVPIO = false
+        isUsingSplitEngineFallback = false
+        isTapInstalled = false
+        activeVPIOEnabled = false
         isRunning = false
+        measuredInputRateHz = 0
+        measuredInputChannels = 0
+        measuredOutputRateHz = 0
+        measuredOutputChannels = 0
     }
 
-    private func scheduleEngineRecovery(reason: String) {
+    private func scheduleEngineRecovery(reason: String, resetBudget: Bool = false) {
         guard wantCapture || wantPlayback else { return }
-        pendingReconnectWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.wantCapture || self.wantPlayback else { return }
-                self.recoveryCount += 1
-                self.lastFault = "Recuperação automática: \(reason)"
-                try? await self.startFullDuplexAsync(
-                    enableCapture: self.wantCapture,
-                    enablePlayback: self.wantPlayback,
-                    enableVoiceProcessing: self.wantVoiceProcessing
+        pendingRecoveryTask?.cancel()
+
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if resetBudget {
+            recentRecoveryUptimeNs.removeAll()
+        } else {
+            recentRecoveryUptimeNs = recentRecoveryUptimeNs.filter { nowNs >= $0 && (nowNs &- $0) <= recoveryWindowNs }
+            if recentRecoveryUptimeNs.count >= maxAutoRecoveriesInWindow {
+                lifecycleGeneration &+= 1
+                teardownEnginesCleanly()
+                lifecycleState = .failed
+                let err = NSError(
+                    domain: "VoiceNativeAudioEngine",
+                    code: -10875,
+                    userInfo: [NSLocalizedDescriptionKey: "Limite de recuperações automáticas atingido (\(maxAutoRecoveriesInWindow) tentativas em 12s) após: \(reason)."]
                 )
-                self.onDeviceTopologyChanged?()
+                recordFailure(operation: .handleConfigChange, error: err)
+                lastFault = err.localizedDescription
+                onDeviceTopologyChanged?()
+                return
             }
+            recentRecoveryUptimeNs.append(nowNs)
         }
-        pendingReconnectWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+
+        let scheduledCapture = wantCapture
+        let scheduledPlayback = wantPlayback
+        let scheduledVP = wantVoiceProcessing
+        let scheduledEpoch = lifecycleGeneration
+
+        pendingRecoveryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            guard let self,
+                  !Task.isCancelled,
+                  self.lifecycleGeneration == scheduledEpoch,
+                  self.wantCapture || self.wantPlayback else { return }
+
+            self.recoveryCount += 1
+            self.restartCount += 1
+            self.lifecycleState = .recovering
+            self.lastOperation = .handleConfigChange
+            self.lastFault = "Recuperação automática (\(self.recoveryCount)): \(reason)"
+
+            do {
+                try await self.runSerializedLifecycleOperation { [weak self] in
+                    guard let self,
+                          !Task.isCancelled,
+                          self.lifecycleGeneration == scheduledEpoch,
+                          self.wantCapture || self.wantPlayback else { return }
+                    try await self.performStartupSequenceAsync(
+                        enableCapture: scheduledCapture,
+                        enablePlayback: scheduledPlayback,
+                        enableVoiceProcessing: scheduledVP,
+                        expectedGeneration: scheduledEpoch
+                    )
+                }
+            } catch is CancellationError {
+                // Superseded by newer explicit start/stop
+            } catch {
+                self.lifecycleState = .failed
+                self.isRunning = false
+                self.lastFault = "Falha na recuperação automática: \(error.localizedDescription)"
+            }
+            self.onDeviceTopologyChanged?()
+        }
     }
 
     private func installCoreAudioDeviceObservers() {
@@ -1511,8 +2405,8 @@ public final class VoiceNativeAudioEngine: ObservableObject {
             AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main) { [weak self] _, _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.refreshDevices()
-                    if self.isRunning {
+                    let changed = self.refreshDevices()
+                    if changed && self.isRunning && !self.isApplyingInternalConfiguration {
                         self.onDeviceTopologyChanged?()
                     }
                 }

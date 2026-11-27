@@ -245,7 +245,19 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
     }
 
     deinit {
-        unloadSync()
+        lastIdleUnloadWorkItem?.cancel()
+        lastIdleUnloadWorkItem = nil
+        let old = stateLock.withLock { () -> LoadedHandles? in
+            let current = loaded
+            loaded = nil
+            diagnosticsSnapshot.isLoaded = false
+            return current
+        }
+        if let old {
+            synthQueue.async {
+                old.destroyTts(old.ttsPointer)
+            }
+        }
     }
 
     public var isReadyOnDisk: Bool {
@@ -1146,7 +1158,16 @@ public final class SherpaVitsPiperTTSProvider: StreamingTextToSpeechProvider, @u
     }
 
     deinit {
-        unloadSync()
+        let old = lock.withLock { () -> LoadedVitsHandles? in
+            let current = loaded
+            loaded = nil
+            return current
+        }
+        if let old {
+            queue.async {
+                old.destroyTts(old.ttsPointer)
+            }
+        }
     }
 
     public func resolveModelPaths(for language: VoiceLanguageVariant) -> (runtimeDir: URL, modelDir: URL, onnxFile: URL, tokensFile: URL, espeakDir: URL, modelID: String)? {

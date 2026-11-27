@@ -597,9 +597,17 @@ struct VoiceHUDModalView: View {
                     .foregroundStyle(Color.red.opacity(0.92))
             }
 
-            Text("Áudio: \(engStats.processingStatus.rawValue) · In: \(engStats.inputDeviceName) · Out: \(engStats.outputDeviceName) · Jitter alvo \(Int(engStats.outputTargetPrebufferMs))ms · Underruns: \(engStats.outputUnderruns)")
-                .font(.system(size: 11))
+            Text("Build: \(WisdVoiceBuildInfo.summary) · Estado Engine: \(engStats.lifecycleState.rawValue) · AU: \(engStats.audioUnitState)")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Color.white.opacity(0.76))
+
+            Text("Áudio: VPIO=\(engStats.vpioActive ? "ON" : "OFF") · Tap=\(engStats.tapInstalled ? "ON" : "OFF") · In: \(engStats.inputDeviceName) (\(Int(engStats.inputSampleRateHz))Hz/\(engStats.inputChannels)ch) · Out: \(engStats.outputDeviceName) (\(Int(engStats.outputSampleRateHz))Hz/\(engStats.outputChannels)ch)")
+                .font(.system(size: 10.5))
                 .foregroundStyle(Color.white.opacity(0.68))
+
+            Text("Grafo: \(engStats.nodeGraphSummary) · Op=\(engStats.lastOperation.rawValue) · Restarts=\(engStats.restartCount) · Recoveries=\(engStats.recoveryCount) · Jitter \(Int(engStats.outputTargetPrebufferMs))ms · Underruns=\(engStats.outputUnderruns)")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Color.white.opacity(0.62))
 
             Text(String(format: "Startup %.0fms · Barge-in %.0f/%.0fms · E2E %.0f/%.0fms · RAM %.0f MB · CPU %.1f%% (%d cores) · GPU %@",
                         orchestrator.lastStartupDurationMs,
@@ -1002,19 +1010,25 @@ struct WisdEnterpriseVoiceSettingsCard: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
+                Text("Build: \(WisdVoiceBuildInfo.summary) · Estado Engine: \(engStats.lifecycleState.rawValue) · AudioUnit: \(engStats.audioUnitState)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(DesktopStyle.muted)
                 Text("Reconhecimento Ativo: \(sttSnap?.activeEngineOrModel ?? orchestrator.resolvedPipeline.activeSTTName) · Cérebro Ativo: \(llmSnap?.activeEngineOrModel ?? orchestrator.brainStatus.rawValue)")
                     .font(.system(size: 11))
                 Text("Síntese Vocal Ativa: \(ttsSnap?.activeEngineOrModel ?? orchestrator.resolvedPipeline.activeTTSName) · Vozes PT Instaladas: \(orchestrator.installedPTVoicesCount) · Locales STT: \(orchestrator.installedSpeechLocales.isEmpty ? "verificar via Testar" : orchestrator.installedSpeechLocales.joined(separator: ", "))")
                     .font(.system(size: 11))
-                Text("Microfone: \(capSnap?.activeEngineOrModel ?? engStats.inputDeviceName) (RMS \(String(format: "%.3f", orchestrator.audioEngine.liveLevels.micLevel))) · Reprodução: \(playSnap?.activeEngineOrModel ?? engStats.outputDeviceName)")
+                Text("Microfone: \(capSnap?.activeEngineOrModel ?? engStats.inputDeviceName) [\(Int(engStats.inputSampleRateHz))Hz/\(engStats.inputChannels)ch] (RMS \(String(format: "%.3f", orchestrator.audioEngine.liveLevels.micLevel))) · Reprodução: \(playSnap?.activeEngineOrModel ?? engStats.outputDeviceName) [\(Int(engStats.outputSampleRateHz))Hz/\(engStats.outputChannels)ch]")
                     .font(.system(size: 11))
+                Text("VPIO=\(engStats.vpioActive ? "ON" : "OFF") · Tap=\(engStats.tapInstalled ? "Instalado" : "Ausente") · Op=\(engStats.lastOperation.rawValue) · Restarts=\(engStats.restartCount) · Recoveries=\(engStats.recoveryCount) · Grafo: \(engStats.nodeGraphSummary)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(DesktopStyle.muted)
                 Text(String(format: "Recursos: RAM %.1f MB / %.1f GB · CPU %.1f%% (%d núcleos) · GPU %@ (máx %llu MB) · Disco livre %.1f GB",
                             res.residentMemoryMB, res.physicalRAMGB, res.cpuPercent, res.cpuCoreCount, res.gpuName, res.gpuMaxRecommendedMB, orchestrator.modelAssetManager.availableDiskGB))
                     .font(.system(size: 11))
                     .foregroundStyle(DesktopStyle.muted)
-                Text("Agentes Externos: \(agSnap?.activeEngineOrModel ?? "Independente") · Último Erro: \(orchestrator.lastErrorSummary ?? orchestrator.activeBannerNotice ?? "Nenhum erro registrado")")
+                Text("Agentes Externos: \(agSnap?.activeEngineOrModel ?? "Independente") · Último Erro: \(engStats.lastFailure?.formattedSummary ?? orchestrator.lastErrorSummary ?? orchestrator.activeBannerNotice ?? "Nenhum erro registrado")")
                     .font(.system(size: 11))
-                    .foregroundStyle((orchestrator.lastErrorSummary != nil) ? Color.red : DesktopStyle.muted)
+                    .foregroundStyle((engStats.lastFailure != nil || orchestrator.lastErrorSummary != nil) ? Color.red : DesktopStyle.muted)
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)

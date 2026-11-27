@@ -621,25 +621,26 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         updateComponentStatus(.llm, state: .initializing, engineOrModel: localBrain.backendStatus.rawValue)
         updateComponentStatus(.tts, state: .initializing, engineOrModel: resolvedPipeline.activeTTSName)
 
-        // Anti-hang startup watchdog: allows cold CoreAudio VPIO fallback stabilization (~2.4s max)
-        // while guaranteeing never hanging indefinitely in .connecting/.initializingLocalEngine (> 3.5s).
+        // Anti-hang startup watchdog: allows CoreAudio VPIO/HAL recovery stabilization (~2.5s max)
+        // while guaranteeing never hanging indefinitely in .connecting/.initializingLocalEngine (> 5.0s).
         startupWatchdogTask?.cancel()
         startupWatchdogTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
             guard let self,
                   !Task.isCancelled,
                   self.sessionGenerationID == currentSessionID,
                   self.isVoiceSessionActive else { return }
             if self.state == .connecting || self.state == .initializingLocalEngine || self.state == .loadingModel {
-                self.telemetry.log(category: "Startup", message: "Watchdog de 3.5s acionado; ativando estado observável não bloqueante.")
+                self.telemetry.log(category: "Startup", message: "Watchdog de 5.0s acionado; estado AudioEngine=\(self.audioEngine.lifecycleState.rawValue), op=\(self.audioEngine.lastOperation.rawValue).")
                 if self.audioEngine.isRunning {
-                    self.transitionState(.listening, reason: "Watchdog anti-travamento (3.5s)")
+                    self.transitionState(.listening, reason: "Watchdog anti-travamento (5.0s)")
                     self.startTurnEvaluationLoop()
                 } else {
-                    let msg = "Tempo limite ao iniciar motor de áudio local (3,5s). Verifique dispositivos e permissões de microfone."
+                    let failDetail = self.audioEngine.lastFailure?.formattedSummary ?? "Timeout após 5,0s em \(self.audioEngine.lastOperation.rawValue)"
+                    let msg = "Tempo limite ao iniciar motor de áudio local (5,0s): \(failDetail)."
                     self.activeBannerNotice = msg
                     self.updateComponentStatus(.audioCapture, state: .error, engineOrModel: "CoreAudio", lastError: msg)
-                    self.transitionState(.error, reason: "Timeout de inicialização (3.5s)")
+                    self.transitionState(.error, reason: "Timeout de inicialização (5.0s)")
                 }
             }
         }
@@ -751,25 +752,63 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             }
             let audioMs = Double(DispatchTime.now().uptimeNanoseconds &- audioT0) / 1_000_000.0
             let telSnap = audioEngine.telemetrySnapshot()
-            let capState: VoiceComponentHealthState = (audioEngine.lastFault == nil) ? .ready : .degraded
+            let isDegraded = (telSnap.lifecycleState == .degradedCompatibility) || !telSnap.vpioActive || (audioEngine.lastFault != nil)
+            let capState: VoiceComponentHealthState = isDegraded ? .degraded : .ready
+            let depHint: String? = isDegraded
+                ? (audioEngine.lastFault ?? "Modo de compatibilidade sem VPIO hardware; supressão de eco por software ativa.")
+                : nil
+            if isDegraded {
+                activeBannerNotice = depHint
+            }
+            updateComponentStatus(
+                .audioPlayback,
+                state: telSnap.isSplitEngineCompatibility ? .degraded : .ready,
+                engineOrModel: "\(telSnap.outputDeviceName) (\(Int(telSnap.outputSampleRateHz))Hz/\(telSnap.outputChannels)ch)",
+                latencyMs: audioMs,
+                lastError: telSnap.isSplitEngineCompatibility ? audioEngine.lastFault : nil
+            )
             updateComponentStatus(
                 .audioCapture,
                 state: capState,
-                engineOrModel: "\(telSnap.inputDeviceName) (\(telSnap.processingStatus.rawValue))",
+                engineOrModel: "\(telSnap.inputDeviceName) (\(Int(telSnap.inputSampleRateHz))Hz/\(telSnap.inputChannels)ch · \(telSnap.processingStatus.rawValue))",
                 latencyMs: audioMs,
                 lastError: audioEngine.lastFault,
-                dependencyHint: audioEngine.lastFault != nil ? "Hardware AEC VPIO recusou inicialização; supressão de eco por software está ativa." : nil
+                dependencyHint: depHint
             )
-            updateComponentStatus(.audioPlayback, state: .ready, engineOrModel: telSnap.outputDeviceName, latencyMs: audioMs)
             updateComponentStatus(.vad, state: .ready, engineOrModel: "AcousticVADTracker + HybridTurnTakingAnalyzer")
+            telemetry.log(
+                category: "AudioEngine",
+                message: "Motor de áudio ativo em \(String(format: "%.0f", audioMs))ms: state=\(telSnap.lifecycleState.rawValue), graph='\(telSnap.nodeGraphSummary)'."
+            )
         } catch {
             startupWatchdogTask?.cancel()
-            let err = "Não foi possível iniciar o motor de áudio nativo: \(error.localizedDescription)"
+            let telSnap = audioEngine.telemetrySnapshot()
+            let failRec = telSnap.lastFailure
+            let failSummary = failRec?.formattedSummary ?? error.localizedDescription
+            let err = "Não foi possível iniciar o motor de áudio nativo: \(failSummary)"
             activeBannerNotice = err
-            updateComponentStatus(.audioCapture, state: .error, engineOrModel: "AVAudioEngine", lastError: err)
-            updateComponentStatus(.audioPlayback, state: .error, engineOrModel: "AVAudioEngine", lastError: err)
-            transitionState(.error, reason: "Falha no motor de áudio")
-            telemetry.log(category: "AudioEngine", message: "Erro ao iniciar full-duplex: \(error.localizedDescription)")
+
+            let isCaptureCause: Bool = {
+                guard let op = failRec?.operation else { return Int32((error as NSError).code) == -3 }
+                switch op {
+                case .validatePermissions, .enableVoiceProcessingIO, .installInputTap:
+                    return true
+                case .attachOutputSource:
+                    return false
+                default:
+                    return Int32((error as NSError).code) == -3
+                }
+            }()
+
+            if isCaptureCause {
+                updateComponentStatus(.audioPlayback, state: .error, engineOrModel: "\(telSnap.outputDeviceName) (AVAudioEngine)", lastError: err)
+                updateComponentStatus(.audioCapture, state: .error, engineOrModel: "\(telSnap.inputDeviceName) (AVAudioEngine)", lastError: err)
+            } else {
+                updateComponentStatus(.audioCapture, state: .error, engineOrModel: "\(telSnap.inputDeviceName) (AVAudioEngine)", lastError: err)
+                updateComponentStatus(.audioPlayback, state: .error, engineOrModel: "\(telSnap.outputDeviceName) (AVAudioEngine)", lastError: err)
+            }
+            transitionState(.error, reason: "Falha no motor de áudio (\(failRec?.operation.rawValue ?? "Start"))")
+            telemetry.log(category: "AudioEngine", message: "Erro ao iniciar full-duplex: \(failSummary) | Graph='\(telSnap.nodeGraphSummary)' | AU='\(telSnap.audioUnitState)'")
             lastStartupDurationMs = Double(DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000.0
             return
         }
@@ -1829,7 +1868,35 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
 
         audioEngine.onDeviceTopologyChanged = { [weak self] in
-            self?.telemetry.log(category: "AudioDevice", message: "Dispositivos de áudio atualizados; gráfico sincronizado.")
+            guard let self else { return }
+            let telSnap = self.audioEngine.telemetrySnapshot()
+            self.telemetry.log(
+                category: "AudioDevice",
+                message: "Topologia atualizada: state=\(telSnap.lifecycleState.rawValue), graph='\(telSnap.nodeGraphSummary)', op=\(telSnap.lastOperation.rawValue)."
+            )
+            if telSnap.lifecycleState == .failed {
+                let err = telSnap.lastFailure?.formattedSummary ?? telSnap.lastFaultDescription ?? "Falha de hardware/rota após atualização de áudio."
+                self.activeBannerNotice = err
+                self.updateComponentStatus(.audioCapture, state: .error, engineOrModel: telSnap.inputDeviceName, lastError: err)
+                self.updateComponentStatus(.audioPlayback, state: .error, engineOrModel: telSnap.outputDeviceName, lastError: err)
+                if self.isVoiceSessionActive {
+                    self.transitionState(.error, reason: "Falha de rota CoreAudio")
+                }
+            } else {
+                let degraded = (telSnap.lifecycleState == .degradedCompatibility) || !telSnap.vpioActive
+                self.updateComponentStatus(
+                    .audioCapture,
+                    state: degraded ? .degraded : .ready,
+                    engineOrModel: "\(telSnap.inputDeviceName) (\(Int(telSnap.inputSampleRateHz))Hz/\(telSnap.inputChannels)ch · \(telSnap.processingStatus.rawValue))",
+                    lastError: self.audioEngine.lastFault
+                )
+                self.updateComponentStatus(
+                    .audioPlayback,
+                    state: telSnap.isSplitEngineCompatibility ? .degraded : .ready,
+                    engineOrModel: "\(telSnap.outputDeviceName) (\(Int(telSnap.outputSampleRateHz))Hz/\(telSnap.outputChannels)ch)",
+                    lastError: telSnap.isSplitEngineCompatibility ? self.audioEngine.lastFault : nil
+                )
+            }
         }
     }
 
@@ -2655,9 +2722,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let res = telemetry.resourceSnapshot
         var lines: [String] = []
         lines.append("=== WisdAI Voice Engine Diagnostic Report ===")
-        lines.append("Build: \(WisdVoiceBuildInfo.summary)")
+        lines.append("Build: \(WisdVoiceBuildInfo.summary) | Commit: \(WisdVoiceBuildInfo.gitCommit)")
         lines.append("Timestamp: \(ISO8601DateFormatter().string(from: Date()))")
-        lines.append("Engine State: \(state.rawValue) (\(state.displayTitle)) | SessionActive: \(isVoiceSessionActive)")
+        lines.append("Session State: \(state.rawValue) (\(state.displayTitle)) | SessionActive: \(isVoiceSessionActive) | SessionEpoch: \(sessionGenerationID)")
+        lines.append("Active Engines: STT=\(resolvedPipeline.activeSTTName) | LLM=\(brainStatus.rawValue) | TTS=\(resolvedPipeline.activeTTSName)")
+        lines.append("AudioEngine Lifecycle: \(engStats.lifecycleState.rawValue) | AudioUnit: \(engStats.audioUnitState)")
+        lines.append("AudioRoute Input: '\(engStats.inputDeviceName)' (\(Int(engStats.inputSampleRateHz))Hz, \(engStats.inputChannels)ch) | Output: '\(engStats.outputDeviceName)' (\(Int(engStats.outputSampleRateHz))Hz, \(engStats.outputChannels)ch)")
+        lines.append("AudioGraph: VPIO=\(engStats.vpioActive ? "Enabled" : "Bypass/Off") (\(engStats.processingStatus.rawValue)) | Tap=\(engStats.tapInstalled ? "Installed" : "NotInstalled") | SplitCompat=\(engStats.isSplitEngineCompatibility) | Nodes=\(engStats.nodeGraphSummary)")
+        lines.append("AudioOperations: LastOp=\(engStats.lastOperation.rawValue) | Restarts=\(engStats.restartCount) | AutoRecoveries=\(engStats.recoveryCount)")
+        lines.append("AudioLastFailure: \(engStats.lastFailure?.formattedSummary ?? engStats.lastFaultDescription ?? "None")")
         lines.append(String(format: "Startup Latency: %.1f ms | Hardware Profile: %@ | OutHWLat: %.1f ms", lastStartupDurationMs, audioEngine.memoryProfile.displayName, hwOutLatency))
         lines.append(String(format: "Memory: App+Kokoro %.1f MB + llama-server %.1f MB = Total Voice Stack %.1f MB / %.1f GB RAM",
                             res.residentMemoryMB, telemetry.llamaServerMemoryMB, telemetry.totalVoiceStackMemoryMB, res.physicalRAMGB))
