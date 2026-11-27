@@ -883,6 +883,8 @@ struct VoiceSettingsSection: View {
             .background(DesktopStyle.surface.opacity(0.6), in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(DesktopStyle.line))
 
+            VoiceLaboratoryView(orchestrator: voice.orchestrator)
+
             WisdEnterpriseVoiceSettingsCard(workspace: workspace, orchestrator: voice.orchestrator)
         }
     }
