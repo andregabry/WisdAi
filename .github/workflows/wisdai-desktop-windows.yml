@@ -1,0 +1,60 @@
+name: Build WisdAI Desktop Windows
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'codex/desktop/windows/**'
+      - 'codex/codex-rs/**'
+      - '.github/workflows/wisdai-desktop-windows.yml'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build WisdAI Desktop (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: codex/desktop/windows/package.json
+
+      - name: Build Rust Backend Engine
+        shell: bash
+        run: |
+          cd codex/codex-rs
+          cargo build --release -p codex-cli -p codex-code-mode-host --target x86_64-pc-windows-msvc
+          mkdir -p ../desktop/windows/bin
+          cp target/x86_64-pc-windows-msvc/release/codex.exe ../desktop/windows/bin/
+          cp target/x86_64-pc-windows-msvc/release/codex-code-mode-host.exe ../desktop/windows/bin/
+
+      - name: Install Desktop App Dependencies
+        shell: bash
+        run: |
+          cd codex/desktop/windows
+          npm install
+
+      - name: Package Windows Desktop App
+        shell: bash
+        run: |
+          cd codex/desktop/windows
+          npm run dist:win
+
+      - name: Upload Windows Installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: WisdAI-Desktop-Windows-x64
+          path: |
+            codex/desktop/windows/dist/*.exe
+            codex/desktop/windows/dist/*.zip

@@ -1,0 +1,9 @@
+# Implementation plan
+
+1. Establish source and installed-client baselines. Audit thread and approval boundaries, desktop availability and official provider interfaces.
+2. Add an opt-in local status command using the official Claude CLI. Keep stdout and stderr from the child private. Distinguish missing binaries, signed-out sessions, native account login, other authentication methods and indeterminate results.
+3. Prove Claude native launch with a user-authenticated installation, a disposable workspace and a policy boundary that enforces the active Codex restrictions. Verify that alternate credentials and extra usage cannot silently activate. Keep external execution unavailable where that boundary cannot be proven.
+4. Read a completed Codex turn and build a bounded, reviewable handoff from its explicit task state, decisions, completed and pending work, sanitized tool results and test outcomes. Verify canonical working directory, HEAD and a content-sensitive worktree snapshot that includes relevant untracked changes. Recheck before resuming. Treat history and tool output as untrusted data. Exclude credentials, hidden state and approval grants.
+5. Associate native session IDs and checkpoints without rewriting either history. Record a switch only after the target acknowledges startup. On failure keep the source active. Preserve unresolved operations as pending for review. Verify Codex → Claude → Codex with a dirty disposable repository and test cancellation, stale checkpoints, concurrent changes and recovery.
+6. Add a TUI selector after the execution and checkpoint path passes the acceptance tests. The desktop client requires a supported extension point or upstream client participation.
+7. Evaluate Google, Kimi, MiMo, DeepSeek and NVIDIA in priority order, using the same permission, entitlement and recovery gates.

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key><string>WisdAI</string>
+    <key>CFBundleExecutable</key><string>WisdAI</string>
+    <key>CFBundleIdentifier</key><string>local.wisdai.desktop</string>
+    <key>CFBundleName</key><string>WisdAI</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleShortVersionString</key><string>0.7.1</string>
+    <key>CFBundleVersion</key><string>9</string>
+    <key>NSMicrophoneUsageDescription</key><string>Gravar comandos de voz e áudio quando você aciona o microfone ou o controle por voz.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>Reconhecer sua fala em tempo real para executar as tarefas pedidas no WisdAI.</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>

@@ -1,0 +1,38 @@
+# External repositories and non-app root artifacts
+/rea/
+/dist/
+/ChatGPT.dmg
+/calculator.html
+/calculator.py
+
+# Compiled binaries, installers, and build artifacts
+*.rcgu.o
+*.o
+*.dmg
+*.exe
+*.zip
+*.app/
+target/
+target-*/
+node_modules/
+**/dist/
+.build/
+DerivedData/
+
+# Python / virtualenv / local state
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Environment and OS/IDE files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,56 @@
+{
+  "name": "wisdai-desktop",
+  "productName": "WisdAI",
+  "version": "0.7.1",
+  "description": "WisdAI Desktop Client for Windows",
+  "main": "src/main/index.js",
+  "author": "WisdAI Team",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "pack:win": "electron-builder --win --dir",
+    "dist:win": "electron-builder --win --x64 nsis"
+  },
+  "build": {
+    "appId": "com.wisdai.desktop",
+    "productName": "WisdAI",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable",
+        "zip"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "WisdAI"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ]
+  },
+  "devDependencies": {
+    "electron": "34.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}
