@@ -17,6 +17,7 @@ struct VoiceSmokeTests {
         testAutonomousIntentRoutingAndRiskTiers()
         testAcousticEchoSuppressorAndQuarantineFTS5()
         testVoiceIdentityInvarianceAndNewStateMachineStates()
+        await testPhase1And2RegressionFixesAndMemoryHygiene()
         await testNativeAudioEngineDeadlockFreeStartStop()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
@@ -517,5 +518,97 @@ struct VoiceSmokeTests {
         precondition(!report.contains("sk-"))
         precondition(orch.telemetry.resourceSnapshot.cpuCoreCount >= 1)
         print("PASS: Permanent diagnostics probes & sanitized GPU/CPU/RAM report")
+    }
+
+    @MainActor
+    static func testPhase1And2RegressionFixesAndMemoryHygiene() async {
+        // 1. Casual mention of agent name or conceptual question must NOT dispatch agents
+        let casualCodex = LocalQueryComplexityAnalyzer.route(utterance: "O Codex é bom para refatorar?", currentLanguage: .portugueseBR)
+        if case .handleLocally(_, _) = casualCodex {
+        } else {
+            preconditionFailure("Menção casual ao Codex não deve delegar tarefa")
+        }
+        let conceptual = LocalQueryComplexityAnalyzer.route(utterance: "Como funciona um teste unitário no Xcode?", currentLanguage: .portugueseBR)
+        if case .handleLocally(_, _) = conceptual {
+        } else {
+            preconditionFailure("Pergunta conceitual não deve executar tarefa no workspace")
+        }
+
+        // 2. Semantic complexity scores short conceptual questions high without relying only on word count
+        let shortComplex = LocalQueryComplexityAnalyzer.route(utterance: "Por que deadlock acontece?", currentLanguage: .portugueseBR)
+        if case .handleLocally(let score, _) = shortComplex {
+            precondition(score >= 0.65, "Pergunta curta de arquitetura exige score >= 0.65, obtido \(score)")
+        } else {
+            preconditionFailure("Deveria rotear localmente com alta complexidade semântica")
+        }
+
+        // 3. Section 13 canonical parallel delegation ("Peça ao Codex...") must succeed cleanly
+        let canonical = LocalQueryComplexityAnalyzer.route(
+            utterance: "Peça ao Codex para analisar a autenticação do projeto e continue conversando comigo sobre a arquitetura.",
+            currentLanguage: .portugueseBR
+        )
+        if case .delegateToSpecialist(let hint, _, let risk, let parallel) = canonical {
+            precondition(hint == .codex && risk == .low && parallel, "Delegação canônica falhou")
+        } else {
+            preconditionFailure("Deveria rotear para .delegateToSpecialist(.codex)")
+        }
+
+        // 4. Acoustic Echo Hangover blocks tail bleed while allowing real human barge-in
+        let suppressor = AcousticEchoSuppressor()
+        suppressor.updatePlaybackReference(bufferedMs: 0, playbackRMS: 0.14, renderAgeMs: 25, micRMS: 0.02, isAssistantSpeaking: false)
+        precondition(suppressor.isInEchoOrHangoverWindow, "Janela de cauda acústica deve permanecer ativa após renderização")
+        precondition(suppressor.shouldSuppressAsSelfEcho(micRMS: 0.018, lowEnergy: 0.01, isAssistantSpeaking: false), "Eco de cauda deve ser suprimido")
+        precondition(!suppressor.shouldSuppressAsSelfEcho(micRMS: 0.16, lowEnergy: 0.14, isAssistantSpeaking: true), "Barge-in humano forte deve passar")
+
+        // 5. Unavailable external brain fails honestly (zero fabricated smart chat)
+        let brain = LocalConversationalBrain()
+        brain.preferredEngineKind = .localLlamaCppMetal
+        let reply = await brain.streamReply(
+            userText: "Oi tudo bem",
+            systemInstructions: "Teste",
+            portableContextSummary: "",
+            language: .portugueseBR
+        ) { _ in }
+        precondition(brain.backendStatus == .compactHeuristicFallback && reply.lowercased().contains("indispon"), "Modelo ausente deve reportar indisponibilidade honesta")
+
+        // 6. Optional 11-stage trace stays disabled by default
+        let tel = VoiceTelemetryRecorder()
+        precondition(!tel.enablePipelineDiagnosticsTrace)
+        tel.recordPipelineTrace(stage: .microphone, sessionToken: "s1", turnEpoch: 1, detail: "segredo")
+        precondition(tel.pipelineTraceEvents.isEmpty, "Trace não pode gravar por padrão quando desativado")
+        tel.enablePipelineDiagnosticsTrace = true
+        tel.recordPipelineTrace(stage: .playback, sessionToken: "s1", turnEpoch: 1, detail: "ok")
+        precondition(tel.pipelineTraceEvents.count == 1)
+        tel.enablePipelineDiagnosticsTrace = false
+        precondition(tel.pipelineTraceEvents.isEmpty)
+
+        // 7. Structural Memory Hygiene catches ASR drift loops while preserving genuine user history
+        let tempContURL = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-cont-hygiene-\(UUID().uuidString).json")
+        let tempFTSURL = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-fts-hygiene-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: tempContURL)
+            try? FileManager.default.removeItem(at: tempFTSURL)
+        }
+        let cont = CodexRealtimeContinuityStore(fileURL: tempContURL)
+        let fts = VoiceSQLiteKnowledgeStore(databaseURL: tempFTSURL)
+        let tid = "thread-test-hygiene"
+        cont.recordItem(threadId: tid, role: "user", text: "Quero revisar a autenticação do módulo principal")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Claro, vou conferir os arquivos de login com você.")
+        cont.recordItem(threadId: tid, role: "user", text: "Molina")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Parece que você mencionou Molina.")
+        cont.recordItem(threadId: tid, role: "user", text: "Molina. Comendo")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Posso ajudar com comida ou Molina?")
+        cont.recordItem(threadId: tid, role: "user", text: "Molina. Comendo.")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Entendi, comida e Molina.")
+
+        let candidates = VoiceMemoryHygieneAnalyzer.scan(knowledgeStore: fts, continuityStore: cont)
+        precondition(candidates.contains(where: { $0.text == "Molina. Comendo." }), "Deve identificar loop de deriva ASR")
+        precondition(!candidates.contains(where: { $0.text.contains("autenticação do módulo principal") }), "Não pode marcar memória legítima do usuário")
+        let removed = VoiceMemoryHygieneAnalyzer.removeReviewedCandidates(candidates, knowledgeStore: fts, continuityStore: cont)
+        precondition(removed >= 4)
+        let remaining = cont.loadItems(for: tid)
+        precondition(remaining.count == 2 && remaining[0].text.contains("autenticação"), "Histórico legítimo precisa permanecer intacto")
+
+        print("PASS: Phase 1 & 2 fixes (routing, echo hangover, honest brain unavailability, trace opt-in, safe memory hygiene)")
     }
 }

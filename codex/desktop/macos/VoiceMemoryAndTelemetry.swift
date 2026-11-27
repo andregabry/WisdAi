@@ -158,7 +158,8 @@ public final class VoiceMemoryStore: ObservableObject {
     }
 
     public func seedFromHistoryItems(_ items: [CodexContinuityItem], providerID: String) {
-        let seeded: [VoiceTurnRecord] = items
+        let filtered = VoiceMemoryHygieneAnalyzer.filterCleanContextItems(items)
+        let seeded: [VoiceTurnRecord] = filtered
             .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .suffix(hardwareProfile.maxInMemoryTurns)
             .map { item in
@@ -459,6 +460,29 @@ public enum ProcessResourceProbe {
     }
 }
 
+public enum VoicePipelineTraceStage: String, CaseIterable, Codable, Sendable {
+    case microphone = "1. Microfone"
+    case acousticProcessing = "2. Processamento Acústico"
+    case partialSTT = "3. Transcrição Parcial"
+    case finalSTT = "4. Transcrição Final"
+    case retrievedContext = "5. Contexto Recuperado"
+    case systemPrompt = "6. System Prompt"
+    case conversationalModel = "7. Modelo Conversacional"
+    case textReply = "8. Resposta Textual"
+    case speechAdaptation = "9. Adaptação Oral"
+    case vocalSynthesis = "10. Síntese Vocal"
+    case playback = "11. Reprodução"
+}
+
+public struct VoicePipelineTraceEvent: Identifiable, Equatable, Sendable {
+    public let id = UUID()
+    public let timestamp: Date
+    public let stage: VoicePipelineTraceStage
+    public let sessionToken: String
+    public let turnEpoch: UInt64
+    public let payload: String
+}
+
 @MainActor
 public final class VoiceTelemetryRecorder: ObservableObject {
     @Published public private(set) var sttStats: LatencySummaryStats = .empty
@@ -470,6 +494,15 @@ public final class VoiceTelemetryRecorder: ObservableObject {
     @Published public private(set) var activeProviderLabel: String = "Apple Speech + Natural PCM"
     @Published public private(set) var resourceSnapshot: ProcessResourceSnapshot = ProcessResourceProbe.sample()
     @Published public private(set) var diagnosticLogs: [VoiceDiagnosticEvent] = []
+    /// Disabled by default per privacy policy; local-only in-memory pipeline trace when explicitly enabled by user.
+    @Published public var enablePipelineDiagnosticsTrace: Bool = false {
+        didSet {
+            if !enablePipelineDiagnosticsTrace {
+                pipelineTraceEvents.removeAll(keepingCapacity: false)
+            }
+        }
+    }
+    @Published public private(set) var pipelineTraceEvents: [VoicePipelineTraceEvent] = []
 
     private var sttSamples: [Double] = []
     private var llmSamples: [Double] = []
@@ -482,6 +515,30 @@ public final class VoiceTelemetryRecorder: ObservableObject {
 
     public func setActiveProviderLabel(_ label: String) {
         activeProviderLabel = VoiceLogRedactor.redact(label)
+    }
+
+    public func recordPipelineTrace(
+        stage: VoicePipelineTraceStage,
+        sessionToken: String,
+        turnEpoch: UInt64,
+        detail: String
+    ) {
+        guard enablePipelineDiagnosticsTrace else { return }
+        let safeDetail = VoiceLogRedactor.redact(String(detail.prefix(500)))
+        pipelineTraceEvents.append(VoicePipelineTraceEvent(
+            timestamp: Date(),
+            stage: stage,
+            sessionToken: sessionToken,
+            turnEpoch: turnEpoch,
+            payload: safeDetail
+        ))
+        if pipelineTraceEvents.count > 220 {
+            pipelineTraceEvents.removeFirst(pipelineTraceEvents.count - 220)
+        }
+    }
+
+    public func clearPipelineTrace() {
+        pipelineTraceEvents.removeAll(keepingCapacity: false)
     }
 
     public func recordSTTLatency(ms: Double) {
@@ -728,6 +785,251 @@ public final class VoiceSQLiteKnowledgeStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         sqlite3_exec(db, "DELETE FROM voice_facts; DELETE FROM voice_facts_fts;", nil, nil, nil)
+    }
+
+    public func listAllFacts(limit: Int = 200) -> [VoiceKnowledgeRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return [] }
+        let sql = """
+        SELECT id, content, source, project_scope, trust_tier, created_at
+        FROM voice_facts
+        ORDER BY created_at DESC
+        LIMIT ?;
+        """
+        var stmt: OpaquePointer?
+        var out: [VoiceKnowledgeRecord] = []
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_int(stmt, 1, Int32(max(1, min(limit, 500))))
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let id = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+                let content = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+                let source = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                let scope = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "global"
+                let tierRaw = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "auto"
+                let ts = sqlite3_column_double(stmt, 5)
+                out.append(VoiceKnowledgeRecord(
+                    id: id,
+                    content: content,
+                    source: source,
+                    projectScope: scope,
+                    trustTier: VoiceMemoryTrustTier(rawValue: tierRaw) ?? .auto,
+                    score: 1.0,
+                    createdAt: ts
+                ))
+            }
+            sqlite3_finalize(stmt)
+        }
+        return out
+    }
+
+    @discardableResult
+    public func deleteFacts(withIDs ids: [String]) -> Int {
+        guard !ids.isEmpty else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return 0 }
+        var removed = 0
+        for id in ids {
+            var stmt1: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM voice_facts WHERE id = ?;", -1, &stmt1, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt1, 1, id, -1, Self.sqliteTransient)
+                if sqlite3_step(stmt1) == SQLITE_DONE {
+                    removed += Int(sqlite3_changes(db))
+                }
+                sqlite3_finalize(stmt1)
+            }
+            var stmt2: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM voice_facts_fts WHERE fact_id = ?;", -1, &stmt2, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt2, 1, id, -1, Self.sqliteTransient)
+                sqlite3_step(stmt2)
+                sqlite3_finalize(stmt2)
+            }
+        }
+        return removed
+    }
+}
+
+// MARK: - Memory Contamination Inspection & Safe Selective Cleanup (Phase 2)
+
+public enum VoiceMemoryContaminationSource: String, Codable, Sendable {
+    case continuityStore = "Continuidade de Voz (~/.codex)"
+    case knowledgeFTS5 = "Banco FTS5 Local"
+}
+
+public struct VoiceMemoryContaminationCandidate: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let source: VoiceMemoryContaminationSource
+    public let threadOrScope: String
+    public let roleOrTier: String
+    public let text: String
+    public let reason: String
+}
+
+public enum VoiceMemoryHygieneAnalyzer {
+    public static func normalizeForComparison(_ text: String) -> String {
+        let lower = text.lowercased()
+            .folding(options: [.diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "pt_BR"))
+        let tokens = lower.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+        return tokens.joined(separator: " ")
+    }
+
+    public static func isZeroSemanticFragment(_ text: String) -> Bool {
+        normalizeForComparison(text).isEmpty
+    }
+
+    /// Identifies structurally contaminated sequences (e.g. ASR progressive drift "X" -> "X Y" -> "X Y." -> "X Y. .",
+    /// adjacent duplicate fragments, or quarantined prompt-injection entries) without using any hardcoded topic blacklist.
+    public static func detectContaminatedIndices(in items: [CodexContinuityItem]) -> [Int: String] {
+        var flagged: [Int: String] = [:]
+        guard !items.isEmpty else { return flagged }
+
+        var userIndices: [Int] = []
+        for idx in items.indices where items[idx].role == "user" {
+            userIndices.append(idx)
+        }
+
+        // 1. Structural incremental drift / cumulative re-emission & duplicate fragments across consecutive user turns
+        var normCounts: [String: Int] = [:]
+        for uIdx in userIndices {
+            let text = items[uIdx].text
+            if isZeroSemanticFragment(text) {
+                flagged[uIdx] = "Fragmento sem conteúdo semântico (apenas pontuação/ruído)"
+                continue
+            }
+            let norm = normalizeForComparison(text)
+            normCounts[norm, default: 0] += 1
+        }
+
+        for i in 0..<userIndices.count {
+            let curIdx = userIndices[i]
+            let curNorm = normalizeForComparison(items[curIdx].text)
+            let curWordCount = curNorm.split(separator: " ").count
+            guard !curNorm.isEmpty else { continue }
+
+            if i > 0 {
+                let prevIdx = userIndices[i - 1]
+                let prevNorm = normalizeForComparison(items[prevIdx].text)
+                let prevTrim = items[prevIdx].text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let curTrim = items[curIdx].text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if curNorm == prevNorm {
+                    let msg = "Reemissão duplicada / pontuação residual de turno anterior de ASR"
+                    flagged[prevIdx] = flagged[prevIdx] ?? msg
+                    flagged[curIdx] = msg
+                    if curIdx + 1 < items.count && items[curIdx + 1].role == "assistant" {
+                        flagged[curIdx + 1] = "Resposta automática a reemissão duplicada de ASR"
+                    }
+                    if prevIdx + 1 < items.count && items[prevIdx + 1].role == "assistant" {
+                        flagged[prevIdx + 1] = flagged[prevIdx + 1] ?? "Resposta associada a loop de reemissão ASR"
+                    }
+                } else if !prevNorm.isEmpty && curNorm.hasPrefix(prevNorm) && prevNorm.split(separator: " ").count <= 3 && curWordCount <= 5 && curTrim != prevTrim {
+                    let msg = "Deriva cumulativa de buffer ASR sem reset de segmento"
+                    flagged[prevIdx] = flagged[prevIdx] ?? msg
+                    flagged[curIdx] = msg
+                    if curIdx + 1 < items.count && items[curIdx + 1].role == "assistant" {
+                        flagged[curIdx + 1] = "Resposta a deriva cumulativa de buffer ASR"
+                    }
+                    if prevIdx + 1 < items.count && items[prevIdx + 1].role == "assistant" {
+                        flagged[prevIdx + 1] = flagged[prevIdx + 1] ?? "Resposta associada a segmento ASR aberto"
+                    }
+                }
+            }
+
+            if (normCounts[curNorm] ?? 0) >= 3 && curWordCount <= 4 {
+                flagged[curIdx] = flagged[curIdx] ?? "Fragmento curto repetido \(normCounts[curNorm] ?? 0)x em sequência"
+            }
+        }
+        return flagged
+    }
+
+    /// Prevents runaway ASR drift / noise fragments in seed history from poisoning fresh local sessions,
+    /// without touching legitimate stored files unless explicitly reviewed & deleted by user.
+    public static func filterCleanContextItems(_ items: [CodexContinuityItem]) -> [CodexContinuityItem] {
+        let dirty = detectContaminatedIndices(in: items)
+        return items.enumerated().compactMap { idx, item in
+            if dirty[idx] != nil { return nil }
+            let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if VoiceSQLiteKnowledgeStore.classifyTrustTier(for: trimmed, explicitTrusted: false) == .untrusted {
+                return nil
+            }
+            return item
+        }
+    }
+
+    public static func scan(
+        knowledgeStore: VoiceSQLiteKnowledgeStore,
+        continuityStore: CodexRealtimeContinuityStore
+    ) -> [VoiceMemoryContaminationCandidate] {
+        var candidates: [VoiceMemoryContaminationCandidate] = []
+
+        // 1. Continuity JSON (~/.codex/realtime-voice-continuity.json)
+        for (threadID, items) in continuityStore.allThreads().sorted(by: { $0.key < $1.key }) {
+            let dirty = detectContaminatedIndices(in: items)
+            for idx in dirty.keys.sorted() {
+                let item = items[idx]
+                candidates.append(VoiceMemoryContaminationCandidate(
+                    id: "cont|\(threadID)|\(idx)|\(item.text.hashValue)",
+                    source: .continuityStore,
+                    threadOrScope: threadID,
+                    roleOrTier: item.role,
+                    text: item.text,
+                    reason: dirty[idx] ?? "Anomalia estrutural de transcrição"
+                ))
+            }
+        }
+
+        // 2. Local SQLite FTS5 voice_facts
+        let facts = knowledgeStore.listAllFacts(limit: 250)
+        var seenNorm: [String: Int] = [:]
+        for f in facts {
+            seenNorm[normalizeForComparison(f.content), default: 0] += 1
+        }
+        for fact in facts {
+            if fact.trustTier == .untrusted {
+                candidates.append(VoiceMemoryContaminationCandidate(
+                    id: "fts|\(fact.id)",
+                    source: .knowledgeFTS5,
+                    threadOrScope: fact.projectScope,
+                    roleOrTier: "\(fact.source) [\(fact.trustTier.rawValue)]",
+                    text: fact.content,
+                    reason: "Marcado em quarentena (.untrusted / suspeita de prompt injection)"
+                ))
+            } else if fact.source == "user_voice" || isZeroSemanticFragment(fact.content) || ((seenNorm[normalizeForComparison(fact.content)] ?? 0) >= 2 && !fact.content.isEmpty) {
+                let words = normalizeForComparison(fact.content).split(separator: " ").count
+                if fact.source == "user_voice" && words <= 5 {
+                    candidates.append(VoiceMemoryContaminationCandidate(
+                        id: "fts|\(fact.id)",
+                        source: .knowledgeFTS5,
+                        threadOrScope: fact.projectScope,
+                        roleOrTier: "\(fact.source) [\(fact.trustTier.rawValue)]",
+                        text: fact.content,
+                        reason: "Transcrição bruta curta armazenada antes da correção de higiene"
+                    ))
+                }
+            }
+        }
+        return candidates
+    }
+
+    @discardableResult
+    public static func removeReviewedCandidates(
+        _ selected: [VoiceMemoryContaminationCandidate],
+        knowledgeStore: VoiceSQLiteKnowledgeStore,
+        continuityStore: CodexRealtimeContinuityStore
+    ) -> Int {
+        var removedCount = 0
+        let ftsIDs = selected
+            .filter { $0.source == .knowledgeFTS5 && $0.id.hasPrefix("fts|") }
+            .map { String($0.id.dropFirst(4)) }
+        removedCount += knowledgeStore.deleteFacts(withIDs: ftsIDs)
+
+        let byThread = Dictionary(grouping: selected.filter { $0.source == .continuityStore }, by: \.threadOrScope)
+        for (threadID, group) in byThread {
+            let texts = Set(group.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) })
+            removedCount += continuityStore.removeMatchingItems(threadId: threadID, matchingNormalizedTexts: texts)
+        }
+        return removedCount
     }
 }
 

@@ -182,6 +182,34 @@ public final class CodexRealtimeContinuityStore {
         writeFileLocked(payload)
     }
 
+    public func allThreads() -> [String: [CodexContinuityItem]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return readFileLocked().threads.mapValues { $0.items }
+    }
+
+    public func removeMatchingItems(threadId: String, matchingNormalizedTexts texts: Set<String>) -> Int {
+        guard !texts.isEmpty else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        var payload = readFileLocked()
+        guard var record = payload.threads[threadId] else { return 0 }
+        let before = record.items.count
+        record.items.removeAll { item in
+            texts.contains(item.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        let removed = before - record.items.count
+        if removed > 0 {
+            if record.items.isEmpty {
+                payload.threads.removeValue(forKey: threadId)
+            } else {
+                payload.threads[threadId] = record
+            }
+            writeFileLocked(payload)
+        }
+        return removed
+    }
+
     private func readFileLocked() -> CodexContinuityFilePayload {
         guard let data = try? Data(contentsOf: fileURL),
               let decoded = try? JSONDecoder().decode(CodexContinuityFilePayload.self, from: data) else {
