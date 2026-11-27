@@ -197,9 +197,17 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     private var isTTSWorkerRunning = false
     private var turnEvalTimer: DispatchSourceTimer?
     private var resourceTimer: DispatchSourceTimer?
-    private var lastAcousticSpeechTimestampNs: UInt64 = DispatchTime.now().uptimeNanoseconds
+    private var sessionGenerationID: UInt64 = 0
+    private var activeTurnGenerationID: UInt64 = 0
+    private var activePlaybackEpoch: UInt64 = 0
+    private var lastAcousticSpeechTimestampNs: UInt64 = 0
+    private var lastMicNonSilenceTimestampNs: UInt64 = 0
+    private var lastSTTResultTimestampNs: UInt64 = 0
+    private var lastFrameClearedEchoGate: Bool = false
     private var userSpeechStartedAtNs: UInt64 = 0
     private var turnSubmittedAtNs: UInt64 = 0
+    private var lastCommittedNormalizedUtterance: String = ""
+    private var lastCommittedUtteranceAtNs: UInt64 = 0
     private var firstLLMDeltaRecorded = false
     private var firstAudioChunkRecorded = false
     private var activeS2SAssistantItemID: String = ""
@@ -207,7 +215,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     private var onCommitUserUtterance: ((String) -> Void)?
     private var onTranscriptDeltaUI: ((String, String) -> Void)?
     private var activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])?
-    private var onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> Void)?
+    private var onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> VoiceDelegationDispatchResult)?
     private var onRecordLocalExchangeToChat: ((String, String) -> Void)?
     private var hasCodexAppServerConnected: Bool = false
 
@@ -400,11 +408,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
 
         guard isVoiceSessionActive, !isOutputMuted else { return }
+        let expectedSession = sessionGenerationID
         if state == .userSpeaking || state == .processing {
             Task { @MainActor [weak self] in
                 for _ in 0..<25 {
                     try? await Task.sleep(nanoseconds: 250_000_000)
-                    guard let self, self.isVoiceSessionActive, !self.isOutputMuted else { return }
+                    guard let self,
+                          self.sessionGenerationID == expectedSession,
+                          self.isVoiceSessionActive,
+                          !self.isOutputMuted else { return }
                     if self.state == .listening {
                         self.speakSystemNoticeNaturally(fullNotice, priorityInterrupt: false)
                         return
@@ -422,12 +434,24 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         greetingText: String?,
         hasCodexAppServer: Bool,
         activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])? = nil,
-        onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> Void)? = nil,
+        onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> VoiceDelegationDispatchResult)? = nil,
         onRecordLocalExchangeToChat: ((String, String) -> Void)? = nil,
         onCommitUserUtterance: @escaping (String) -> Void,
         onTranscriptDeltaUI: ((String, String) -> Void)? = nil
     ) async {
         stopSession(clearUI: false)
+        sessionGenerationID &+= 1
+        activeTurnGenerationID &+= 1
+        activePlaybackEpoch &+= 1
+        let currentSessionID = sessionGenerationID
+        lastAcousticSpeechTimestampNs = 0
+        lastMicNonSilenceTimestampNs = 0
+        lastSTTResultTimestampNs = 0
+        lastFrameClearedEchoGate = false
+        userSpeechStartedAtNs = 0
+        lastCommittedNormalizedUtterance = ""
+        lastCommittedUtteranceAtNs = 0
+
         self.onCommitUserUtterance = onCommitUserUtterance
         self.onTranscriptDeltaUI = onTranscriptDeltaUI
         self.activeTasksProvider = activeTasksProvider
@@ -466,7 +490,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         startupWatchdogTask?.cancel()
         startupWatchdogTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 3_500_000_000)
-            guard let self, !Task.isCancelled, self.isVoiceSessionActive else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.sessionGenerationID == currentSessionID,
+                  self.isVoiceSessionActive else { return }
             if self.state == .connecting || self.state == .initializingLocalEngine || self.state == .loadingModel {
                 self.telemetry.log(category: "Startup", message: "Watchdog de 3.5s acionado; ativando estado observável não bloqueante.")
                 if self.audioEngine.isRunning {
@@ -520,7 +547,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let permT0 = DispatchTime.now().uptimeNanoseconds
         let micGranted = await BoundedVoicePermissions.requestMicrophoneAuthorized(timeoutSeconds: 2.0)
         let permMs = Double(DispatchTime.now().uptimeNanoseconds &- permT0) / 1_000_000.0
-        guard isVoiceSessionActive else { return }
+        guard isVoiceSessionActive, sessionGenerationID == currentSessionID else { return }
         guard micGranted else {
             startupWatchdogTask?.cancel()
             let err = "Acesso ao microfone negado ou expirado. Habilite em Ajustes do Sistema → Privacidade e Segurança → Microfone."
@@ -537,6 +564,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let audioT0 = DispatchTime.now().uptimeNanoseconds
         do {
             try await audioEngine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+            guard isVoiceSessionActive, sessionGenerationID == currentSessionID else {
+                audioEngine.stop()
+                return
+            }
             let audioMs = Double(DispatchTime.now().uptimeNanoseconds &- audioT0) / 1_000_000.0
             let telSnap = audioEngine.telemetrySnapshot()
             let capState: VoiceComponentHealthState = (audioEngine.lastFault == nil) ? .ready : .degraded
@@ -563,18 +594,23 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
 
         let targetPipeline = resolvedPipeline
+        guard isVoiceSessionActive, sessionGenerationID == currentSessionID else { return }
         if targetPipeline.effectiveProvider == .openAIRealtimeAPI || targetPipeline.effectiveProvider == .geminiLiveAPI {
-            await startNativeS2SSession(pipeline: targetPipeline, greetingText: greetingText)
+            await startNativeS2SSession(pipeline: targetPipeline, greetingText: greetingText, sessionID: currentSessionID)
         } else {
-            await startStreamingPipelineSession(pipeline: targetPipeline, greetingText: greetingText)
+            await startStreamingPipelineSession(pipeline: targetPipeline, greetingText: greetingText, sessionID: currentSessionID)
         }
 
+        guard isVoiceSessionActive, sessionGenerationID == currentSessionID else { return }
         startupWatchdogTask?.cancel()
         lastStartupDurationMs = Double(DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000.0
         startResourcePolling()
     }
 
     public func stopSession(clearUI: Bool = true) {
+        sessionGenerationID &+= 1
+        activeTurnGenerationID &+= 1
+        activePlaybackEpoch &+= 1
         startupWatchdogTask?.cancel()
         startupWatchdogTask = nil
         localBrainGenerationTask?.cancel()
@@ -598,6 +634,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         vadTracker.reset()
         speechSegmenter.reset()
         isVoiceSessionActive = false
+        userSpeechStartedAtNs = 0
+        lastAcousticSpeechTimestampNs = 0
+        lastMicNonSilenceTimestampNs = 0
+        lastSTTResultTimestampNs = 0
         stateMachine.resetToIdle(reason: "Sessão encerrada pelo usuário")
         state = stateMachine.state
 
@@ -734,7 +774,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     // MARK: - Private Audio & Session Pipelines
 
-    private func startNativeS2SSession(pipeline: ResolvedVoicePipeline, greetingText: String?) async {
+    private func startNativeS2SSession(pipeline: ResolvedVoicePipeline, greetingText: String?, sessionID: UInt64) async {
+        guard isVoiceSessionActive, sessionGenerationID == sessionID else { return }
         let transport: RealtimeSpeechToSpeechTransport = (pipeline.effectiveProvider == .geminiLiveAPI)
             ? geminiLive
             : openAIRealtime
@@ -759,8 +800,13 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         do {
             try await transport.connect(config: cfg, resumptionHandle: geminiResumptionHandle) { [weak self] event in
                 Task { @MainActor [weak self] in
-                    self?.handleS2SEvent(event, providerID: transport.providerID)
+                    guard let self, self.sessionGenerationID == sessionID, self.isVoiceSessionActive else { return }
+                    self.handleS2SEvent(event, providerID: transport.providerID)
                 }
+            }
+            guard isVoiceSessionActive, sessionGenerationID == sessionID else {
+                await transport.disconnect()
+                return
             }
             transitionState(.listening, reason: "Sessão S2S conectada (\(transport.providerID))")
             if let greetingText, !greetingText.isEmpty {
@@ -770,6 +816,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 )
             }
         } catch {
+            guard isVoiceSessionActive, sessionGenerationID == sessionID else { return }
             telemetry.log(category: "S2S", message: "Falha ao conectar \(transport.providerID): \(error.localizedDescription); alternando para pipeline streaming local.")
             activeBannerNotice = error.localizedDescription
             await startStreamingPipelineSession(
@@ -780,7 +827,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                     isUsingPaidCloud: false,
                     advisoryBanner: error.localizedDescription
                 ),
-                greetingText: greetingText
+                greetingText: greetingText,
+                sessionID: sessionID
             )
         }
     }
@@ -854,13 +902,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
-    private func startStreamingPipelineSession(pipeline: ResolvedVoicePipeline, greetingText: String?) async {
+    private func startStreamingPipelineSession(pipeline: ResolvedVoicePipeline, greetingText: String?, sessionID: UInt64) async {
+        guard isVoiceSessionActive, sessionGenerationID == sessionID else { return }
         activeS2STransport = nil
         let sttProvider: StreamingSpeechToTextProvider = (pipeline.effectiveProvider == .hybridDeepgramElevenLabs)
             ? deepgramSTT
             : localSTT
         activeSTTProvider = sttProvider
         let sttT0 = DispatchTime.now().uptimeNanoseconds
+        let turnSnapshotAtStart = activeTurnGenerationID
 
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -870,18 +920,21 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         policy: policy,
                         onPartial: { [weak self] text in
                             Task { @MainActor [weak self] in
-                                self?.handlePartialTranscript(text)
+                                guard let self, self.sessionGenerationID == sessionID else { return }
+                                self.handlePartialTranscript(text, isFinalEvent: false, sessionID: sessionID, expectedTurnGeneration: turnSnapshotAtStart)
                             }
                         },
                         onFinal: { [weak self] text in
                             Task { @MainActor [weak self] in
-                                self?.handlePartialTranscript(text)
+                                guard let self, self.sessionGenerationID == sessionID else { return }
+                                self.handlePartialTranscript(text, isFinalEvent: true, sessionID: sessionID, expectedTurnGeneration: turnSnapshotAtStart)
                             }
                         },
                         onError: { [weak self] err in
                             Task { @MainActor [weak self] in
-                                self?.telemetry.log(category: "STT", message: err)
-                                self?.updateComponentStatus(.stt, state: .error, engineOrModel: sttProvider.providerID, lastError: err)
+                                guard let self, self.sessionGenerationID == sessionID else { return }
+                                self.telemetry.log(category: "STT", message: err)
+                                self.updateComponentStatus(.stt, state: .error, engineOrModel: sttProvider.providerID, lastError: err)
                             }
                         }
                     )
@@ -892,6 +945,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 }
                 try await group.next()
                 group.cancelAll()
+            }
+
+            guard isVoiceSessionActive, sessionGenerationID == sessionID else {
+                sttProvider.stop()
+                return
             }
 
             let sttMs = Double(DispatchTime.now().uptimeNanoseconds &- sttT0) / 1_000_000.0
@@ -905,6 +963,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             transitionState(.listening, reason: "Motor Autônomo ativo (\(sttProvider.providerID))")
             startTurnEvaluationLoop()
         } catch {
+            guard isVoiceSessionActive, sessionGenerationID == sessionID else { return }
             if case VoiceGatewayError.onDeviceRecognitionUnavailable = error {
                 showConsentDialog = true
             }
@@ -932,25 +991,53 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
-    private func handlePartialTranscript(_ text: String) {
+    private func handlePartialTranscript(_ text: String, isFinalEvent: Bool, sessionID: UInt64, expectedTurnGeneration: UInt64) {
+        guard sessionID == sessionGenerationID, isVoiceSessionActive, !isMuted else { return }
+        _ = expectedTurnGeneration // Epoch checked at STT segment boundary; sessionID isolates across restarts.
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, isVoiceSessionActive, !isMuted else { return }
-        // Recognition alone is not evidence of a new human turn (echo or stale callbacks).
-        let now = DispatchTime.now().uptimeNanoseconds
-        guard userSpeechStartedAtNs != 0,
-              now &- lastAcousticSpeechTimestampNs < 1_500_000_000 else { return }
+        guard !clean.isEmpty, !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(clean) else { return }
         guard state != .processing, state != .consultingAgent else { return }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        let hasRecentVAD = lastAcousticSpeechTimestampNs > 0 && (now &- lastAcousticSpeechTimestampNs < 2_200_000_000)
+        let hasRecentMicSignal = lastMicNonSilenceTimestampNs > 0 && (now &- lastMicNonSilenceTimestampNs < 2_200_000_000)
+
+        // Reject echoes and trailing speaker reverb, while allowing quiet/soft-spoken human mics when noise gate is quiet.
+        if echoSuppressor.isInEchoOrHangoverWindow && !(lastAcousticSpeechTimestampNs > 0 && (now &- lastAcousticSpeechTimestampNs < 550_000_000)) {
+            return
+        }
+        guard hasRecentVAD || hasRecentMicSignal else { return }
+
+        // Ignore duplicate echo of the just-committed utterance within 3.0s
+        let normClean = VoiceMemoryHygieneAnalyzer.normalizeForComparison(clean)
+        if !normClean.isEmpty,
+           normClean == lastCommittedNormalizedUtterance,
+           lastCommittedUtteranceAtNs > 0,
+           (now &- lastCommittedUtteranceAtNs) < 3_000_000_000 {
+            return
+        }
+
+        lastSTTResultTimestampNs = now
+        telemetry.recordPipelineTrace(
+            stage: isFinalEvent ? .finalSTT : .partialSTT,
+            sessionToken: "\(sessionGenerationID)",
+            turnEpoch: activeTurnGenerationID,
+            detail: clean
+        )
 
         if state == .assistantSpeaking {
             // Backchannel brief acknowledgements ("aham", "ok") should NOT cut off an ongoing reply unless sustained.
             if HybridTurnTakingAnalyzer.isLikelyBackchannelOnly(clean) {
                 return
             }
+            guard lastAcousticSpeechTimestampNs > 0, (now &- lastAcousticSpeechTimestampNs < 1_000_000_000) else {
+                return
+            }
             performManualOrVADBarageIn(reason: "Fala do usuário durante resposta")
         } else if state != .userSpeaking {
             transitionState(.userSpeaking, reason: "Transcrição parcial iniciada")
             if userSpeechStartedAtNs == 0 {
-                userSpeechStartedAtNs = DispatchTime.now().uptimeNanoseconds
+                userSpeechStartedAtNs = now
             }
         }
         liveUserTranscript = clean
@@ -976,11 +1063,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         guard !transcript.isEmpty, state == .userSpeaking else { return }
 
         let nowNs = DispatchTime.now().uptimeNanoseconds
-        let silenceMs = Double(nowNs &- lastAcousticSpeechTimestampNs) / 1_000_000.0
+        let latestActivityNs = max(lastAcousticSpeechTimestampNs, lastSTTResultTimestampNs)
+        let silenceMs = latestActivityNs > 0 ? Double(nowNs &- latestActivityNs) / 1_000_000.0 : 0
         let evaluation = HybridTurnTakingAnalyzer.evaluate(
             transcript: transcript,
             silenceDurationMs: silenceMs,
-            isAcousticSpeechActive: silenceMs < 180.0,
+            isAcousticSpeechActive: lastAcousticSpeechTimestampNs > 0 && (nowNs &- lastAcousticSpeechTimestampNs) < 180_000_000,
             language: behavior.languageVariant
         )
         lastTurnEvaluation = evaluation
@@ -994,14 +1082,38 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             } else {
                 committed = transcript
             }
-            let finalUtterance = committed.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawFinal = committed.isEmpty ? transcript : committed
+            let finalUtterance = rawFinal.trimmingCharacters(in: .whitespacesAndNewlines)
             liveUserTranscript = ""
             userSpeechStartedAtNs = 0
-            guard !finalUtterance.isEmpty else {
+            lastSTTResultTimestampNs = 0
+
+            guard !finalUtterance.isEmpty, !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(finalUtterance) else {
                 transitionState(.listening, reason: "Enunciado vazio após filtragem")
                 return
             }
-            turnSubmittedAtNs = DispatchTime.now().uptimeNanoseconds
+
+            let normFinal = VoiceMemoryHygieneAnalyzer.normalizeForComparison(finalUtterance)
+            if !normFinal.isEmpty,
+               normFinal == lastCommittedNormalizedUtterance,
+               lastCommittedUtteranceAtNs > 0,
+               (nowNs &- lastCommittedUtteranceAtNs) < 3_000_000_000 {
+                transitionState(.listening, reason: "Turno duplicado ignorado")
+                return
+            }
+
+            lastCommittedNormalizedUtterance = normFinal
+            lastCommittedUtteranceAtNs = nowNs
+            activeTurnGenerationID &+= 1
+
+            telemetry.recordPipelineTrace(
+                stage: .finalSTT,
+                sessionToken: "\(sessionGenerationID)",
+                turnEpoch: activeTurnGenerationID,
+                detail: finalUtterance
+            )
+
+            turnSubmittedAtNs = nowNs
             firstLLMDeltaRecorded = false
             firstAudioChunkRecorded = false
             transitionState(.processing, reason: evaluation.diagnosticReason)
@@ -1034,30 +1146,28 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
         case .delegateToSpecialist(let hint, let prompt, let riskTier, _):
             if let delegate = onDelegateTaskToAgent {
-                if riskTier == .high {
+                let outcome = delegate(hint, prompt, riskTier)
+                switch outcome {
+                case .awaitingUserApproval(let reason):
                     let safetyReply = behavior.languageVariant.bcp47LanguagePrefix == "en"
-                        ? "This request has high risk in the workspace. I sent it to the screen for your explicit approval before executing anything."
-                        : "Essa operação envolve risco alto no workspace. Enviei a solicitação para você revisar e aprovar na tela antes de executar."
+                        ? "This action requires manual approval on your screen before executing. \(reason)"
+                        : "Essa operação exige sua aprovação manual na tela antes de executar. \(reason)"
                     emitImmediateLocalSpeechReply(safetyReply, userUtterance: utterance)
-                    delegate(hint, prompt, riskTier)
-                } else {
-                    transitionState(.consultingAgent, reason: "Consultando especialista (\(hint.rawValue))")
-                    let agentLabel: String = {
-                        switch hint {
-                        case .claude: return "o Claude"
-                        case .antigravity: return "o Antigravity"
-                        case .codex: return "o Codex"
-                        case .autoActive: return "o agente ativo"
-                        }
-                    }()
+
+                case .dispatched(let confirmedAgentName):
                     let ackReply = behavior.languageVariant.bcp47LanguagePrefix == "en"
-                        ? "Got it. I just started that in the background, and we can keep talking while it runs."
-                        : "Certo, já acionei \(agentLabel) em segundo plano. Pode continuar conversando comigo normalmente enquanto ele trabalha."
+                        ? "Got it. \(confirmedAgentName) started working on that in the background, and we can keep talking while it runs."
+                        : "Certo, já acionei \(confirmedAgentName) em segundo plano com confirmação real da tarefa. Pode continuar conversando comigo normalmente enquanto ele executa."
                     emitImmediateLocalSpeechReply(ackReply, userUtterance: utterance)
-                    delegate(hint, prompt, riskTier)
+
+                case .unavailable(let reason):
+                    let failReply = behavior.languageVariant.bcp47LanguagePrefix == "en"
+                        ? "I could not dispatch the task to an agent: \(reason)"
+                        : "Não foi possível encaminhar a tarefa ao agente agora: \(reason)"
+                    emitImmediateLocalSpeechReply(failReply, userUtterance: utterance)
                 }
             } else {
-                // Fallback when running standalone or legacy single-callback caller
+                // Standalone / unit-test caller with single callback
                 onCommitUserUtterance?(utterance)
             }
 
@@ -1084,9 +1194,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         case .stopVoiceSession:
             let bye = behavior.languageVariant.bcp47LanguagePrefix == "en" ? "Closing voice mode. Talk soon!" : "Encerrando a conversa por voz. Até já!"
             emitImmediateLocalSpeechReply(bye, userUtterance: rawUtterance)
+            let expectedSess = sessionGenerationID
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
-                self?.stopSession(clearUI: true)
+                guard let self, self.sessionGenerationID == expectedSess else { return }
+                self.stopSession(clearUI: true)
             }
         case .switchLanguage(let targetLang):
             behavior.languageVariant = targetLang
@@ -1117,6 +1229,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         localBrainGenerationTask?.cancel()
         beginAssistantTurnResponseTracking()
 
+        let expectedSession = sessionGenerationID
+        let expectedTurn = activeTurnGenerationID
         let activeLang = behavior.languageVariant
         let systemPrompt = buildLocalBrainInstructions(for: activeLang)
         let portable = memoryStore.exportPortableSnapshot(targetProviderID: "wisdai_local_brain")
@@ -1131,18 +1245,57 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             }
         }
 
+        telemetry.recordPipelineTrace(
+            stage: .retrievedContext,
+            sessionToken: "\(expectedSession)",
+            turnEpoch: expectedTurn,
+            detail: contextSummary.isEmpty ? "(vazio)" : contextSummary
+        )
+        telemetry.recordPipelineTrace(
+            stage: .systemPrompt,
+            sessionToken: "\(expectedSession)",
+            turnEpoch: expectedTurn,
+            detail: systemPrompt
+        )
+
+        let recentPairs = portable.recentTurns.map { ($0.role, $0.text) }
+
         localBrainGenerationTask = Task { @MainActor [weak self] in
-            guard let self, self.isVoiceSessionActive else { return }
+            guard let self,
+                  self.isVoiceSessionActive,
+                  self.sessionGenerationID == expectedSession,
+                  self.activeTurnGenerationID == expectedTurn else { return }
             let reply = await self.localBrain.streamReply(
                 userText: utterance,
                 systemInstructions: systemPrompt,
                 portableContextSummary: contextSummary,
+                recentTurns: recentPairs,
                 language: activeLang
             ) { [weak self] delta in
-                self?.handleStreamingAssistantDelta(delta)
+                guard let self,
+                      !Task.isCancelled,
+                      self.isVoiceSessionActive,
+                      self.sessionGenerationID == expectedSession,
+                      self.activeTurnGenerationID == expectedTurn else { return }
+                self.handleStreamingAssistantDelta(delta)
             }
-            guard !Task.isCancelled, self.isVoiceSessionActive else { return }
+            guard !Task.isCancelled,
+                  self.isVoiceSessionActive,
+                  self.sessionGenerationID == expectedSession,
+                  self.activeTurnGenerationID == expectedTurn else { return }
             self.brainStatus = self.localBrain.backendStatus
+            self.updateComponentStatus(
+                .llm,
+                state: self.localBrain.backendStatus == .compactHeuristicFallback ? .degraded : .ready,
+                engineOrModel: self.localBrain.backendStatus.rawValue,
+                lastError: self.localBrain.lastErrorDetail
+            )
+            self.telemetry.recordPipelineTrace(
+                stage: .textReply,
+                sessionToken: "\(expectedSession)",
+                turnEpoch: expectedTurn,
+                detail: reply
+            )
             self.finishAssistantResponse(fullMarkdownText: reply)
             if !reply.isEmpty {
                 self.memoryStore.appendAssistantTurn(reply, providerID: "wisdai_local_brain", wasInterruptedByBargeIn: false)
@@ -1166,14 +1319,38 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         return instructions
     }
 
+    private final class PlaybackCancellationGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var currentEpoch: UInt64 = 0
+
+        func advanceEpoch() -> UInt64 {
+            lock.withLock {
+                currentEpoch &+= 1
+                return currentEpoch
+            }
+        }
+
+        func snapshotEpoch() -> UInt64 {
+            lock.withLock { currentEpoch }
+        }
+
+        func isCurrent(_ epoch: UInt64) -> Bool {
+            lock.withLock { currentEpoch == epoch }
+        }
+    }
+
+    private let playbackGate = PlaybackCancellationGate()
+
     private func wireAudioEngineCallbacks() {
         audioEngine.onInputAudioChunk = { [weak self] samples, sampleRate in
             guard let self, self.isVoiceSessionActive, !self.isMuted else { return }
             let levels = AudioPCMConverter.measureLevels(samples: samples)
             let isSpeakingOut = self.state == .assistantSpeaking
-            let bufferedOutMs = Double(self.audioEngine.outputJitterBuffer.stats.bufferedMs)
-            self.echoSuppressor.updateSpeakerEnvelope(
-                bufferedMs: bufferedOutMs,
+            let playRef = self.audioEngine.outputJitterBuffer.playbackReferenceState
+            self.echoSuppressor.updatePlaybackReference(
+                bufferedMs: playRef.bufferedMs,
+                playbackRMS: playRef.renderedRMS,
+                renderAgeMs: playRef.renderAgeMs,
                 micRMS: levels.rms,
                 isAssistantSpeaking: isSpeakingOut
             )
@@ -1183,8 +1360,14 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 lowEnergy: levels.low,
                 isAssistantSpeaking: isSpeakingOut
             )
+            self.lastFrameClearedEchoGate = !suppressedSelfEcho
             if suppressedSelfEcho {
                 return
+            }
+
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            if levels.rms >= 0.0065 && !self.echoSuppressor.isInEchoOrHangoverWindow {
+                self.lastMicNonSilenceTimestampNs = nowNs
             }
 
             let vadResult = self.vadTracker.processFrame(
@@ -1195,10 +1378,17 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             )
 
             if vadResult.isSpeechActive {
-                self.lastAcousticSpeechTimestampNs = DispatchTime.now().uptimeNanoseconds
+                self.lastAcousticSpeechTimestampNs = nowNs
+                self.lastMicNonSilenceTimestampNs = nowNs
                 if self.userSpeechStartedAtNs == 0 {
-                    self.userSpeechStartedAtNs = self.lastAcousticSpeechTimestampNs
+                    self.userSpeechStartedAtNs = nowNs
                 }
+                self.telemetry.recordPipelineTrace(
+                    stage: .acousticProcessing,
+                    sessionToken: "\(self.sessionGenerationID)",
+                    turnEpoch: self.activeTurnGenerationID,
+                    detail: String(format: "rms=%.3f low=%.3f high=%.3f sustained=%.0fms", levels.rms, levels.low, levels.high, vadResult.sustainedSpeechMs)
+                )
             }
 
             if vadResult.isIntentionalBargeIn {
@@ -1215,6 +1405,9 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
         audioEngine.onRawAudioBufferForSpeech = { [weak self] buffer in
             guard let self, self.isVoiceSessionActive, !self.isMuted else { return }
+            // Never feed STT while processing/thinking or when active frame belongs to self-playback echo.
+            guard self.state != .processing, self.state != .consultingAgent else { return }
+            guard self.lastFrameClearedEchoGate else { return }
             guard let stt = self.activeSTTProvider else { return }
             let floats = AudioPCMConverter.mixToMono(buffer: buffer)
             let levels = AudioPCMConverter.measureLevels(samples: floats)
@@ -1240,6 +1433,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             customDictionary: customPronunciation
         )
         guard !adapted.spokenText.isEmpty else { return }
+        telemetry.recordPipelineTrace(
+            stage: .speechAdaptation,
+            sessionToken: "\(sessionGenerationID)",
+            turnEpoch: activeTurnGenerationID,
+            detail: adapted.spokenText
+        )
         enqueueSpokenTextDirectly(adapted.spokenText)
     }
 
@@ -1255,19 +1454,37 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         isTTSWorkerRunning = true
         transitionState(.assistantSpeaking, reason: "Sintetizando resposta em streaming")
 
+        let expectedSession = sessionGenerationID
+        let expectedPlayback = playbackGate.advanceEpoch()
+        let gateRef = playbackGate
+
         ttsQueueTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                self.isTTSWorkerRunning = false
-                if self.isVoiceSessionActive && self.state == .assistantSpeaking {
-                    // Wait smoothly until jitter buffer drains before slipping back to .listening
-                    Task { @MainActor [weak self] in
-                        while let self, self.audioEngine.outputJitterBuffer.stats.bufferedMs > 40 {
-                            if !self.isVoiceSessionActive || self.state != .assistantSpeaking { return }
-                            try? await Task.sleep(nanoseconds: 45_000_000)
-                        }
-                        if let self, self.isVoiceSessionActive && self.state == .assistantSpeaking {
-                            self.transitionState(.listening, reason: "Fala da IA concluída")
+                if self.sessionGenerationID == expectedSession {
+                    self.isTTSWorkerRunning = false
+                    if self.isVoiceSessionActive && self.state == .assistantSpeaking {
+                        // Wait smoothly until jitter buffer drains before slipping back to .listening
+                        Task { @MainActor [weak self] in
+                            while let self,
+                                  self.sessionGenerationID == expectedSession,
+                                  gateRef.isCurrent(expectedPlayback),
+                                  self.audioEngine.outputJitterBuffer.stats.bufferedMs > 40 {
+                                if !self.isVoiceSessionActive || self.state != .assistantSpeaking { return }
+                                try? await Task.sleep(nanoseconds: 45_000_000)
+                            }
+                            if let self,
+                               self.sessionGenerationID == expectedSession,
+                               gateRef.isCurrent(expectedPlayback),
+                               self.isVoiceSessionActive && self.state == .assistantSpeaking {
+                                self.telemetry.recordPipelineTrace(
+                                    stage: .playback,
+                                    sessionToken: "\(expectedSession)",
+                                    turnEpoch: self.activeTurnGenerationID,
+                                    detail: "Reprodução concluída (jitter drenado)"
+                                )
+                                self.transitionState(.listening, reason: "Fala da IA concluída")
+                            }
                         }
                     }
                 }
@@ -1285,11 +1502,21 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 }
             }
 
-            while !Task.isCancelled && !self.queuedSpeechChunks.isEmpty {
+            while !Task.isCancelled,
+                  self.sessionGenerationID == expectedSession,
+                  gateRef.isCurrent(expectedPlayback),
+                  !self.queuedSpeechChunks.isEmpty {
                 let nextChunk = self.queuedSpeechChunks.removeFirst()
                 let tts = self.selectActiveTTSProvider()
                 let ttsStartNs = DispatchTime.now().uptimeNanoseconds
                 let latencyGate = ChunkLatencyGate()
+
+                self.telemetry.recordPipelineTrace(
+                    stage: .vocalSynthesis,
+                    sessionToken: "\(expectedSession)",
+                    turnEpoch: self.activeTurnGenerationID,
+                    detail: "[\(tts.providerID)] \(nextChunk.text)"
+                )
 
                 do {
                     try await tts.synthesizeChunk(
@@ -1298,11 +1525,16 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         voicePreference: self.effectiveTTSVoicePreference(),
                         rate: self.effectiveSpeechRate()
                     ) { [weak self] floats24k, spanLabel in
-                        guard let self, !Task.isCancelled else { return }
+                        guard let self,
+                              !Task.isCancelled,
+                              gateRef.isCurrent(expectedPlayback) else { return }
                         let nowNs = DispatchTime.now().uptimeNanoseconds
                         if latencyGate.claim() {
                             let ttsMs = Double(nowNs &- ttsStartNs) / 1_000_000.0
-                            Task { @MainActor in
+                            Task { @MainActor [weak self] in
+                                guard let self,
+                                      self.sessionGenerationID == expectedSession,
+                                      gateRef.isCurrent(expectedPlayback) else { return }
                                 self.hasLocalTTSWarmedUp = true
                                 self.telemetry.recordTTSFirstAudioLatency(ms: ttsMs)
                                 if !self.firstAudioChunkRecorded && self.turnSubmittedAtNs > 0 {
@@ -1316,7 +1548,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                     }
                 } catch {
                     // Transparent fallback to local clean Apple Natural voice if paid cloud TTS fails.
-                    if tts.requiresPaidOptIn {
+                    if tts.requiresPaidOptIn && gateRef.isCurrent(expectedPlayback) {
                         await MainActor.run {
                             self.telemetry.log(category: "TTS", message: "Fallback de TTS (\(tts.providerID)): \(error.localizedDescription)")
                         }
@@ -1326,7 +1558,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                             voicePreference: self.effectiveTTSVoicePreference(),
                             rate: self.effectiveSpeechRate()
                         ) { [weak self] floats24k, spanLabel in
-                            guard let self else { return }
+                            guard let self, !Task.isCancelled, gateRef.isCurrent(expectedPlayback) else { return }
                             _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(floats24k, transcriptText: spanLabel)
                         }
                     }
@@ -1347,6 +1579,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
 
     private func cancelAllOutgoingSpeechAndGeneration() {
+        _ = playbackGate.advanceEpoch()
+        activeTurnGenerationID &+= 1
         localBrainGenerationTask?.cancel()
         localBrainGenerationTask = nil
         ttsQueueTask?.cancel()

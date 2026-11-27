@@ -2187,11 +2187,12 @@ final class Workspace: ObservableObject {
                 return list
             },
             onDelegateTaskToAgent: { [weak self] agentHint, instruction, riskTier in
-                guard let self else { return }
+                guard let self else { return .unavailable(reason: "Workspace encerrado.") }
                 let clean = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !clean.isEmpty else { return }
+                guard !clean.isEmpty else { return .unavailable(reason: "Instrução vazia.") }
 
                 // Roteamento explícito de especialista mantendo a voz/identidade WisdAI inalterada
+                var resolvedAgentLabel = self.selectedAccount?.name ?? "o agente ativo"
                 if agentHint != .autoActive, let local = self.localDataRef {
                     let targetProvider: AIProvider? = {
                         switch agentHint {
@@ -2205,12 +2206,9 @@ final class Workspace: ObservableObject {
                         if let matched = local.aiAccounts.first(where: { $0.provider == targetProvider && $0.supportsExecution }) {
                             local.setActiveAccount(id: matched.id)
                             self.selectedAccount = matched
+                            resolvedAgentLabel = matched.name
                         } else {
-                            self.messages.append(Message(
-                                author: "Sistema",
-                                text: "ℹ️ Conta \(agentHint.rawValue.capitalized) não encontrada/disponível; executando via agente ativo (\(self.selectedAccount?.name ?? "WisdAI"))."
-                            ))
-                            self.persistCurrentMessages()
+                            return .unavailable(reason: "Nenhuma conta \(agentHint.rawValue.capitalized) autenticada e ativa está disponível no momento.")
                         }
                     }
                 }
@@ -2223,15 +2221,26 @@ final class Workspace: ObservableObject {
                         text: "🛡️ Segurança por Voz: comando de risco alto colocado no campo de envio para sua confirmação manual antes de executar."
                     ))
                     self.persistCurrentMessages()
-                    return
+                    return .awaitingUserApproval(reason: "A instrução foi colocada no campo de envio para revisão manual.")
                 }
 
                 if self.voice.voiceContinuityEnabled, let tid = self.selected {
                     CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: clean)
                 }
                 self.voiceTurnBaselineMessageID = self.messages.last(where: { ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text })?.id
+                let prevError = self.error
+                self.error = nil
                 self.prompt = clean
                 self.send()
+
+                if let sendErr = self.error, !sendErr.isEmpty, sendErr != prevError {
+                    return .unavailable(reason: sendErr)
+                }
+                let confirmed = self.busy || !self.activeTasks.isEmpty
+                guard confirmed else {
+                    return .unavailable(reason: self.error ?? "A execução não foi iniciada pelo orquestrador.")
+                }
+                return .dispatched(agentDisplayName: resolvedAgentLabel)
             },
             onRecordLocalExchangeToChat: { [weak self] userText, assistantText in
                 guard let self else { return }
@@ -2241,8 +2250,12 @@ final class Workspace: ObservableObject {
                 if let tid = self.selected ?? self.voice.realtimeThreadId {
                     self.ensureConversationRegistered(id: tid, title: u.isEmpty ? "Conversa por voz" : String(u.prefix(48)), cwd: self.project?.path ?? "")
                     if self.voice.voiceContinuityEnabled {
-                        if !u.isEmpty { CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: u) }
-                        if !a.isEmpty { CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "assistant", text: a) }
+                        if !u.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(u) {
+                            CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: u)
+                        }
+                        if !a.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(a) {
+                            CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "assistant", text: a)
+                        }
                     }
                 }
                 if !u.isEmpty {

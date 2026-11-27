@@ -597,7 +597,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         continuityMessages: [CodexContinuityItem],
         hasCodexAppServer: Bool,
         activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])? = nil,
-        onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> Void)? = nil,
+        onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> VoiceDelegationDispatchResult)? = nil,
         onRecordLocalExchangeToChat: ((String, String) -> Void)? = nil,
         greeting: String? = nil,
         onSpeech: @escaping (String) -> Void

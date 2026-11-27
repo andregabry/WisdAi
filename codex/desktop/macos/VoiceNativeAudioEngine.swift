@@ -390,6 +390,8 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
     public private(set) var overflowDropCount: UInt64 = 0
     private var isBuffering: Bool = true
     private var fadeInRemaining: Int = 0
+    private var lastRenderedRMS: Float = 0
+    private var lastRenderUptimeNs: UInt64 = 0
 
     public init(sampleRate: Double = 24_000, maxDurationSeconds: Double = 6.0) {
         self.sampleRate = max(8_000, sampleRate)
@@ -496,6 +498,7 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
                 targetPrebufferMs = min(160.0, targetPrebufferMs + 10.0)
                 isBuffering = true
             }
+            lastRenderedRMS = 0
             os_unfair_lock_unlock(&lock)
             output.initialize(repeating: 0, count: frameCount)
             outputLevelOut?.pointee = 0
@@ -527,10 +530,12 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
             }
             fadeInRemaining -= fadeLimit
         }
-        os_unfair_lock_unlock(&lock)
 
         var rms: Float = 0
         vDSP_rmsqv(output, 1, &rms, vDSP_Length(available))
+        lastRenderedRMS = rms
+        lastRenderUptimeNs = DispatchTime.now().uptimeNanoseconds
+        os_unfair_lock_unlock(&lock)
         outputLevelOut?.pointee = rms
         return available
     }
@@ -545,6 +550,7 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         bufferedCount = 0
         isBuffering = true
         fadeInRemaining = 0
+        lastRenderedRMS = 0
         spans.removeAll(keepingCapacity: false)
         totalQueuedSamples = totalPlayedSamples
         os_unfair_lock_unlock(&lock)
@@ -569,8 +575,22 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         targetPrebufferMs = 40.0
         isBuffering = true
         fadeInRemaining = 0
+        lastRenderedRMS = 0
+        lastRenderUptimeNs = 0
         spans.removeAll(keepingCapacity: false)
         os_unfair_lock_unlock(&lock)
+    }
+
+    public var playbackReferenceState: (bufferedMs: Double, renderedRMS: Float, renderAgeMs: Double) {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        os_unfair_lock_lock(&lock)
+        let bufMs = (Double(bufferedCount) / sampleRate) * 1000.0
+        let rms = lastRenderedRMS
+        let ageMs = lastRenderUptimeNs > 0 && nowNs >= lastRenderUptimeNs
+            ? Double(nowNs - lastRenderUptimeNs) / 1_000_000.0
+            : 9_999.0
+        os_unfair_lock_unlock(&lock)
+        return (bufMs, rms, ageMs)
     }
 
     public var stats: (bufferedMs: Double, playedMs: Double, targetPrebufferMs: Double, underruns: UInt64, overflows: UInt64) {
@@ -1216,8 +1236,9 @@ public final class VoiceNativeAudioEngine: ObservableObject {
                     Task { @MainActor [weak self] in
                         guard let self, self.isRunning else { return }
                         self.liveLevels = orb
-                        self.onRawAudioBufferForSpeech?(buffer)
+                        // Always update VAD + echo reference BEFORE forwarding raw audio to STT.
                         self.onInputAudioChunk?(copied, sr)
+                        self.onRawAudioBufferForSpeech?(buffer)
                     }
                 }
             }

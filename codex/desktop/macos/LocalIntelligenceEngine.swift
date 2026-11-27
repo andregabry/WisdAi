@@ -52,6 +52,12 @@ public enum VoiceIntentDecision: Equatable, Sendable {
     case delegateToSpecialist(agentHint: VoiceSpecialistAgentHint, prompt: String, riskTier: VoiceActionRiskTier, parallelFriendly: Bool)
 }
 
+public enum VoiceDelegationDispatchResult: Equatable, Sendable {
+    case dispatched(agentDisplayName: String)
+    case awaitingUserApproval(reason: String)
+    case unavailable(reason: String)
+}
+
 // MARK: - Deterministic Query Complexity & Intent Router
 
 /// Adapted conceptually from OpenJarvis ``learning/routing/complexity.py`` (Apache-2.0, Copyright 2025 The OpenJarvis Authors).
@@ -66,12 +72,36 @@ public enum LocalQueryComplexityAnalyzer {
         "o agente terminou", "alguma tarefa em andamento", "progress of", "running tasks"
     ]
 
+    private static let directDelegatePhrases = [
+        "pede ao ", "pede para o ", "pede pro ", "pede pra ",
+        "peça ao ", "peça para o ", "peça pro ", "peça pra ",
+        "manda o ", "mande o ", "chama o ", "chame o ",
+        "fala pro ", "fala com o ", "diga ao ", "solicite ao ",
+        "delegue ao ", "passa pro ",
+        "ask claude", "ask codex", "ask antigravity", "tell codex", "tell claude"
+    ]
+
     private static let workspaceActionPatterns = [
-        "edite", "edita", "editar", "altere", "altera", "alterar", "refatore", "refatora",
-        "corrija", "corrige", "corrigir", "implemente", "implementa", "crie um arquivo",
-        "rode os testes", "execute", "executa", "rode ", "instale", "compile", "build",
-        "analise o código", "analise o repositório", "verifique o arquivo", "pesquise no código",
-        "revisar", "revise", "review", "check the code", "edit the file", "run tests", "fix the bug"
+        "edite ", "edita ", "editar ", "altere ", "altera ", "alterar ", "refatore ", "refatora ",
+        "corrija ", "corrige ", "corrigir ", "implemente ", "implementa ", "crie um arquivo",
+        "rode os testes", "execute o", "executa o", "rode o", "compile o", "build ",
+        "analise o código", "analise o repositório", "analisar o projeto", "analisar a autenticação",
+        "verifique o arquivo", "pesquise no código", "revise o código", "check the code",
+        "edit the file", "run tests", "fix the bug"
+    ]
+
+    private static let conceptualQuestionPrefixes = [
+        "o que é ", "o que e ", "o que significa ", "como funciona ", "qual a diferença ",
+        "qual é a diferença ", "explique o que ", "por que ", "porque ", "você acha ",
+        "vale a pena ", "what is ", "how does ", "why does ", "explain "
+    ]
+
+    private static let complexReasoningKeywords = [
+        "arquitetura", "architecture", "concorrência", "concorrencia", "deadlock", "race condition",
+        "latência", "latencia", "trade-off", "tradeoff", "compare", "comparar", "diferença",
+        "autenticação", "autenticacao", "segurança", "seguranca", "memória", "memoria", "memory",
+        "duplex", "echo", "eco", "vad", "streaming", "quantiza", "benchmark", "algoritmo",
+        "cqrs", "event-driven", "mutex", "actor", "sqlite", "fts5"
     ]
 
     private static let destructivePatterns = [
@@ -91,6 +121,25 @@ public enum LocalQueryComplexityAnalyzer {
         if enScore > ptScore && enScore >= 1 { return .englishUS }
         if esScore > ptScore && esScore >= 1 { return .spanishES }
         return fallback
+    }
+
+    /// Evaluates semantic complexity independent of raw word count ("Por que deadlock?" can still be high-complexity).
+    public static func computeSemanticComplexityScore(utterance: String) -> Double {
+        let lower = utterance.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return 0.0 }
+        let words = lower.split(whereSeparator: { $0.isWhitespace })
+        var score = min(0.38, Double(words.count) / 48.0)
+        let conceptHits = complexReasoningKeywords.filter { lower.contains($0) }.count
+        if conceptHits > 0 {
+            score = max(score, 0.58 + min(0.32, Double(conceptHits) * 0.14))
+        }
+        if lower.contains("por que") || lower.contains("compare") || lower.contains("como evitar") || lower.contains("explain why") {
+            score = max(score, 0.65)
+        }
+        if lower.contains("?") {
+            score = max(score, 0.35)
+        }
+        return min(1.0, score)
     }
 
     public static func route(
@@ -125,16 +174,21 @@ public enum LocalQueryComplexityAnalyzer {
             return .queryTaskStatus(projectHint: extractProjectMention(from: trimmed))
         }
 
-        // 3. Explicit agent delegation ("Pede ao Claude...", "Manda o Codex...", "pede pro Antigravity...")
+        // 3. Explicit agent delegation or explicit actionable workspace request (never accidental on mere agent name mention or conceptual chat)
         let agentHint = detectAgentHint(in: lower)
-        let hasDirectDelegateVerb = lower.contains("pede ao ") || lower.contains("pede para o ") || lower.contains("pede pro ")
-            || lower.contains("manda o ") || lower.contains("chama o ") || lower.contains("ask claude") || lower.contains("ask codex")
-        let hasWorkspaceAction = workspaceActionPatterns.contains(where: { lower.contains($0) })
+        let hasDirectDelegateVerb = directDelegatePhrases.contains(where: { lower.contains($0) })
+        let isPureConceptualQuestion = conceptualQuestionPrefixes.contains(where: { lower.hasPrefix($0) }) && !hasDirectDelegateVerb
+        let hasWorkspaceAction = !isPureConceptualQuestion && workspaceActionPatterns.contains(where: { lower.contains($0) })
         let isHighRisk = destructivePatterns.contains(where: { lower.contains($0) })
 
         if hasDirectDelegateVerb || hasWorkspaceAction || isHighRisk {
-            let risk: VoiceActionRiskTier = isHighRisk ? .high : (lower.contains("rode") || lower.contains("edite") || lower.contains("corrija") ? .medium : .low)
-            let parallel = lower.contains("continua conversando") || lower.contains("enquanto") || lower.contains("continue talking") || agentHint != nil
+            let isWriteVerb = lower.contains("edite") || lower.contains("edita") || lower.contains("altere")
+                || lower.contains("corrija") || lower.contains("corrige") || lower.contains("implemente")
+                || lower.contains("crie um arquivo") || lower.contains("rode os testes")
+            let risk: VoiceActionRiskTier = isHighRisk ? .high : (isWriteVerb ? .medium : .low)
+            let parallel = lower.contains("continua conversando") || lower.contains("continue conversando")
+                || lower.contains("enquanto") || lower.contains("em paralelo") || lower.contains("em segundo plano")
+                || lower.contains("continue talking") || agentHint != nil
             return .delegateToSpecialist(
                 agentHint: agentHint ?? .autoActive,
                 prompt: trimmed,
@@ -143,9 +197,9 @@ public enum LocalQueryComplexityAnalyzer {
             )
         }
 
-        // 4. Local conversational brain handles greetings, reasoning, explanations, brainstorming, quick tech chat directly (<600ms warm)
+        // 4. Local conversational brain handles greetings, reasoning, memory questions, conceptual questions & brainstorming
         let detected = detectLanguage(from: trimmed, fallback: currentLanguage)
-        let score = min(1.0, Double(trimmed.split(whereSeparator: { $0.isWhitespace }).count) / 45.0)
+        let score = computeSemanticComplexityScore(utterance: trimmed)
         return .handleLocally(complexityScore: score, languageDetected: detected)
     }
 
@@ -170,10 +224,30 @@ public enum LocalQueryComplexityAnalyzer {
     }
 }
 
-// MARK: - Local Conversational Brain (Apple FoundationModels ANE + Smart Fallback)
+// MARK: - Interchangeable Conversational Brain Abstraction (Phase 3)
+
+public enum VoiceBrainEngineKind: String, CaseIterable, Identifiable, Codable, Sendable {
+    case adaptiveAuto = "auto"
+    case appleFoundationModels = "apple_foundation_models"
+    case localLlamaCppMetal = "llama_cpp_metal"
+    case localMLXServer = "mlx_compat_server"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .adaptiveAuto: return "Automático (Melhor Motor Local)"
+        case .appleFoundationModels: return "Apple FoundationModels (ANE Nativo)"
+        case .localLlamaCppMetal: return "llama.cpp Metal (Qwen / Gemma / Llama / Phi)"
+        case .localMLXServer: return "MLX Local Server (127.0.0.1)"
+        }
+    }
+}
 
 public enum LocalBrainBackendStatus: String, Sendable {
     case appleFoundationModelsReady = "Apple FoundationModels (On-Device ANE)"
+    case llamaCppMetalReady = "llama.cpp Metal Local (GGUF)"
+    case mlxLocalServerReady = "MLX Local Compat Server"
     case compactHeuristicFallback = "Modelo conversacional indisponível"
 }
 
@@ -181,43 +255,83 @@ public enum LocalBrainBackendStatus: String, Sendable {
 public final class LocalConversationalBrain: ObservableObject {
     @Published public private(set) var backendStatus: LocalBrainBackendStatus = .compactHeuristicFallback
     @Published public private(set) var isPrewarmed: Bool = false
+    @Published public private(set) var lastErrorDetail: String? = nil
+    @Published public var preferredEngineKind: VoiceBrainEngineKind = VoiceBrainEngineKind(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.brainEngineKind") ?? "") ?? .adaptiveAuto {
+        didSet {
+            UserDefaults.standard.set(preferredEngineKind.rawValue, forKey: "wisdai.voice.brainEngineKind")
+        }
+    }
+
+    public var externalLocalChatHandler: ((_ systemPrompt: String, _ recentHistory: [(role: String, text: String)], _ userText: String, _ language: VoiceLanguageVariant, _ onDelta: @escaping @MainActor (String) -> Void) async throws -> String)?
+    public var externalLocalReadyProvider: (() -> (ready: Bool, label: String))?
 
     #if canImport(FoundationModels)
     // Type-erased storage keeps deployment target compatibility cleanly across macOS 14..27.
     private var fmSessionBox: Any?
     #endif
+    private var lastAppliedInstructionsDigest: Int = 0
     private var approximateSessionTokens: Int = 0
     private let maxSafeTokenBudget = 3200 // Reserve margin cleanly below Apple FM 4,096 context cap
+    private var recentAssistantOpenings: [String] = []
 
     public init() {
+        refreshBackendAvailability()
+    }
+
+    public func refreshBackendAvailability() {
+        if preferredEngineKind == .localLlamaCppMetal || preferredEngineKind == .localMLXServer {
+            if let ext = externalLocalReadyProvider?(), ext.ready {
+                backendStatus = (preferredEngineKind == .localMLXServer) ? .mlxLocalServerReady : .llamaCppMetalReady
+                return
+            }
+        }
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
             if case .available = SystemLanguageModel.default.availability {
                 backendStatus = .appleFoundationModelsReady
+                return
             }
         }
         #endif
+        if let ext = externalLocalReadyProvider?(), ext.ready {
+            backendStatus = .llamaCppMetalReady
+        } else {
+            backendStatus = .compactHeuristicFallback
+        }
     }
 
     public func prewarm(instructions: String) {
+        if (preferredEngineKind == .localLlamaCppMetal || preferredEngineKind == .localMLXServer),
+           let ext = externalLocalReadyProvider?(), ext.ready {
+            backendStatus = (preferredEngineKind == .localMLXServer) ? .mlxLocalServerReady : .llamaCppMetalReady
+            lastAppliedInstructionsDigest = instructions.hashValue
+            isPrewarmed = true
+            return
+        }
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *),
+           preferredEngineKind != .localLlamaCppMetal,
+           preferredEngineKind != .localMLXServer,
            case .available = SystemLanguageModel.default.availability {
             backendStatus = .appleFoundationModelsReady
             let session = LanguageModelSession(instructions: instructions)
             session.prewarm()
             self.fmSessionBox = session
+            self.lastAppliedInstructionsDigest = instructions.hashValue
             self.approximateSessionTokens = max(64, instructions.count / 4)
             self.isPrewarmed = true
+            self.lastErrorDetail = nil
             return
         }
         #endif
-        backendStatus = .compactHeuristicFallback
+        refreshBackendAvailability()
         isPrewarmed = true
     }
 
     public func resetSession(instructions: String) {
         approximateSessionTokens = 0
+        lastAppliedInstructionsDigest = 0
+        recentAssistantOpenings.removeAll(keepingCapacity: false)
         #if canImport(FoundationModels)
         fmSessionBox = nil
         #endif
@@ -228,72 +342,140 @@ public final class LocalConversationalBrain: ObservableObject {
         userText: String,
         systemInstructions: String,
         portableContextSummary: String,
+        recentTurns: [(role: String, text: String)] = [],
         language: VoiceLanguageVariant,
         onDelta: @escaping @MainActor (String) -> Void
     ) async -> String {
+        lastErrorDetail = nil
+        var enrichedInstructions = systemInstructions
+        if !portableContextSummary.isEmpty {
+            enrichedInstructions += "\n\n<portable_context_reference>\n\(String(portableContextSummary.prefix(1200)))\n</portable_context_reference>"
+        }
+        if !recentAssistantOpenings.isEmpty {
+            let openingsHint = recentAssistantOpenings.suffix(3).joined(separator: " | ")
+            enrichedInstructions += "\nEvite repetir as mesmas aberturas usadas recentemente (\(openingsHint)); varie naturalmente como em diálogo humano."
+        }
+
+        // Route to external local runtime (llama.cpp Metal / MLX Server) if explicitly selected or when Apple FM unavailable
+        let useExternalFirst: Bool = {
+            if preferredEngineKind == .localLlamaCppMetal || preferredEngineKind == .localMLXServer {
+                return externalLocalChatHandler != nil && (externalLocalReadyProvider?().ready ?? false)
+            }
+            if preferredEngineKind == .adaptiveAuto,
+               let ext = externalLocalReadyProvider?(), ext.ready,
+               externalLocalChatHandler != nil {
+                // Prefer loaded GGUF model in Adaptive mode only when user intentionally loaded one; otherwise Apple FM runs with 0 heap load.
+                return true
+            }
+            return false
+        }()
+
+        if useExternalFirst, let handler = externalLocalChatHandler {
+            do {
+                backendStatus = (preferredEngineKind == .localMLXServer) ? .mlxLocalServerReady : .llamaCppMetalReady
+                let reply = try await handler(enrichedInstructions, recentTurns, userText, language, onDelta)
+                let clean = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !clean.isEmpty && !Task.isCancelled {
+                    recordOpening(from: clean)
+                    return clean
+                }
+            } catch {
+                if Task.isCancelled { return "" }
+                lastErrorDetail = "Motor local selecionado falhou: \(error.localizedDescription)"
+                if preferredEngineKind != .adaptiveAuto {
+                    refreshBackendAvailability()
+                    return emitUnavailableNotice(language: language, detail: lastErrorDetail, onDelta: onDelta)
+                }
+            }
+        }
+
         let userTokens = max(8, userText.count / 4)
         if approximateSessionTokens + userTokens > maxSafeTokenBudget {
-            // Proactively compact session before hitting Apple FM 4,096 token ceiling
-            let compactedInstructions = systemInstructions + (portableContextSummary.isEmpty ? "" : "\n\nContext summary:\n\(String(portableContextSummary.prefix(1200)))")
-            resetSession(instructions: compactedInstructions)
+            resetSession(instructions: enrichedInstructions)
         }
 
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *),
+           preferredEngineKind != .localLlamaCppMetal,
+           preferredEngineKind != .localMLXServer,
            case .available = SystemLanguageModel.default.availability {
-            let activeSession: LanguageModelSession
-            if let existing = fmSessionBox as? LanguageModelSession {
-                activeSession = existing
-            } else {
-                let s = LanguageModelSession(instructions: systemInstructions)
-                s.prewarm()
-                fmSessionBox = s
-                activeSession = s
-            }
+            backendStatus = .appleFoundationModelsReady
 
-            let languageCue: String = {
-                switch language {
-                case .englishUS: return "[Respond naturally in English matching the user] "
-                case .spanishES: return "[Responde naturalmente en español] "
-                case .portuguesePT: return "[Responde em português europeu natural] "
-                case .portugueseBR: return "[Responda naturalmente em português brasileiro] "
+            for attempt in 0..<2 {
+                if Task.isCancelled { return "" }
+                let activeSession: LanguageModelSession
+                if attempt == 0,
+                   let existing = fmSessionBox as? LanguageModelSession,
+                   (lastAppliedInstructionsDigest == 0 || !portableContextSummary.isEmpty || lastAppliedInstructionsDigest == enrichedInstructions.hashValue) {
+                    activeSession = existing
+                } else {
+                    let s = LanguageModelSession(instructions: enrichedInstructions)
+                    s.prewarm()
+                    fmSessionBox = s
+                    lastAppliedInstructionsDigest = enrichedInstructions.hashValue
+                    approximateSessionTokens = max(64, enrichedInstructions.count / 4)
+                    activeSession = s
                 }
-            }()
-            let promptInput = languageCue + userText
 
-            var emittedPrefixLen = 0
-            var fullReply = ""
-            do {
-                for try await partial in activeSession.streamResponse(to: promptInput) {
+                var emittedPrefixLen = 0
+                var fullReply = ""
+                do {
+                    for try await partial in activeSession.streamResponse(to: userText) {
+                        if Task.isCancelled { return "" }
+                        let current = partial.content
+                        if current.count > emittedPrefixLen {
+                            let startIdx = current.index(current.startIndex, offsetBy: emittedPrefixLen)
+                            let delta = String(current[startIdx...])
+                            emittedPrefixLen = current.count
+                            fullReply = current
+                            onDelta(delta)
+                        }
+                    }
+                    let finalClean = fullReply.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !finalClean.isEmpty {
+                        approximateSessionTokens += userTokens + max(16, finalClean.count / 4)
+                        recordOpening(from: finalClean)
+                        return finalClean
+                    }
+                } catch {
                     if Task.isCancelled { return "" }
-                    let current = partial.content
-                    if current.count > emittedPrefixLen {
-                        let startIdx = current.index(current.startIndex, offsetBy: emittedPrefixLen)
-                        let delta = String(current[startIdx...])
-                        emittedPrefixLen = current.count
-                        fullReply = current
-                        onDelta(delta)
+                    lastErrorDetail = error.localizedDescription
+                    #if DEBUG
+                    #endif
+                    fmSessionBox = nil
+                    // Never fabricate or append text onto a partial response already heard by user
+                    if !fullReply.isEmpty { return fullReply }
+                    if attempt == 0 {
+                        approximateSessionTokens = 0
+                        continue
                     }
                 }
-                let finalClean = fullReply.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !finalClean.isEmpty {
-                    approximateSessionTokens += userTokens + max(16, finalClean.count / 4)
-                    return finalClean
-                }
-            } catch {
-                if Task.isCancelled { return "" }
-                resetSession(instructions: systemInstructions)
-                // Do not append a fabricated fallback to a reply already streamed.
-                if !fullReply.isEmpty { return fullReply }
             }
         }
         #endif
 
         guard !Task.isCancelled else { return "" }
         backendStatus = .compactHeuristicFallback
-        let fallback = deterministicNaturalFallback(for: userText, language: language)
+        return emitUnavailableNotice(language: language, detail: lastErrorDetail, onDelta: onDelta)
+    }
+
+    private func emitUnavailableNotice(
+        language: VoiceLanguageVariant,
+        detail: String?,
+        onDelta: @escaping @MainActor (String) -> Void
+    ) -> String {
+        let fallback = deterministicNaturalFallback(for: "", language: language, errorDetail: detail)
         onDelta(fallback)
         return fallback
+    }
+
+    private func recordOpening(from reply: String) {
+        let prefix = String(reply.prefix(24)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prefix.isEmpty else { return }
+        recentAssistantOpenings.append(prefix)
+        if recentAssistantOpenings.count > 4 {
+            recentAssistantOpenings.removeFirst(recentAssistantOpenings.count - 4)
+        }
     }
 
     public static func formatTaskStatusReply(
@@ -316,16 +498,16 @@ public final class LocalConversationalBrain: ObservableObject {
         return "Existem \(tasks.count) tarefas em execução: \(descriptions)."
     }
 
-    private func deterministicNaturalFallback(for input: String, language: VoiceLanguageVariant) -> String {
+    private func deterministicNaturalFallback(for input: String, language: VoiceLanguageVariant, errorDetail: String? = nil) -> String {
         switch language {
         case .englishUS:
-            return "The local conversation model is unavailable. Please try again or explicitly ask me to consult an agent."
+            return "The local conversation model is unavailable right now. Please try again or explicitly ask me to consult an agent."
         case .spanishES:
-            return "El modelo de conversación local no está disponible. Inténtalo de nuevo o pide que consulte a un agente."
+            return "El modelo de conversación local no está disponible ahora mismo. Inténtalo de nuevo o pide que consulte a un agente."
         case .portuguesePT:
-            return "O modelo de conversação local está indisponível. Tenta novamente ou pede-me para consultar um agente."
+            return "O modelo de conversação local está indisponível neste momento. Tenta novamente ou pede-me para consultar um agente."
         case .portugueseBR:
-            return "O modelo de conversação local está indisponível. Tente novamente ou peça para eu consultar um agente."
+            return "O modelo de conversação local está indisponível no momento. Tente novamente ou peça explicitamente para eu consultar um agente."
         }
     }
 }
