@@ -426,6 +426,7 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
     private var ewmaArrivalJitterMs: Double = 0
     private var spans: [SpokenSpan] = []
 
+    public private(set) var basePrebufferMs: Double = 40.0
     public private(set) var targetPrebufferMs: Double = 40.0
     public private(set) var underrunCount: UInt64 = 0
     public private(set) var overflowDropCount: UInt64 = 0
@@ -438,9 +439,12 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
     private var lastFlushUptimeNs: UInt64 = 0
     private var firstSilentRenderAfterFlushUptimeNs: UInt64 = 0
 
-    public init(sampleRate: Double = 24_000, maxDurationSeconds: Double = 6.0) {
+    public init(sampleRate: Double = 24_000, maxDurationSeconds: Double = 6.0, basePrebufferMs: Double = 40.0) {
         self.sampleRate = max(8_000, sampleRate)
         self.capacitySamples = max(4_800, Int(self.sampleRate * maxDurationSeconds))
+        let clampedBase = max(5.0, min(120.0, basePrebufferMs))
+        self.basePrebufferMs = clampedBase
+        self.targetPrebufferMs = clampedBase
         self.storage = UnsafeMutablePointer<Float>.allocate(capacity: self.capacitySamples)
         self.storage.initialize(repeating: 0, count: self.capacitySamples)
     }
@@ -632,7 +636,7 @@ public final class AdaptiveJitterBuffer: @unchecked Sendable {
         totalPlayedSamples = 0
         lastEnqueueUptimeNs = 0
         ewmaArrivalJitterMs = 0
-        targetPrebufferMs = 40.0
+        targetPrebufferMs = basePrebufferMs
         isBuffering = true
         fadeInRemaining = 0
         lastRenderedRMS = 0
@@ -873,6 +877,9 @@ public final class VoiceNativeAudioEngine: ObservableObject {
     public let memoryProfile: HardwareMemoryProfile
     public let captureRingBuffer: PreallocatedFloatRingBuffer
     public let outputJitterBuffer: AdaptiveJitterBuffer
+    /// Priority-4 playback channel for <100ms cached active-listening backchannels & micro-vocalizations.
+    /// Yields immediately to Priority-3 `outputJitterBuffer` (main reply) and Priority-1/2 user speech/barge-in.
+    public let auxiliaryVocalizationBuffer: AdaptiveJitterBuffer
 
     public var onInputAudioChunk: (([Float], Double) -> Void)?
     public var onRawAudioBufferForSpeech: ((AVAudioPCMBuffer) -> Void)?
@@ -900,6 +907,11 @@ public final class VoiceNativeAudioEngine: ObservableObject {
         self.outputJitterBuffer = AdaptiveJitterBuffer(
             sampleRate: renderOutputRate,
             maxDurationSeconds: memoryProfile.maxOutputJitterSeconds
+        )
+        self.auxiliaryVocalizationBuffer = AdaptiveJitterBuffer(
+            sampleRate: renderOutputRate,
+            maxDurationSeconds: 2.0,
+            basePrebufferMs: 10.0
         )
         refreshDevices()
         installCoreAudioDeviceObservers()
@@ -1183,13 +1195,53 @@ public final class VoiceNativeAudioEngine: ObservableObject {
         stopEngineOnly()
         captureRingBuffer.flush()
         _ = outputJitterBuffer.flushAndCaptureHeardSnapshot()
+        _ = auxiliaryVocalizationBuffer.flushAndCaptureHeardSnapshot()
         processingStatus = .inactive
         liveLevels = .zero
     }
 
     @discardableResult
     public func bargeInFlushPlayback() -> JitterBufferFlushSnapshot {
+        _ = auxiliaryVocalizationBuffer.flushAndCaptureHeardSnapshot()
         return outputJitterBuffer.flushAndCaptureHeardSnapshot()
+    }
+
+    public func flushAuxiliaryVocalizationOnly() {
+        _ = auxiliaryVocalizationBuffer.flushAndCaptureHeardSnapshot()
+    }
+
+    /// Enqueues a pre-warmed cached vocalization (Priority 4) without resetting main reply history.
+    /// Returns false if main assistant response audio is currently buffered/active (no overlap permitted).
+    @discardableResult
+    public func enqueueAuxiliaryVocalization(_ samples24k: [Float], label: String? = nil) -> Bool {
+        guard !samples24k.isEmpty else { return false }
+        let mainState = outputJitterBuffer.playbackReferenceState
+        guard mainState.bufferedMs <= 12.0 && mainState.renderAgeMs >= 90.0 else {
+            return false
+        }
+        auxiliaryVocalizationBuffer.resetForNewResponse()
+        _ = auxiliaryVocalizationBuffer.pushFloatSamples(samples24k, transcriptText: label)
+        return true
+    }
+
+    public var isAuxiliaryPlaybackActive: Bool {
+        let ref = auxiliaryVocalizationBuffer.playbackReferenceState
+        return ref.bufferedMs > 2.0 || (ref.renderAgeMs < 95.0 && ref.renderedRMS > 0.002)
+    }
+
+    public var combinedPlaybackReferenceState: (bufferedMs: Double, renderedRMS: Float, renderAgeMs: Double, isAuxiliaryOnly: Bool) {
+        let mainRef = outputJitterBuffer.playbackReferenceState
+        let auxRef = auxiliaryVocalizationBuffer.playbackReferenceState
+        let mainActive = mainRef.bufferedMs > 1.0 || mainRef.renderAgeMs < 140.0
+        if mainActive || mainRef.renderedRMS >= auxRef.renderedRMS {
+            return (
+                bufferedMs: max(mainRef.bufferedMs, auxRef.bufferedMs),
+                renderedRMS: max(mainRef.renderedRMS, auxRef.renderedRMS),
+                renderAgeMs: min(mainRef.renderAgeMs, auxRef.renderAgeMs),
+                isAuxiliaryOnly: !mainActive && (auxRef.bufferedMs > 1.0 || auxRef.renderAgeMs < 140.0)
+            )
+        }
+        return (auxRef.bufferedMs, auxRef.renderedRMS, auxRef.renderAgeMs, true)
     }
 
     public var currentOutputHardwareLatencyMs: Double {
@@ -1253,10 +1305,12 @@ public final class VoiceNativeAudioEngine: ObservableObject {
 
         if enablePlayback {
             let jitterRef = outputJitterBuffer
+            let auxJitterRef = auxiliaryVocalizationBuffer
             guard let sourceFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: renderOutputRate, channels: 1, interleaved: false) else {
                 throw NSError(domain: "VoiceNativeAudioEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: "Formato de saída inválido."])
             }
             var scratch = [Float](repeating: 0, count: 4096)
+            var auxScratch = [Float](repeating: 0, count: 4096)
             var lastPullRms: Float = 0
 
             let sourceNode = AVAudioSourceNode(format: sourceFmt) { _, _, frameCount, audioBufferList -> OSStatus in
@@ -1267,17 +1321,35 @@ public final class VoiceNativeAudioEngine: ObservableObject {
                 }
                 let needed = min(frames, scratch.count)
                 var rms: Float = 0
-                let pulled = scratch.withUnsafeMutableBufferPointer { buf in
+                let pulledMain = scratch.withUnsafeMutableBufferPointer { buf in
                     guard let base = buf.baseAddress else { return 0 }
                     return jitterRef.renderPull(into: base, frameCount: needed, outputLevelOut: &rms)
                 }
-                if pulled > 0 {
-                    outPtr.update(from: scratch, count: pulled)
+                if pulledMain > 0 {
+                    // Priority 3 (main reply) strictly suppresses Priority 4 (auxiliary backchannel).
+                    if auxJitterRef.stats.bufferedMs > 0 {
+                        _ = auxJitterRef.flushAndCaptureHeardSnapshot()
+                    }
+                    outPtr.update(from: scratch, count: pulledMain)
+                    if frames > pulledMain {
+                        outPtr.advanced(by: pulledMain).initialize(repeating: 0, count: frames - pulledMain)
+                    }
+                    lastPullRms = rms
+                    return noErr
                 }
-                if frames > pulled {
-                    outPtr.advanced(by: pulled).initialize(repeating: 0, count: frames - pulled)
+
+                var auxRms: Float = 0
+                let pulledAux = auxScratch.withUnsafeMutableBufferPointer { buf in
+                    guard let base = buf.baseAddress else { return 0 }
+                    return auxJitterRef.renderPull(into: base, frameCount: needed, outputLevelOut: &auxRms)
                 }
-                lastPullRms = rms
+                if pulledAux > 0 {
+                    outPtr.update(from: auxScratch, count: pulledAux)
+                }
+                if frames > pulledAux {
+                    outPtr.advanced(by: pulledAux).initialize(repeating: 0, count: frames - pulledAux)
+                }
+                lastPullRms = auxRms
                 return noErr
             }
             self.outputSourceNode = sourceNode

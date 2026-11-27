@@ -238,6 +238,14 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
     public var languageVariant: VoiceLanguageVariant
     public var autoSummarizeTechnicalReplies: Bool
 
+    // Voice Intelligence V3 Conversational Behavior Controls
+    public var profilePreset: VoiceConversationProfilePreset
+    public var backchannelFrequency: Double   // 0.0...1.0
+    public var vocalizationIntensity: Double  // 0.15...0.75
+    public var pauseScale: Double             // 0.65...1.60
+    public var enableActiveListening: Bool
+    public var enableContextualProsody: Bool
+
     public static let `default` = VoiceBehaviorProfile(
         personality: .naturalPartner,
         formality: .balanced,
@@ -246,8 +254,119 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
         technicalDepth: .practical,
         speechRate: 1.0,
         languageVariant: .portugueseBR,
-        autoSummarizeTechnicalReplies: true
+        autoSummarizeTechnicalReplies: true,
+        profilePreset: .natural,
+        backchannelFrequency: 0.60,
+        vocalizationIntensity: 0.40,
+        pauseScale: 1.0,
+        enableActiveListening: true,
+        enableContextualProsody: true
     )
+
+    public init(
+        personality: VoicePersonalityStyle = .naturalPartner,
+        formality: VoiceFormalityLevel = .balanced,
+        expressivity: VoiceExpressivityLevel = .balanced,
+        detailLevel: VoiceDetailLevel = .balanced,
+        technicalDepth: VoiceTechnicalDepth = .practical,
+        speechRate: Float = 1.0,
+        languageVariant: VoiceLanguageVariant = .portugueseBR,
+        autoSummarizeTechnicalReplies: Bool = true,
+        profilePreset: VoiceConversationProfilePreset = .natural,
+        backchannelFrequency: Double = 0.60,
+        vocalizationIntensity: Double = 0.40,
+        pauseScale: Double = 1.0,
+        enableActiveListening: Bool = true,
+        enableContextualProsody: Bool = true
+    ) {
+        self.personality = personality
+        self.formality = formality
+        self.expressivity = expressivity
+        self.detailLevel = detailLevel
+        self.technicalDepth = technicalDepth
+        self.speechRate = speechRate
+        self.languageVariant = languageVariant
+        self.autoSummarizeTechnicalReplies = autoSummarizeTechnicalReplies
+        self.profilePreset = profilePreset
+        self.backchannelFrequency = backchannelFrequency
+        self.vocalizationIntensity = vocalizationIntensity
+        self.pauseScale = pauseScale
+        self.enableActiveListening = enableActiveListening
+        self.enableContextualProsody = enableContextualProsody
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = VoiceBehaviorProfile.default
+        self.personality = try c.decodeIfPresent(VoicePersonalityStyle.self, forKey: .personality) ?? d.personality
+        self.formality = try c.decodeIfPresent(VoiceFormalityLevel.self, forKey: .formality) ?? d.formality
+        self.expressivity = try c.decodeIfPresent(VoiceExpressivityLevel.self, forKey: .expressivity) ?? d.expressivity
+        self.detailLevel = try c.decodeIfPresent(VoiceDetailLevel.self, forKey: .detailLevel) ?? d.detailLevel
+        self.technicalDepth = try c.decodeIfPresent(VoiceTechnicalDepth.self, forKey: .technicalDepth) ?? d.technicalDepth
+        self.speechRate = try c.decodeIfPresent(Float.self, forKey: .speechRate) ?? d.speechRate
+        self.languageVariant = try c.decodeIfPresent(VoiceLanguageVariant.self, forKey: .languageVariant) ?? d.languageVariant
+        self.autoSummarizeTechnicalReplies = try c.decodeIfPresent(Bool.self, forKey: .autoSummarizeTechnicalReplies) ?? d.autoSummarizeTechnicalReplies
+        self.profilePreset = try c.decodeIfPresent(VoiceConversationProfilePreset.self, forKey: .profilePreset) ?? d.profilePreset
+        self.backchannelFrequency = try c.decodeIfPresent(Double.self, forKey: .backchannelFrequency) ?? d.backchannelFrequency
+        self.vocalizationIntensity = try c.decodeIfPresent(Double.self, forKey: .vocalizationIntensity) ?? d.vocalizationIntensity
+        self.pauseScale = try c.decodeIfPresent(Double.self, forKey: .pauseScale) ?? d.pauseScale
+        self.enableActiveListening = try c.decodeIfPresent(Bool.self, forKey: .enableActiveListening) ?? d.enableActiveListening
+        self.enableContextualProsody = try c.decodeIfPresent(Bool.self, forKey: .enableContextualProsody) ?? d.enableContextualProsody
+    }
+
+    public func applyingPreset(_ preset: VoiceConversationProfilePreset) -> VoiceBehaviorProfile {
+        var copy = self
+        copy.profilePreset = preset
+        switch preset {
+        case .natural:
+            copy.personality = .naturalPartner
+            copy.formality = .balanced
+            copy.expressivity = .balanced
+            copy.detailLevel = .balanced
+            copy.speechRate = 1.00
+            copy.backchannelFrequency = 0.60
+            copy.vocalizationIntensity = 0.40
+            copy.pauseScale = 1.00
+            copy.enableActiveListening = true
+            copy.enableContextualProsody = true
+        case .expressive:
+            copy.personality = .creativeBrainstorm
+            copy.formality = .casual
+            copy.expressivity = .warmAndDynamic
+            copy.detailLevel = .balanced
+            copy.speechRate = 1.03
+            copy.backchannelFrequency = 0.82
+            copy.vocalizationIntensity = 0.50
+            copy.pauseScale = 1.12
+            copy.enableActiveListening = true
+            copy.enableContextualProsody = true
+        case .professional:
+            copy.personality = .conciseExecutive
+            copy.formality = .formal
+            copy.expressivity = .subtle
+            copy.detailLevel = .brief
+            copy.speechRate = 0.98
+            copy.backchannelFrequency = 0.0
+            copy.vocalizationIntensity = 0.25
+            copy.pauseScale = 0.92
+            copy.enableActiveListening = false
+            copy.enableContextualProsody = true
+        case .casual:
+            copy.personality = .naturalPartner
+            copy.formality = .casual
+            copy.expressivity = .warmAndDynamic
+            copy.detailLevel = .brief
+            copy.speechRate = 1.05
+            copy.backchannelFrequency = 0.72
+            copy.vocalizationIntensity = 0.45
+            copy.pauseScale = 0.95
+            copy.enableActiveListening = true
+            copy.enableContextualProsody = true
+        case .custom:
+            break
+        }
+        return copy
+    }
 
     private static let defaultsKey = "wisdai.voice.behaviorProfile.v1"
 
@@ -268,7 +387,7 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
     public func systemPromptInstructions(projectName: String?) -> String {
         let langInstr: String = {
             switch languageVariant {
-            case .portugueseBR: return "Speak primarily in natural Brazilian Portuguese unless the user switches languages."
+            case .portugueseBR: return "Speak exclusively in natural, spoken Brazilian Portuguese unless the user switches languages."
             case .portuguesePT: return "Speak in natural European Portuguese unless the user switches languages."
             case .englishUS: return "Speak in natural conversational English unless the user switches languages."
             case .spanishES: return "Habla en español natural a menos que el usuario cambie de idioma."
@@ -276,26 +395,26 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
         }()
         let personalityInstr: String = {
             switch personality {
-            case .naturalPartner: return "Be warm, direct, conversational, and genuinely helpful like ChatGPT Voice."
+            case .naturalPartner: return "Participate like an attentive human partner: warm, spontaneous, clear, never robotic or overly formal."
             case .conciseExecutive: return "Be crisp, concise, and direct without unnecessary filler."
-            case .calmMentor: return "Explain concepts calmly, clearly, and step-by-step."
-            case .creativeBrainstorm: return "Collaborate energetically, explore angles, and ask sharp follow-up questions."
+            case .calmMentor: return "Explain concepts calmly, clearly, and naturally step-by-step."
+            case .creativeBrainstorm: return "Collaborate energetically, explore angles, and engage conversationally."
             }
         }()
         let detailInstr: String = {
             switch detailLevel {
-            case .brief: return "Keep spoken replies under 2-3 sentences unless detailed analysis is explicitly requested."
-            case .balanced: return "Prefer concise 2-4 sentence spoken turns; summarize long technical outputs for speech while visual chat holds details."
-            case .detailed: return "Provide thorough spoken explanations with structured transitions suitable for listening."
+            case .brief: return "Keep spoken replies under 2 short natural sentences unless detailed analysis is explicitly requested."
+            case .balanced: return "Prefer concise 2-3 sentence conversational turns; summarize long technical points cleanly."
+            case .detailed: return "Provide thorough yet oral explanations with smooth spoken transitions."
             }
         }()
         let projInstr = projectName.map { "Active workspace project context: \($0)." } ?? "General conversation or project workspace."
         return """
         \(langInstr)
         \(personalityInstr)
-        Formality: \(formality.rawValue). Expressivity: \(expressivity.rawValue). Technical depth: \(technicalDepth.rawValue).
+        Profile: \(profilePreset.displayName). Formality: \(formality.rawValue). Expressivity: \(expressivity.rawValue). Technical depth: \(technicalDepth.rawValue).
         \(detailInstr)
-        Never invent user emotions or psychological states. Never read markdown syntax, raw URLs, or code blocks verbatim aloud. Do not repeat the user's question back before answering.
+        Write as natural spoken language: avoid robotic intros ("Certamente!", "Claro! Aqui está:"), avoid numbered bullet lists unless requested, avoid generic closing formulas, and never read markdown syntax, JSON metadata, or raw URLs aloud. Subtle self-corrections or reflective pauses ("Hmm…", "Olha,") are welcome only occasionally when genuinely natural—never force interjections into every reply. Never invent user emotions or psychological states.
         \(projInstr)
         """
     }
@@ -716,7 +835,9 @@ public enum HybridTurnTakingAnalyzer {
         transcript: String,
         silenceDurationMs: Double,
         isAcousticSpeechActive: Bool = false,
-        language: VoiceLanguageVariant = .portugueseBR
+        language: VoiceLanguageVariant = .portugueseBR,
+        pitchContour: PitchContourKind = .unknown,
+        adaptiveHoldOffsetMs: Double = 0
     ) -> TurnTakingEvaluation {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -814,8 +935,23 @@ public enum HybridTurnTakingAnalyzer {
             )
         }
 
-        // Rule 5: Strong terminal punctuation (., !, ?) enables low-latency turn commit (~480–560ms).
-        let holdMs: Double = hasStrongTerminal ? 520.0 : (rawTokens.count >= 6 ? 780.0 : 920.0)
+        // Rule 4c: Acoustic rising continuation inflection (F0 rising on unfinished clause without terminal "?").
+        if pitchContour == .rising && !hasStrongTerminal && rawTokens.count >= 4 {
+            let holdMs = max(920.0, 1080.0 + adaptiveHoldOffsetMs)
+            let finalize = !isAcousticSpeechActive && silenceDurationMs >= holdMs
+            return TurnTakingEvaluation(
+                intent: finalize ? .completeTurn : .pauseToThinkHold,
+                recommendedSilenceHoldMs: holdMs,
+                shouldFinalizeTurn: finalize,
+                diagnosticReason: finalize ? "Entoação ascendente finalizada" : "Entoação ascendente indica continuação de raciocínio"
+            )
+        }
+
+        // Rule 5: Strong terminal punctuation (., !, ?) or falling F0 inflection enables responsive commit.
+        let baseHoldMs: Double = hasStrongTerminal
+            ? (pitchContour == .falling ? 470.0 : 520.0)
+            : (rawTokens.count >= 6 ? 780.0 : 920.0)
+        let holdMs = max(420.0, min(1450.0, baseHoldMs + adaptiveHoldOffsetMs))
         let finalize = !isAcousticSpeechActive && silenceDurationMs >= holdMs
         return TurnTakingEvaluation(
             intent: .completeTurn,

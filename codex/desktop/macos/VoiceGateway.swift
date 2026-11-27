@@ -1320,6 +1320,24 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
         rate: Float,
         onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
     ) async throws {
+        try await synthesizeChunk(
+            text,
+            language: language,
+            voicePreference: voicePreference,
+            rate: rate,
+            pitchMultiplier: 1.0,
+            onAudioFloats24k: onAudioFloats24k
+        )
+    }
+
+    public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        pitchMultiplier: Float,
+        onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
 
@@ -1330,7 +1348,7 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
         // Map friendly 0.75...1.35 scale around Apple's default rate smoothly.
         let clampedRate = min(max(rate, 0.75), 1.35)
         utterance.rate = min(AVSpeechUtteranceMaximumSpeechRate, max(AVSpeechUtteranceMinimumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * clampedRate))
-        utterance.pitchMultiplier = 1.0 // Zero synthetic pitch-shifting distortion!
+        utterance.pitchMultiplier = min(1.06, max(0.95, pitchMultiplier))
         utterance.preUtteranceDelay = 0.0
         utterance.postUtteranceDelay = 0.03
 

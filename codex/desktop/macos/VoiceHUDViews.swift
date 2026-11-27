@@ -515,12 +515,15 @@ struct VoiceHUDModalView: View {
                     .labelsHidden()
                 }
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Personalidade")
+                    Text("Perfil Conversacional")
                         .font(.system(size: 10.5))
                         .foregroundStyle(Color.white.opacity(0.6))
-                    Picker("", selection: $orchestrator.behavior.personality) {
-                        ForEach(VoicePersonalityStyle.allCases) { style in
-                            Text(style.displayName).tag(style)
+                    Picker("", selection: Binding(
+                        get: { orchestrator.behavior.profilePreset },
+                        set: { orchestrator.applyConversationProfilePreset($0) }
+                    )) {
+                        ForEach(VoiceConversationProfilePreset.allCases) { preset in
+                            Text(preset.displayName).tag(preset)
                         }
                     }
                     .labelsHidden()

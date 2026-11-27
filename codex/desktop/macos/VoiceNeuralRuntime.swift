@@ -464,6 +464,24 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         rate: Float,
         onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
     ) async throws {
+        try await synthesizeChunk(
+            text,
+            language: language,
+            voicePreference: voicePreference,
+            rate: rate,
+            silenceScale: 0.20,
+            onAudioFloats24k: onAudioFloats24k
+        )
+    }
+
+    public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        silenceScale: Float,
+        onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         guard let preset = Self.resolvePreset(language: language, voicePreference: voicePreference) else {
@@ -487,7 +505,7 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
                     let t0 = DispatchTime.now().uptimeNanoseconds
 
                     var genCfg = SherpaGenerationConfigC()
-                    genCfg.silence_scale = 0.2
+                    genCfg.silence_scale = min(0.60, max(0.10, silenceScale))
                     genCfg.speed = min(1.35, max(0.70, rate))
                     genCfg.sid = preset.speakerID
 
@@ -579,7 +597,8 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         text: String,
         language: VoiceLanguageVariant,
         preset: KokoroVoicePreset,
-        rate: Float = 1.0
+        rate: Float = 1.0,
+        silenceScale: Float = 0.20
     ) async throws -> (samples: [Float], sampleRate: Int, synthMs: Double) {
         final class SamplesBox: @unchecked Sendable {
             private let lock = NSLock()
@@ -593,7 +612,8 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
             text,
             language: language,
             voicePreference: preset.rawValue,
-            rate: rate
+            rate: rate,
+            silenceScale: silenceScale
         ) { floats, _ in
             box.append(floats)
         }
@@ -646,7 +666,7 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
         return proc.processIdentifier
     }
 
-    public static func isStrictLoopbackURL(_ url: URL) -> Bool {
+    nonisolated public static func isStrictLoopbackURL(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
               let host = url.host?.lowercased() else {
             return false
@@ -1095,7 +1115,494 @@ private enum OpenAILoopbackSSEClient {
     }
 }
 
-// MARK: - Native Speech-to-Speech Hardware & Runtime Eligibility Probe (Phase 5)
+// MARK: - Section 10: Real Alternative VITS/Piper Local C-ABI Engine & Expressive MLX-Audio Loopback Client
+
+public final class SherpaVitsPiperTTSProvider: StreamingTextToSpeechProvider, @unchecked Sendable {
+    public let providerID = "sherpa_vits_piper_local_onnx"
+    public let requiresPaidOptIn = false
+
+    private struct LoadedVitsHandles {
+        let ortHandle: UnsafeMutableRawPointer?
+        let sherpaHandle: UnsafeMutableRawPointer
+        let destroyTts: FnDestroyOfflineTts
+        let sampleRateFn: FnOfflineTtsSampleRate
+        let generateWithConfigFn: FnOfflineTtsGenerateWithConfig
+        let destroyAudioFn: FnDestroyGeneratedAudio
+        let ttsPointer: OpaquePointer
+        let modelID: String
+        let sampleRate: Int
+    }
+
+    private let queue = DispatchQueue(label: "local.wisdai.voice.pipervits", qos: .userInitiated)
+    private let lock = NSLock()
+    private var loaded: LoadedVitsHandles?
+    private var cancelledEpoch: UInt64 = 0
+    private let appSupportVoiceRoot: URL
+
+    public init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        self.appSupportVoiceRoot = appSupport.appendingPathComponent("WisdAI/Voice", isDirectory: true)
+    }
+
+    deinit {
+        unloadSync()
+    }
+
+    public func resolveModelPaths(for language: VoiceLanguageVariant) -> (runtimeDir: URL, modelDir: URL, onnxFile: URL, tokensFile: URL, espeakDir: URL, modelID: String)? {
+        let fm = FileManager.default
+        let rtDir = appSupportVoiceRoot
+            .appendingPathComponent("Runtimes/\(VoiceModelCatalog.sherpaRuntimeID)/sherpa-onnx-v1.13.8-osx-arm64-shared-lib/lib", isDirectory: true)
+        guard fm.fileExists(atPath: rtDir.appendingPathComponent("libsherpa-onnx-c-api.dylib").path) else {
+            return nil
+        }
+
+        let dirNames: [String] = {
+            switch language {
+            case .portuguesePT:
+                return ["vits-piper-pt_PT-tugao-medium", "vits-piper-pt_PT-dii-high", "vits-piper-pt_PT-miro-high"]
+            case .portugueseBR:
+                return ["vits-piper-pt_BR-faber-medium", "vits-piper-pt_BR-cadu-medium", "vits-piper-pt_BR-edresson-low"]
+            case .englishUS:
+                return ["vits-piper-en_US-lessac-medium", "vits-piper-en_US-amy-medium"]
+            case .spanishES:
+                return ["vits-piper-es_ES-davefx-medium"]
+            }
+        }()
+
+        let modelsBase = appSupportVoiceRoot.appendingPathComponent("Models", isDirectory: true)
+        for name in dirNames {
+            let folder = modelsBase.appendingPathComponent(name, isDirectory: true)
+            guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { continue }
+            let searchDir: URL = {
+                if items.contains(where: { $0.pathExtension == "onnx" }) { return folder }
+                if let nested = items.first(where: { $0.hasDirectoryPath }) { return nested }
+                return folder
+            }()
+            guard let inner = try? fm.contentsOfDirectory(at: searchDir, includingPropertiesForKeys: nil),
+                  let onnx = inner.first(where: { $0.pathExtension == "onnx" }),
+                  let tokens = inner.first(where: { $0.lastPathComponent == "tokens.txt" }) else {
+                continue
+            }
+            let espeak = inner.first(where: { $0.lastPathComponent == "espeak-ng-data" }) ?? searchDir.appendingPathComponent("espeak-ng-data")
+            guard fm.fileExists(atPath: espeak.path) else { continue }
+            return (rtDir, searchDir, onnx, tokens, espeak, name)
+        }
+        return nil
+    }
+
+    public func isReadyOnDisk(for language: VoiceLanguageVariant = .portugueseBR) -> Bool {
+        resolveModelPaths(for: language) != nil
+    }
+
+    public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
+        try await synthesizeChunk(
+            text,
+            language: language,
+            voicePreference: voicePreference,
+            rate: rate,
+            silenceScale: 0.20,
+            onAudioFloats24k: onAudioFloats24k
+        )
+    }
+
+    public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        silenceScale: Float,
+        onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        let startEpoch = lock.withLock { cancelledEpoch }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [weak self] in
+                guard let self else { continuation.resume(); return }
+                do {
+                    guard !Task.isCancelled, self.lock.withLock({ self.cancelledEpoch == startEpoch }) else {
+                        continuation.resume()
+                        return
+                    }
+                    let handles = try self.ensureLoadedSync(language: language)
+                    var genCfg = SherpaGenerationConfigC()
+                    genCfg.silence_scale = min(0.60, max(0.10, silenceScale))
+                    genCfg.speed = min(1.35, max(0.70, rate))
+                    genCfg.sid = 0
+
+                    let arena = CStringArena()
+                    guard let cText = arena.cString(clean) else {
+                        throw VoiceGatewayError.protocolError("Falha ao alocar texto UTF-8 para Piper VITS.")
+                    }
+                    let audioPtr = withUnsafePointer(to: &genCfg) { cfgPtr in
+                        handles.generateWithConfigFn(handles.ttsPointer, cText, cfgPtr, nil, nil)
+                    }
+                    if let audioPtr {
+                        defer { handles.destroyAudioFn(audioPtr) }
+                        if !self.lock.withLock({ self.cancelledEpoch != startEpoch }) {
+                            let audio = audioPtr.assumingMemoryBound(to: SherpaGeneratedAudioC.self).pointee
+                            if audio.n > 0, let ptr = audio.samples {
+                                let raw = Array(UnsafeBufferPointer(start: ptr, count: Int(audio.n)))
+                                let sr = audio.sample_rate > 0 ? Double(audio.sample_rate) : Double(handles.sampleRate)
+                                let out24k = abs(sr - 24_000) < 1.0 ? raw : AudioPCMConverter.resampleLinear(samples: raw, fromSampleRate: sr, toSampleRate: 24_000)
+                                if !out24k.isEmpty {
+                                    onAudioFloats24k(out24k, clean)
+                                }
+                            }
+                        }
+                    }
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func ensureLoadedSync(language: VoiceLanguageVariant) throws -> LoadedVitsHandles {
+        guard let paths = resolveModelPaths(for: language) else {
+            throw VoiceGatewayError.protocolError("Pesos Piper VITS para \(language.displayName) não encontrados em Models/vits-piper-*. Utilize Kokoro-82M ou Apple Natural.")
+        }
+        if let existing = lock.withLock({ loaded }), existing.modelID == paths.modelID {
+            return existing
+        }
+        unloadSync()
+
+        let fm = FileManager.default
+        let libs = (try? fm.contentsOfDirectory(at: paths.runtimeDir, includingPropertiesForKeys: nil)) ?? []
+        var ortHandle: UnsafeMutableRawPointer? = nil
+        if let ortURL = libs.first(where: { $0.lastPathComponent.hasPrefix("libonnxruntime") && $0.pathExtension == "dylib" }) {
+            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL)
+        }
+        let sherpaURL = paths.runtimeDir.appendingPathComponent("libsherpa-onnx-c-api.dylib")
+        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL) else {
+            throw VoiceGatewayError.protocolError("Falha ao abrir libsherpa-onnx-c-api.dylib para Piper VITS.")
+        }
+        func sym<T>(_ name: String) throws -> T {
+            guard let p = dlsym(sherpaHandle, name) else {
+                throw VoiceGatewayError.protocolError("Símbolo C ausente: \(name)")
+            }
+            return unsafeBitCast(p, to: T.self)
+        }
+
+        let createFn: FnCreateOfflineTts = try sym("SherpaOnnxCreateOfflineTts")
+        let destroyFn: FnDestroyOfflineTts = try sym("SherpaOnnxDestroyOfflineTts")
+        let srFn: FnOfflineTtsSampleRate = try sym("SherpaOnnxOfflineTtsSampleRate")
+        let genFn: FnOfflineTtsGenerateWithConfig = try sym("SherpaOnnxOfflineTtsGenerateWithConfig")
+        let destroyAudioFn: FnDestroyGeneratedAudio = try sym("SherpaOnnxDestroyOfflineTtsGeneratedAudio")
+
+        let arena = CStringArena()
+        var cfg = SherpaOfflineTtsConfigC()
+        cfg.model.num_threads = 2
+        cfg.model.debug = 0
+        cfg.model.provider = arena.cString("cpu")
+        cfg.model.vits.model = arena.cString(paths.onnxFile.path)
+        cfg.model.vits.tokens = arena.cString(paths.tokensFile.path)
+        cfg.model.vits.data_dir = arena.cString(paths.espeakDir.path)
+        cfg.model.vits.length_scale = 1.0
+        cfg.max_num_sentences = 1
+        cfg.silence_scale = 0.2
+
+        guard let ttsPtr = withUnsafePointer(to: &cfg, { createFn($0) }) else {
+            throw VoiceGatewayError.protocolError("SherpaOnnxCreateOfflineTts recusou modelo Piper VITS (\(paths.modelID)).")
+        }
+        let sr = Int(srFn(ttsPtr))
+        let h = LoadedVitsHandles(
+            ortHandle: ortHandle,
+            sherpaHandle: sherpaHandle,
+            destroyTts: destroyFn,
+            sampleRateFn: srFn,
+            generateWithConfigFn: genFn,
+            destroyAudioFn: destroyAudioFn,
+            ttsPointer: ttsPtr,
+            modelID: paths.modelID,
+            sampleRate: sr > 0 ? sr : 22_050
+        )
+        lock.withLock { loaded = h }
+        return h
+    }
+
+    private func unloadSync() {
+        let old = lock.withLock { () -> LoadedVitsHandles? in
+            let cur = loaded
+            loaded = nil
+            return cur
+        }
+        if let old { old.destroyTts(old.ttsPointer) }
+    }
+
+    public func cancelAll() {
+        lock.withLock { cancelledEpoch &+= 1 }
+    }
+}
+
+/// Real local loopback adapter (`http://127.0.0.1:<port>/v1/audio/speech`) for user-started `mlx-audio`
+/// servers hosting expressive models such as Chatterbox Multilingual MLX Q4, CosyVoice2/3, or Dia.
+@MainActor
+public final class LocalExpressiveTTSLoopbackClient: ObservableObject, StreamingTextToSpeechProvider, @unchecked Sendable {
+    public let providerID = "local_mlx_audio_loopback_tts"
+    public let requiresPaidOptIn = false
+
+    @Published public var port: Int = UserDefaults.standard.integer(forKey: "wisdai.voice.mlxTTSPort") == 0
+        ? 8000
+        : UserDefaults.standard.integer(forKey: "wisdai.voice.mlxTTSPort") {
+        didSet {
+            UserDefaults.standard.set(port, forKey: "wisdai.voice.mlxTTSPort")
+            configLock.withLock { runtimePort = port }
+        }
+    }
+    @Published public private(set) var isServerReachable: Bool = false
+    @Published public private(set) var activeModelName: String = "Não detectado em 127.0.0.1" {
+        didSet {
+            configLock.withLock { runtimeModelName = activeModelName }
+        }
+    }
+    @Published public private(set) var lastError: String?
+
+    private let configLock = NSLock()
+    nonisolated(unsafe) private var runtimePort: Int
+    nonisolated(unsafe) private var runtimeModelName: String = "Não detectado em 127.0.0.1"
+
+    public init() {
+        let initialPort = UserDefaults.standard.integer(forKey: "wisdai.voice.mlxTTSPort")
+        self.runtimePort = initialPort == 0 ? 8000 : initialPort
+    }
+
+    public func probeServer() async -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/models"),
+              LocalLlamaServerBrainRuntime.isStrictLoopbackURL(url) else {
+            isServerReachable = false
+            lastError = "Porta/URL loopback inválida."
+            return false
+        }
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        cfg.urlCache = nil
+        let session = URLSession(configuration: cfg)
+        defer { session.invalidateAndCancel() }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.2
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(code) else {
+                isServerReachable = false
+                lastError = "Servidor mlx-audio HTTP \(code)."
+                return false
+            }
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let list = obj["data"] as? [[String: Any]],
+               let firstID = list.first?["id"] as? String {
+                activeModelName = firstID
+            } else {
+                activeModelName = "mlx-audio@127.0.0.1:\(port)"
+            }
+            isServerReachable = true
+            lastError = nil
+            return true
+        } catch {
+            isServerReachable = false
+            activeModelName = "Não detectado em 127.0.0.1:\(port)"
+            lastError = "Nenhum servidor mlx-audio ativo na porta \(port)."
+            return false
+        }
+    }
+
+    nonisolated public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
+        let (targetPort, targetModel) = configLock.withLock { (runtimePort, runtimeModelName) }
+        guard let url = URL(string: "http://127.0.0.1:\(targetPort)/v1/audio/speech"),
+              LocalLlamaServerBrainRuntime.isStrictLoopbackURL(url) else {
+            throw VoiceGatewayError.protocolError("Bloqueio de segurança: servidor TTS local deve estar estritamente em 127.0.0.1.")
+        }
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 20
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "model": targetModel,
+            "input": clean,
+            "voice": voicePreference,
+            "speed": min(1.30, max(0.75, Double(rate))),
+            "stream": true,
+            "response_format": "pcm",
+            "lang_code": language.bcp47LanguagePrefix
+        ])
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        cfg.urlCache = nil
+        let session = URLSession(configuration: cfg)
+        defer { session.invalidateAndCancel() }
+
+        let (bytes, response) = try await session.bytes(for: req)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw VoiceGatewayError.protocolError("Servidor TTS loopback retornou HTTP \(code).")
+        }
+
+        var pending = Data()
+        var labelled = false
+        for try await b in bytes {
+            if Task.isCancelled { break }
+            pending.append(b)
+            if pending.count >= 4_800 {
+                let evenCount = pending.count - (pending.count % 2)
+                let floats = AudioPCMConverter.pcm16DataToFloats(pending.prefix(evenCount))
+                pending.removeFirst(evenCount)
+                if !floats.isEmpty {
+                    onAudioFloats24k(floats, labelled ? "" : clean)
+                    labelled = true
+                }
+            }
+        }
+        let tailEven = pending.count - (pending.count % 2)
+        if tailEven > 0 && !Task.isCancelled {
+            let floats = AudioPCMConverter.pcm16DataToFloats(pending.prefix(tailEven))
+            if !floats.isEmpty {
+                onAudioFloats24k(floats, labelled ? "" : clean)
+            }
+        }
+    }
+
+    nonisolated public func cancelAll() {
+        // Cooperative async Task cancellation terminates the loopback HTTP stream immediately.
+    }
+}
+
+// MARK: - Section 11: Honest Local Speech-to-Speech Abstraction & Loopback Transport
+
+public final class LocalMultimodalS2SLoopbackTransport: RealtimeSpeechToSpeechTransport, @unchecked Sendable {
+    public let providerID: String
+    public let inputSampleRateHz: Double = 24_000
+    public let outputSampleRateHz: Double = 24_000
+
+    private let endpointURL: URL
+    private let lock = NSLock()
+    private var session: URLSession?
+    private var wsTask: URLSessionWebSocketTask?
+    private var rxTask: Task<Void, Never>?
+    private var onEventCB: (@Sendable (RealtimeGatewayEvent) -> Void)?
+
+    public init(port: Int = 8998, providerID: String = "local_s2s_loopback") {
+        self.providerID = providerID
+        self.endpointURL = URL(string: "ws://127.0.0.1:\(port)/api/chat")!
+    }
+
+    public func connect(config: VoiceSessionConfig, resumptionHandle: String?, onEvent: @escaping @Sendable (RealtimeGatewayEvent) -> Void) async throws {
+        guard endpointURL.host == "127.0.0.1" || endpointURL.host == "::1" else {
+            throw VoiceGatewayError.protocolError("Bloqueio de segurança: Speech-to-Speech local aceita apenas loopback.")
+        }
+        await disconnect()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        let urlSession = URLSession(configuration: cfg)
+        var req = URLRequest(url: endpointURL)
+        req.timeoutInterval = 3.0
+
+        let task = urlSession.webSocketTask(with: req)
+        lock.withLock {
+            self.session = urlSession
+            self.wsTask = task
+            self.onEventCB = onEvent
+        }
+        task.resume()
+
+        // Verify live WebSocket handshake instead of assuming daemon presence.
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            task.sendPing { err in
+                if let err {
+                    cont.resume(throwing: VoiceGatewayError.networkConnectionFailed("Servidor Speech-to-Speech local offline em \(self.endpointURL.absoluteString): \(err.localizedDescription)"))
+                } else {
+                    cont.resume()
+                }
+            }
+        }
+        onEvent(.sessionReady(sessionId: "local-s2s-\(UUID().uuidString.prefix(8))"))
+
+        rxTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let msg = try await task.receive()
+                    guard let self else { break }
+                    let cb = self.lock.withLock { self.onEventCB }
+                    switch msg {
+                    case .data(let rawPCM):
+                        if !rawPCM.isEmpty {
+                            cb?(.assistantAudioDelta(itemId: "s2s", pcm16: rawPCM, sampleRate: 24_000))
+                        }
+                    case .string(let txt):
+                        if let data = txt.data(using: .utf8),
+                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let kind = json["type"] as? String {
+                            if kind == "transcript_delta", let delta = json["text"] as? String {
+                                cb?(.assistantTranscriptDelta(itemId: "s2s", text: delta))
+                            } else if kind == "turn_done" {
+                                cb?(.assistantTurnCompleted(itemId: "s2s", finalText: json["text"] as? String ?? ""))
+                            }
+                        }
+                    @unknown default:
+                        break
+                    }
+                } catch {
+                    self?.lock.withLock { self?.onEventCB }?(.disconnected(reason: error.localizedDescription))
+                    break
+                }
+            }
+        }
+    }
+
+    public func sendAudioPCM16(_ pcm16Data: Data) async {
+        let task = lock.withLock { wsTask }
+        try? await task?.send(.data(pcm16Data))
+    }
+
+    public func commitInputAudio() async {
+        let task = lock.withLock { wsTask }
+        try? await task?.send(.string("{\"type\":\"commit\"}"))
+    }
+
+    public func triggerResponse(promptText: String?) async {}
+    public func injectContextUpdate(_ text: String, triggerReply: Bool) async {}
+    public func cancelActiveResponse() async {
+        let task = lock.withLock { wsTask }
+        try? await task?.send(.string("{\"type\":\"cancel\"}"))
+    }
+    public func truncateAssistantItem(itemId: String, audioEndMs: Int) async {}
+
+    public func disconnect() async {
+        let (task, sess, rx) = lock.withLock { () -> (URLSessionWebSocketTask?, URLSession?, Task<Void, Never>?) in
+            let t = wsTask; let s = session; let r = rxTask
+            wsTask = nil; session = nil; rxTask = nil; onEventCB = nil
+            return (t, s, r)
+        }
+        rx?.cancel()
+        task?.cancel(with: .normalClosure, reason: nil)
+        sess?.invalidateAndCancel()
+    }
+}
 
 public struct NativeS2SReadinessSnapshot: Equatable, Sendable {
     public let isSupportedOnThisMac: Bool
@@ -1105,17 +1612,16 @@ public struct NativeS2SReadinessSnapshot: Equatable, Sendable {
 }
 
 public enum NativeS2SRuntimeProbe {
-    public static func evaluate(hardwareTier: VoiceHardwareTier) -> NativeS2SReadinessSnapshot {
+    public static func evaluate(hardwareTier: VoiceHardwareTier, liveS2SLoopbackReachable: Bool = false) -> NativeS2SReadinessSnapshot {
         let ramGB = hardwareTier.resolvedRAMGB()
         if ramGB < 14.0 {
             return NativeS2SReadinessSnapshot(
                 isSupportedOnThisMac: false,
                 recommendedProfileName: hardwareTier.displayName,
-                blockerReason: String(format: "Memória RAM efetiva (~%.0f GB) insuficiente para S2S nativo em execução simultânea (Kyutai Moshi MLX Q4 requer ~5 GB livres + sistema e idioma principal em inglês; MiniCPM-o/PersonaPlex requerem 24–32+ GB). Modo Híbrido Neural ativo.", ramGB),
+                blockerReason: String(format: "Memória RAM efetiva (~%.0f GB) insuficiente para S2S nativo em execução simultânea (Moshi MLX Q4 requer ~5–8 GB livres + sistema e idioma principal em inglês; MiniCPM-o/PersonaPlex requerem 24–32+ GB). Modo Híbrido Neural V3 ativo.", ramGB),
                 inspectedModules: []
             )
         }
-        // Honest runtime check: inspect whether user installed local MLX / moshi_mlx in standard Python environments
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidateBins = [
             "/opt/homebrew/bin/python3",
@@ -1124,12 +1630,20 @@ public enum NativeS2SRuntimeProbe {
             "\(home)/.venv/bin/python3"
         ]
         let found = candidateBins.filter { FileManager.default.isExecutableFile(atPath: $0) }
+        if liveS2SLoopbackReachable {
+            return NativeS2SReadinessSnapshot(
+                isSupportedOnThisMac: true,
+                recommendedProfileName: hardwareTier.displayName,
+                blockerReason: nil,
+                inspectedModules: found
+            )
+        }
         return NativeS2SReadinessSnapshot(
             isSupportedOnThisMac: false,
             recommendedProfileName: hardwareTier.displayName,
             blockerReason: found.isEmpty
-                ? "Nenhum runtime S2S local (mlx / moshi_mlx / MiniCPM-o) detectado neste Mac. Utilize o modo Híbrido Neural Local."
-                : "Ambiente Python detectado (\(found.joined(separator: ", "))), porém pesos S2S locais (Moshi MLX / MiniCPM-o) ainda requerem instalação e servidor dedicado.",
+                ? "Nenhum servidor Speech-to-Speech local respondendo em loopback (127.0.0.1:8998) nem runtime moshi_mlx/MiniCPM-o instalado. Modo Híbrido Neural ativo."
+                : "Ambiente Python detectado (\(found.joined(separator: ", "))), porém o servidor Speech-to-Speech local (127.0.0.1:8998) não respondeu ao handshake ao vivo.",
             inspectedModules: found
         )
     }

@@ -514,6 +514,11 @@ public final class VoiceTelemetryRecorder: ObservableObject {
     @Published public private(set) var e2eResponseStats: LatencySummaryStats = .empty
     @Published public private(set) var bargeInStopStats: LatencySummaryStats = .empty
     @Published public private(set) var bargeInAudibleStopStats: LatencySummaryStats = .empty
+    @Published public private(set) var vocalizationCacheLatencyStats: LatencySummaryStats = .empty
+    @Published public private(set) var backchannelsEmittedCount: Int = 0
+    @Published public private(set) var backchannelsSuppressedCount: Int = 0
+    @Published public private(set) var lastPlannedBehaviorSummary: String = "Aguardando turno"
+    @Published public private(set) var lastAcousticContextSummary: String = "Pitch/Ritmo indisponíveis"
     @Published public private(set) var reconnectCount: Int = 0
     @Published public private(set) var activeProviderLabel: String = "Apple Speech + Natural PCM"
     @Published public private(set) var resourceSnapshot: ProcessResourceSnapshot = ProcessResourceProbe.sample()
@@ -541,6 +546,7 @@ public final class VoiceTelemetryRecorder: ObservableObject {
     private var e2eSamples: [Double] = []
     private var bargeInSamples: [Double] = []
     private var bargeInAudibleSamples: [Double] = []
+    private var vocalizationLatencySamples: [Double] = []
     private let maxSamples = 64
 
     public init() {}
@@ -626,6 +632,22 @@ public final class VoiceTelemetryRecorder: ObservableObject {
         appendSample(ms, into: &bargeInAudibleSamples)
         bargeInAudibleStopStats = LatencySummaryStats.compute(from: bargeInAudibleSamples)
         log(category: "BargeInAudível", message: String(format: "Interrupção efetivamente audível concluída em %.1f ms", ms))
+    }
+
+    public func recordVocalizationPlaybackLatency(ms: Double, vocalizationTag: String) {
+        appendSample(ms, into: &vocalizationLatencySamples)
+        vocalizationCacheLatencyStats = LatencySummaryStats.compute(from: vocalizationLatencySamples)
+        backchannelsEmittedCount += 1
+        log(category: "EscutaAtiva", message: String(format: "Vocalização '%@' entregue em %.1f ms (cache local)", vocalizationTag, ms))
+    }
+
+    public func recordSuppressedBackchannel() {
+        backchannelsSuppressedCount += 1
+    }
+
+    public func updateBehaviorTelemetry(planSummary: String, acousticSummary: String) {
+        lastPlannedBehaviorSummary = planSummary
+        lastAcousticContextSummary = acousticSummary
     }
 
     public func recordReconnect(reason: String) {

@@ -13,6 +13,8 @@ struct VoiceLaboratoryView: View {
     @ObservedObject private var localBrain: LocalConversationalBrain
     @ObservedObject private var telemetry: VoiceTelemetryRecorder
     @ObservedObject private var previewPlayer: VoiceAudioPreviewPlayer
+    @ObservedObject private var vocalizationCache: VocalizationCacheEngine
+    @ObservedObject private var mlxTTS: LocalExpressiveTTSLoopbackClient
 
     @State private var activeSection: LabSection = .enginesAndAudio
     @State private var sampleText: String = "Olá! Eu sou a voz neural local do WisdAI. Agora consigo conversar com naturalidade, baixa latência e interrupção imediata."
@@ -24,6 +26,7 @@ struct VoiceLaboratoryView: View {
     @State private var lastGeneratedWAV: Data?
     @State private var comparisonSummary: String?
     @State private var isSynthesizingSample: Bool = false
+    @State private var cacheAuditMessage: String?
 
     @State private var hygieneCandidates: [VoiceMemoryContaminationCandidate] = []
     @State private var selectedHygieneIDs: Set<String> = []
@@ -32,6 +35,7 @@ struct VoiceLaboratoryView: View {
 
     private enum LabSection: String, CaseIterable, Identifiable {
         case enginesAndAudio = "Motores & Voz"
+        case behaviorAndCache = "Comportamento V3"
         case modelCatalog = "Modelos & Hardware"
         case telemetryAndTrace = "Telemetria & Pipeline"
         case memoryHygiene = "Higiene de Memória"
@@ -47,6 +51,8 @@ struct VoiceLaboratoryView: View {
         self.localBrain = orchestrator.localBrain
         self.telemetry = orchestrator.telemetry
         self.previewPlayer = orchestrator.previewPlayer
+        self.vocalizationCache = orchestrator.vocalizationCache
+        self.mlxTTS = orchestrator.mlxExpressiveTTS
     }
 
     var body: some View {
@@ -71,6 +77,8 @@ struct VoiceLaboratoryView: View {
             switch activeSection {
             case .enginesAndAudio:
                 enginesAndAudioSection
+            case .behaviorAndCache:
+                behaviorAndCacheSection
             case .modelCatalog:
                 hardwareAndCatalogSection
             case .telemetryAndTrace:
@@ -112,10 +120,10 @@ struct VoiceLaboratoryView: View {
                     Image(systemName: "waveform.path.ecg")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(WisdTheme.iconAccent)
-                    Text("Laboratório de Voz · WisdAI Engine V2")
+                    Text("Laboratório de Voz · WisdAI Engine V3")
                         .font(.system(size: 14.5, weight: .semibold))
                 }
-                Text("Cérebro ativo: \(localBrain.backendStatus.rawValue) · Voz: \(orchestrator.telemetry.activeProviderLabel) · Hardware: \(assetManager.selectedHardwareTier.displayName)")
+                Text("Cérebro ativo: \(localBrain.backendStatus.rawValue) · Voz: \(orchestrator.telemetry.activeProviderLabel) · Perfil: \(orchestrator.behavior.profilePreset.displayName) · Hardware: \(assetManager.selectedHardwareTier.displayName)")
                     .font(.system(size: 11.5))
                     .foregroundStyle(DesktopStyle.muted)
                 Text(WisdVoiceBuildInfo.summary)
@@ -342,6 +350,24 @@ struct VoiceLaboratoryView: View {
                         .foregroundStyle(.orange)
                 }
 
+                if orchestrator.selectedTTSEngine == .chatterbox || orchestrator.selectedTTSEngine == .cosyVoice2 || orchestrator.selectedTTSEngine == .sesameCSM || orchestrator.selectedTTSEngine == .diaTTS {
+                    HStack(spacing: 8) {
+                        Text("Porta Loopback mlx-audio (127.0.0.1):")
+                            .font(.system(size: 11.5))
+                        TextField("Porta", value: $mlxTTS.port, format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                        Button("Verificar mlx-audio") {
+                            Task { _ = await mlxTTS.probeServer() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        Text(mlxTTS.isServerReachable ? "Conectado (\(mlxTTS.activeModelName))" : (mlxTTS.lastError ?? "Off-line"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(mlxTTS.isServerReachable ? .green : .orange)
+                    }
+                }
+
                 HStack(spacing: 10) {
                     Picker("Idioma do Teste", selection: $orchestrator.behavior.languageVariant) {
                         ForEach(VoiceLanguageVariant.allCases) { lang in
@@ -415,6 +441,13 @@ struct VoiceLaboratoryView: View {
                     .controlSize(.small)
                     .disabled(isSynthesizingSample)
 
+                    Button("Comparar V2 vs V3") {
+                        runV2vsV3BehaviorComparison()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isSynthesizingSample)
+
                     if previewPlayer.isPlaying {
                         Button("Parar Áudio") {
                             previewPlayer.stop()
@@ -455,6 +488,154 @@ struct VoiceLaboratoryView: View {
                 }
                 if let comparisonSummary {
                     Text(comparisonSummary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(WisdTheme.softAccentText)
+                }
+            }
+        }
+    }
+
+    // MARK: - Tab V3: Conversational Behavior Engine & Vocalization Cache
+
+    private var behaviorAndCacheSection: some View {
+        let personality = VoicePersonalityProfile.profile(for: orchestrator.voiceIdentity.persona)
+        let engineCaps = EngineProsodyCapabilities.forEngine(
+            orchestrator.selectedTTSEngine,
+            isKokoroActive: orchestrator.selectedTTSEngine == .kokoro82M || (orchestrator.selectedTTSEngine == .autoLocal && orchestrator.kokoroTTS.isReadyOnDisk && orchestrator.behavior.languageVariant != .portuguesePT)
+        )
+
+        return VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("1. Perfil Conversacional (WisdAI Conversational Behavior Engine)")
+                    .font(.system(size: 12.5, weight: .semibold))
+
+                Picker("Perfil Ativo", selection: Binding(
+                    get: { orchestrator.behavior.profilePreset },
+                    set: { orchestrator.applyConversationProfilePreset($0) }
+                )) {
+                    ForEach(VoiceConversationProfilePreset.allCases) { preset in
+                        Text(preset.displayName).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(orchestrator.behavior.profilePreset.subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(DesktopStyle.muted)
+
+                if orchestrator.behavior.profilePreset == .custom {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("Escuta Ativa com Backchanneling durante fala do usuário", isOn: $orchestrator.behavior.enableActiveListening)
+                        Toggle("Prosódia Contextual por Intenção", isOn: $orchestrator.behavior.enableContextualProsody)
+
+                        HStack {
+                            Text("Frequência de Feedback Vocal (\(Int(orchestrator.behavior.backchannelFrequency * 100))%)")
+                                .font(.system(size: 11))
+                            Slider(value: $orchestrator.behavior.backchannelFrequency, in: 0.0...1.0, step: 0.05)
+                        }
+                        HStack {
+                            Text("Intensidade das Vocalizações (\(Int(orchestrator.behavior.vocalizationIntensity * 100))%)")
+                                .font(.system(size: 11))
+                            Slider(value: $orchestrator.behavior.vocalizationIntensity, in: 0.15...0.75, step: 0.05)
+                        }
+                        if engineCaps.supportsDynamicSilenceScale || engineCaps.supportsRateControl {
+                            HStack {
+                                Text("Ritmo de Fala (\(String(format: "%.2fx", orchestrator.behavior.speechRate)))")
+                                    .font(.system(size: 11))
+                                Slider(value: $orchestrator.behavior.speechRate, in: 0.80...1.25, step: 0.05)
+                            }
+                            HStack {
+                                Text("Pausas Conversacionais (\(String(format: "%.2fx", orchestrator.behavior.pauseScale)))")
+                                    .font(.system(size: 11))
+                                Slider(value: $orchestrator.behavior.pauseScale, in: 0.70...1.50, step: 0.05)
+                            }
+                        }
+                        HStack(spacing: 10) {
+                            Picker("Expressividade", selection: $orchestrator.behavior.expressivity) {
+                                ForEach(VoiceExpressivityLevel.allCases) { exp in
+                                    Text(exp.displayName).tag(exp)
+                                }
+                            }
+                            Picker("Formalidade", selection: $orchestrator.behavior.formality) {
+                                ForEach(VoiceFormalityLevel.allCases) { form in
+                                    Text(form.displayName).tag(form)
+                                }
+                            }
+                            Picker("Comprimento", selection: $orchestrator.behavior.detailLevel) {
+                                ForEach(VoiceDetailLevel.allCases) { det in
+                                    Text(det.displayName).tag(det)
+                                }
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(DesktopStyle.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("2. Identidade Vocal Persistente (Voice Personality Engine)")
+                    .font(.system(size: 12.5, weight: .semibold))
+                Picker("Personalidade Base", selection: $orchestrator.voiceIdentity.persona) {
+                    ForEach(WisdVoicePersona.allCases) { persona in
+                        Text(persona.displayName).tag(persona)
+                    }
+                }
+                Text("\(personality.interactionStyle) Calor \(Int(personality.conversationalWarmth * 100))% · Energia \(Int(personality.energy * 100))% · Objetividade \(Int(personality.directness * 100))%.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(DesktopStyle.muted)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("3. Vocalization Cache Engine (Amostras <100 ms na Identidade Ativa)")
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Spacer()
+                    Text("\(vocalizationCache.cachedClipsCount) clipes · \(String(format: "%.2f MB", vocalizationCache.cacheMemoryMB))")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(DesktopStyle.muted)
+                }
+
+                Text(vocalizationCache.lastGenerationSummary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(DesktopStyle.muted)
+
+                HStack(spacing: 8) {
+                    Button(vocalizationCache.isPrewarming ? "Gerando Cache…" : "Pré-aquecer Cache Ativa") {
+                        orchestrator.prewarmVocalizationCache()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(vocalizationCache.isPrewarming)
+
+                    Button("Invalidar Cache") {
+                        vocalizationCache.invalidateAll(reason: "Solicitação manual")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    ForEach([VocalizationKind.uhum, .aham, .hmm, .entendi, .interessante], id: \.rawValue) { kind in
+                        Button(kind.spokenText(for: orchestrator.behavior.languageVariant)) {
+                            Task {
+                                let res = await orchestrator.previewCachedVocalization(kind)
+                                cacheAuditMessage = res.detail
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                }
+
+                Text("Hits: \(vocalizationCache.hitCount) · Misses: \(vocalizationCache.missCount) · Última entrega: \(String(format: "%.1f ms", vocalizationCache.lastPlaybackLatencyMs)) · Escopo estrito por voz/idioma/motor.")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(DesktopStyle.muted)
+
+                if let cacheAuditMessage {
+                    Text(cacheAuditMessage)
                         .font(.system(size: 11))
                         .foregroundStyle(WisdTheme.softAccentText)
                 }
@@ -598,6 +779,9 @@ struct VoiceLaboratoryView: View {
                 metricTile(title: "Fim Fala → Voz Audível", value: formatStats(telemetry.e2eFromSpeechEndAudibleStats))
                 metricTile(title: "Barge-In Flush", value: formatStats(telemetry.bargeInStopStats))
                 metricTile(title: "Barge-In Audível Real", value: formatStats(telemetry.bargeInAudibleStopStats))
+                metricTile(title: "Cache Vocal (<100ms)", value: telemetry.vocalizationCacheLatencyStats.count > 0 ? formatStats(telemetry.vocalizationCacheLatencyStats) : "sem hits ainda")
+                metricTile(title: "Escuta Ativa", value: "\(telemetry.backchannelsEmittedCount) emitidos · \(telemetry.backchannelsSuppressedCount) suprimidos")
+                metricTile(title: "Estilo Acústico Usuário", value: telemetry.lastAcousticContextSummary)
             }
 
             HStack(spacing: 12) {
@@ -854,6 +1038,40 @@ struct VoiceLaboratoryView: View {
             lastGeneratedWAV = kokoro.wavData ?? apple.wavData
             comparisonSummary = "Kokoro: \(kokoro.ok ? String(format: "%.0f ms", kokoro.synthMs) : kokoro.detail) | Apple Natural: \(apple.ok ? String(format: "%.0f ms", apple.synthMs) : apple.detail)"
             sampleResultMessage = kokoro.ok ? "Reproduzindo Kokoro (\(kokoro.detail))." : "Comparação concluída usando Apple Natural."
+            isSynthesizingSample = false
+        }
+    }
+
+    private func runV2vsV3BehaviorComparison() {
+        isSynthesizingSample = true
+        let rawFormalText = "Certamente! Aqui está a explicação solicitada: 1. Baixa latência melhora a conversa. 2. Backchanneling em cache mantém a escuta natural. Se precisar de mais alguma coisa, estou à disposição!"
+        Task {
+            let v2 = await orchestrator.synthesizeAndPreviewVoiceSample(
+                text: rawFormalText,
+                ttsEngine: orchestrator.selectedTTSEngine,
+                kokoroPreset: orchestrator.selectedKokoroPreset,
+                language: orchestrator.behavior.languageVariant,
+                playAudio: false,
+                applyBehaviorComposition: false
+            )
+            let v3 = await orchestrator.synthesizeAndPreviewVoiceSample(
+                text: rawFormalText,
+                ttsEngine: orchestrator.selectedTTSEngine,
+                kokoroPreset: orchestrator.selectedKokoroPreset,
+                language: orchestrator.behavior.languageVariant,
+                playAudio: true,
+                applyBehaviorComposition: true
+            )
+            lastGeneratedWAV = v3.wavData ?? v2.wavData
+            let composedPreview = NaturalSpeechComposer.compose(
+                rawFormalText,
+                plan: orchestrator.lastBehaviorPlan,
+                profile: orchestrator.behavior,
+                capabilities: EngineProsodyCapabilities.forEngine(orchestrator.selectedTTSEngine, isKokoroActive: orchestrator.kokoroTTS.isReadyOnDisk),
+                customDictionary: orchestrator.customPronunciation
+            ).spokenText
+            comparisonSummary = "Comparação V2 vs V3: V2=\(String(format: "%.0fms", v2.synthMs)) | V3(Natural Composer)=\(String(format: "%.0fms", v3.synthMs)) · Texto oral: \"\(composedPreview)\""
+            sampleResultMessage = "Reproduzindo versão V3 natural (\(v3.engineUsed))."
             isSynthesizingSample = false
         }
     }

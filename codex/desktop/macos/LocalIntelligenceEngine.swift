@@ -356,10 +356,19 @@ public final class LocalConversationalBrain: ObservableObject {
         portableContextSummary: String,
         recentTurns: [(role: String, text: String)] = [],
         language: VoiceLanguageVariant,
+        behaviorHint: ConversationalBehaviorPlan? = nil,
         onDelta: @escaping @MainActor (String) -> Void
     ) async -> String {
         lastErrorDetail = nil
         var enrichedInstructions = systemInstructions
+        if let behaviorHint {
+            enrichedInstructions += "\nConversational tone guide (do NOT output JSON or tags): intent=\(behaviorHint.intent.rawValue), expression=\(behaviorHint.expression.rawValue), formality=\(behaviorHint.formality.rawValue)."
+            if behaviorHint.intent == .reflection || behaviorHint.intent == .uncertainty {
+                enrichedInstructions += " Feel free to sound naturally reflective, honest about uncertainty, and conversational."
+            } else if behaviorHint.intent == .enthusiasm {
+                enrichedInstructions += " Acknowledge the user's progress warmly and naturally without exaggeration."
+            }
+        }
         if !portableContextSummary.isEmpty {
             enrichedInstructions += "\n\n<portable_context_reference>\n\(String(portableContextSummary.prefix(1200)))\n</portable_context_reference>"
         }

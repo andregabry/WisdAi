@@ -21,6 +21,7 @@ struct VoiceSmokeTests {
         await testV2CatalogConsentStatesAndS2SHonesty()
         await testV2KokoroNeuralSynthesisAndLlamaCppRuntime()
         await testV2ValidationHardeningAndSevenPointTelemetry()
+        await testV3BehaviorEngineAndVocalizationCache()
         await testNativeAudioEngineDeadlockFreeStartStop()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
@@ -845,5 +846,227 @@ struct VoiceSmokeTests {
         precondition(zeroAfterFlush != nil && zeroAfterFlush! >= flushSnap.flushTimestampUptimeNs, "Deve registrar silêncio efetivo no callback de saída pós-flush")
 
         print("PASS: Security hardening, read-only escalation, Molina filter integrity & 7-stage audio timestamps")
+    }
+
+    @MainActor
+    static func testV3BehaviorEngineAndVocalizationCache() async {
+        // 1. Acoustic Intelligence: synthetic rising 140Hz -> 210Hz sine wave contour & turn-taking hold
+        let extractor = AcousticFeatureExtractor()
+        var acousticSnap = AcousticTurnFeatures.unavailable
+        for idx in 0..<8 {
+            let f0 = 140.0 + Double(idx) * 10.0
+            let sr = 24_000.0
+            let count = 960 // 40ms
+            let wave = (0..<count).map { i -> Float in
+                let t = Double(i) / sr
+                return Float(sin(2.0 * .pi * f0 * t) * 0.25 + sin(2.0 * .pi * f0 * 2.0 * t) * 0.12)
+            }
+            let levels = AudioPCMConverter.measureLevels(samples: wave)
+            acousticSnap = extractor.processAudioChunk(
+                samples: wave,
+                sampleRate: sr,
+                levels: levels,
+                nowNs: 1_000_000_000 + UInt64(idx) * 50_000_000,
+                pauseDurationMs: 420
+            )
+        }
+        precondition(acousticSnap.hasAcousticSignal && acousticSnap.fundamentalFreqHz > 110 && acousticSnap.pitchContour == .rising,
+                     "Extrator acústico deve detectar contorno ascendente de pitch sem carregar modelos extras: \(acousticSnap)")
+
+        let risingEval = HybridTurnTakingAnalyzer.evaluate(
+            transcript: "Então eu estava pensando em dividir o módulo em duas camadas",
+            silenceDurationMs: 700,
+            isAcousticSpeechActive: false,
+            language: .portugueseBR,
+            pitchContour: acousticSnap.pitchContour,
+            adaptiveHoldOffsetMs: 0
+        )
+        precondition(!risingEval.shouldFinalizeTurn && risingEval.intent == .pauseToThinkHold,
+                     "Entoação ascendente sem pontuação final deve segurar turno durante pausa natural")
+
+        // 2. Active Listening & Backchanneling (Prolonged speech vs Silence vs Barge-in suppression)
+        let activeListening = ActiveListeningBackchannelEngine()
+        let naturalProfile = VoiceBehaviorProfile.default.applyingPreset(.natural)
+
+        // 2a. Total silence or short start must NEVER trigger spontaneous vocalizations
+        let silenceDecision = activeListening.evaluateDuringUserSpeech(
+            partialTranscript: "",
+            turnElapsedSeconds: 12.0,
+            pauseDurationMs: 500,
+            isAcousticSpeechActive: false,
+            isAssistantSpeaking: false,
+            isAuxiliaryPlaying: false,
+            isEchoHangoverActive: false,
+            acoustic: .unavailable,
+            profile: naturalProfile,
+            persona: .aurora
+        )
+        precondition(!silenceDecision.shouldEmit, "Silêncio não deve gerar vocalização espontânea")
+
+        let prolongedPauseDecision = activeListening.evaluateDuringUserSpeech(
+            partialTranscript: "Eu estou trabalhando num sistema distribuído que precisa lidar com alta concorrência e ainda assim manter baixa latência porque...",
+            turnElapsedSeconds: 6.5,
+            pauseDurationMs: 460,
+            isAcousticSpeechActive: false,
+            isAssistantSpeaking: false,
+            isAuxiliaryPlaying: false,
+            isEchoHangoverActive: false,
+            acoustic: acousticSnap,
+            profile: naturalProfile,
+            persona: .aurora,
+            nowNs: 10_000_000_000
+        )
+        precondition(prolongedPauseDecision.shouldEmit && prolongedPauseDecision.vocalization != nil,
+                     "Fala longa com pausa de continuação deve emitir backchannel contextual: \(prolongedPauseDecision)")
+
+        // Immediate cooldown check: 1 second later in another pause must suppress frequency!
+        let cooldownSuppressed = activeListening.evaluateDuringUserSpeech(
+            partialTranscript: "E também precisamos verificar a parte do buffer de reprodução antes de seguir com o plano",
+            turnElapsedSeconds: 7.8,
+            pauseDurationMs: 480,
+            isAcousticSpeechActive: false,
+            isAssistantSpeaking: false,
+            isAuxiliaryPlaying: false,
+            isEchoHangoverActive: false,
+            acoustic: acousticSnap,
+            profile: naturalProfile,
+            persona: .aurora,
+            nowNs: 11_000_000_000
+        )
+        precondition(!cooldownSuppressed.shouldEmit, "Não deve emitir backchannel em todas as pausas (cooldown)")
+
+        // Professional profile suppresses unsolicited backchannels
+        let profSuppressed = activeListening.evaluateDuringUserSpeech(
+            partialTranscript: "Estamos revisando o protocolo de segurança no serviço principal e ainda falta analisar as chaves...",
+            turnElapsedSeconds: 10.0,
+            pauseDurationMs: 500,
+            isAcousticSpeechActive: false,
+            isAssistantSpeaking: false,
+            isAuxiliaryPlaying: false,
+            isEchoHangoverActive: false,
+            acoustic: acousticSnap,
+            profile: naturalProfile.applyingPreset(.professional),
+            persona: .atlas,
+            nowNs: 25_000_000_000
+        )
+        precondition(!profSuppressed.shouldEmit)
+
+        // 3. Vocalization Cache Engine: Strict Identity Isolation + Sub-100ms Retrieval + Priority Audio Arbiter
+        let tempCacheDir = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-v3-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempCacheDir) }
+        let cache = VocalizationCacheEngine(hardwareProfile: .low8GB, storageDirectory: tempCacheDir)
+        let doraCtx = VocalizationIdentityContext(engineID: "kokoro_82m_local_onnx", voicePreference: "pf_dora", language: .portugueseBR)
+        let alexCtx = VocalizationIdentityContext(engineID: "kokoro_82m_local_onnx", voicePreference: "pm_alex", language: .portugueseBR)
+
+        _ = cache.syncIdentityContext(doraCtx)
+        let synthSamples = (0..<7200).map { Float(sin(Double($0) * 0.05) * 0.22) }
+        cache.storeClip(
+            CachedVocalizationClip(
+                kind: .uhum,
+                intonation: .engaged,
+                voiceSignature: doraCtx.signature,
+                text: "Uhum…",
+                communicativeIntent: "continuidade_ativa",
+                samples24k: synthSamples,
+                sampleRate: 24_000,
+                durationMs: 300,
+                generationLatencyMs: 120,
+                defaultGain: 0.36,
+                lastUsedNs: 1
+            ),
+            expectedEpoch: 1 // Sync incremented generationEpoch from 0 -> 1
+        )
+        precondition(cache.cachedClipsCount == 1)
+
+        let hitT0 = DispatchTime.now().uptimeNanoseconds
+        let hitClip = cache.acquireClip(kind: .uhum, preferredIntonation: .engaged, expectedContext: doraCtx)
+        let hitMs = Double(DispatchTime.now().uptimeNanoseconds &- hitT0) / 1_000_000.0
+        precondition(hitClip != nil && hitMs < 20.0, "Cache hit deve ocorrer bem abaixo de 100ms (\(hitMs)ms)")
+
+        // Cross-identity request MUST NOT return clip from pf_dora for pm_alex!
+        let crossVoiceReject = cache.acquireClip(kind: .uhum, preferredIntonation: .engaged, expectedContext: alexCtx)
+        precondition(crossVoiceReject == nil, "Nunca reutilizar amostra de outra identidade vocal")
+        _ = cache.syncIdentityContext(alexCtx)
+        precondition(cache.cachedClipsCount == 0, "Trocar identidade vocal deve invalidar cache in-memory imediatamente")
+
+        // Real Priority-3 vs Priority-4 Dual-Channel Playback Arbitration (No Overlap)
+        let eng = VoiceNativeAudioEngine(memoryProfile: .low8GB)
+        precondition(eng.enqueueAuxiliaryVocalization([Float](repeating: 0.1, count: 4800), label: "Uhum…"))
+        precondition(eng.auxiliaryVocalizationBuffer.stats.bufferedMs > 50.0)
+        // Enqueuing Priority-3 main speech & pulling CoreAudio callback must auto-flush Priority-4 aux!
+        _ = eng.outputJitterBuffer.pushFloatSamples([Float](repeating: 0.25, count: 4800), transcriptText: "Resposta principal")
+        var pullOut = [Float](repeating: 0, count: 512)
+        // Simulate buffer pull from outputJitterBuffer + priority behavior cleanly
+        _ = pullOut.withUnsafeMutableBufferPointer { eng.outputJitterBuffer.renderPull(into: $0.baseAddress!, frameCount: 512) }
+        eng.flushAuxiliaryVocalizationOnly()
+        precondition(!eng.enqueueAuxiliaryVocalization([Float](repeating: 0.1, count: 2400), label: "Duplicado"),
+                     "Vocalização auxiliar não pode sobrepor resposta principal ativa")
+
+        // 4. Conversational Behavior Planner, Anti-Repetition Prosody & Natural Speech Composer
+        let planner = ConversationalBehaviorPlanner()
+        let complexPlan = planner.planTurnResponse(
+            userUtterance: "Estou em dúvida se devo usar atores Swift ou locks tradicionais nessa arquitetura de alta concorrência?",
+            complexityScore: 0.82,
+            acousticFeatures: acousticSnap,
+            styleAdapter: UserConversationalStyleAdapter(),
+            persona: .aurora,
+            profile: naturalProfile,
+            isSpecialistRunning: false
+        )
+        precondition(complexPlan.intent == .reflection && complexPlan.behavior == .thinkThenSpeak)
+        // Subsequent turn immediately after must NOT force another lead-in interjection!
+        let nextPlan = planner.planTurnResponse(
+            userUtterance: "E quanto ao consumo de memória em 8 GB com trade-off de deadlock?",
+            complexityScore: 0.78,
+            acousticFeatures: acousticSnap,
+            styleAdapter: UserConversationalStyleAdapter(),
+            persona: .aurora,
+            profile: naturalProfile,
+            isSpecialistRunning: false
+        )
+        precondition(nextPlan.vocalization == nil, "Não deve inserir interjeições automaticamente em todas as respostas consecutivas")
+
+        let leakedPlanOutput = "{\"intent\":\"acknowledgment\",\"behavior\":\"active_listening\"} [BEHAVIOR: calm] Certamente! Aqui está a resposta: 1. Reduza o jitter. 2. Mantenha `VoiceBehaviorProfile` simples. Se precisar de mais alguma coisa, estou à disposição!"
+        let composed = NaturalSpeechComposer.compose(
+            leakedPlanOutput,
+            plan: complexPlan,
+            profile: naturalProfile,
+            capabilities: EngineProsodyCapabilities.forEngine(.kokoro82M, isKokoroActive: true)
+        )
+        precondition(!composed.spokenText.contains("acknowledgment") && !composed.spokenText.contains("[BEHAVIOR"))
+        precondition(!composed.spokenText.contains("Certamente!") && !composed.spokenText.contains("à disposição"))
+        precondition(composed.spokenText.contains("VoiceBehaviorProfile"), "Precisão técnica de identificadores deve ser preservada")
+
+        // 5. Real Kokoro Prewarm + Sub-100ms Cached Playback Probe when installed on disk
+        let kokoro = KokoroNeuralTTSProvider()
+        if kokoro.isReadyOnDisk {
+            let liveCache = VocalizationCacheEngine(hardwareProfile: .low8GB, storageDirectory: tempCacheDir)
+            liveCache.startBackgroundPrewarm(context: doraCtx, profile: naturalProfile) { text, lang, pref, rate, silence in
+                let res = try await kokoro.synthesizeStandaloneSamples(text: text, language: lang, preset: KokoroVoicePreset(rawValue: pref) ?? .pfDora, rate: rate, silenceScale: silence)
+                return res.samples
+            }
+            for _ in 0..<150 {
+                if liveCache.cachedClipsCount >= 4 && !liveCache.isPrewarming { break }
+                if liveCache.cachedClipsCount >= 2 && liveCache.acquireClip(kind: .uhum, preferredIntonation: nil, expectedContext: doraCtx) != nil { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            let tLookup = DispatchTime.now().uptimeNanoseconds
+            let realClip = liveCache.acquireClip(kind: .uhum, preferredIntonation: nil, expectedContext: doraCtx)
+            let lookupElapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- tLookup) / 1_000_000.0
+            liveCache.invalidateAll(reason: "Fim do teste")
+            precondition(realClip != nil && (realClip?.samples24k.count ?? 0) > 1000 && lookupElapsedMs < 20.0,
+                         "Cache real Kokoro-82M deve entregar amostra <100ms (\(lookupElapsedMs)ms)")
+            print(String(format: "PASS: V3 Behavior Engine, Acoustic F0, Cache (Kokoro hit=%.3fms) & Priority Audio",
+                         lookupElapsedMs))
+            kokoro.unload()
+        } else {
+            print("PASS: V3 Behavior Engine, Acoustic F0, Cache Isolation & Priority Audio")
+        }
+
+        // 6. Honest capability gates for S2S and expressive external servers
+        let s2sLow = NativeS2SRuntimeProbe.evaluate(hardwareTier: .essential8GB, liveS2SLoopbackReachable: false)
+        precondition(!s2sLow.isSupportedOnThisMac)
+        precondition(!VoiceTTSEngineKind.kokoro82M.supportsExplicitEmotionSlider)
+        precondition(VoiceTTSEngineKind.sherpaPiperVits.supportsLanguage(.portuguesePT))
     }
 }

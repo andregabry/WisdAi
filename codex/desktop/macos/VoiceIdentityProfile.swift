@@ -139,10 +139,12 @@ public enum VoiceExecutionArchitectureMode: String, CaseIterable, Identifiable, 
 public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sendable {
     case autoLocal = "auto_local"
     case kokoro82M = "kokoro_82m"
+    case sherpaPiperVits = "sherpa_piper_vits"
     case appleNaturalPCM = "apple_natural"
     case cosyVoice2 = "cosyvoice2"
     case chatterbox = "chatterbox"
     case sesameCSM = "sesame_csm"
+    case diaTTS = "dia_tts"
     case f5TTS = "f5_tts"
 
     public var id: String { rawValue }
@@ -151,32 +153,58 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
         switch self {
         case .autoLocal: return "Automático Local (Kokoro Neural se pronto, senão Apple Natural)"
         case .kokoro82M: return "Kokoro-82M Neural (ONNX Local · PT-BR / EN / ES)"
+        case .sherpaPiperVits: return "Piper VITS Neural (ONNX Local · PT-BR & PT-PT Nativo · PoC)"
         case .appleNaturalPCM: return "Apple Voz Natural (macOS Nativo · Sem Download)"
-        case .cosyVoice2: return "CosyVoice2-0.5B (Adaptador Externo Python/PyTorch)"
-        case .chatterbox: return "Chatterbox MIT (Adaptador Externo EN / Multilíngue)"
-        case .sesameCSM: return "Sesame CSM-1B (Adaptador Externo · Inglês)"
+        case .cosyVoice2: return "CosyVoice2 / 3 (Servidor MLX/PyTorch Loopback)"
+        case .chatterbox: return "Chatterbox Multilingual MIT (Servidor MLX Loopback)"
+        case .sesameCSM: return "Sesame CSM-1B (Servidor MLX/PyTorch · Inglês)"
+        case .diaTTS: return "Nari Labs Dia-1.6B (Apache-2.0 · Inglês · 10+ GB RAM)"
         case .f5TTS: return "F5-TTS (Aviso: Licença CC-BY-NC-4.0 Não Comercial)"
         }
     }
 
     public var supportsExplicitEmotionSlider: Bool {
-        // Only surface controls actually backed by real model parameters.
-        return false
+        switch self {
+        case .chatterbox, .cosyVoice2: return true
+        default: return false
+        }
     }
 
     public var supportsSpeedControl: Bool {
         switch self {
-        case .autoLocal, .kokoro82M, .appleNaturalPCM: return true
+        case .autoLocal, .kokoro82M, .sherpaPiperVits, .appleNaturalPCM, .chatterbox, .cosyVoice2:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var supportsPitchControl: Bool {
+        switch self {
+        case .appleNaturalPCM: return true
         default: return false
         }
+    }
+
+    public var supportsDynamicSilenceScale: Bool {
+        switch self {
+        case .autoLocal, .kokoro82M, .sherpaPiperVits: return true
+        default: return false
+        }
+    }
+
+    public var supportsCustomProfileSettings: Bool {
+        return supportsSpeedControl
     }
 
     public var licenseWarning: String? {
         switch self {
         case .f5TTS:
             return "F5-TTS utiliza licença CC-BY-NC-4.0 (uso estritamente não comercial) e requer ambiente Python/PyTorch separado."
-        case .cosyVoice2, .chatterbox, .sesameCSM:
-            return "Requer runtime Python/PyTorch externo não incluído no app; avaliado apenas como adaptador experimental."
+        case .cosyVoice2, .chatterbox, .sesameCSM, .diaTTS:
+            return "Requer servidor local mlx-audio / PyTorch em 127.0.0.1 iniciado pelo usuário; não empacotado neste app."
+        case .sherpaPiperVits:
+            return "PoC alternativa leve (MIT + espeak-ng GPL via sherpa-onnx C ABI) com suporte genuíno a PT-BR e PT-PT; requer pesos Piper em Application Support."
         default:
             return nil
         }
@@ -187,14 +215,14 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
         case .kokoro82M:
             // Kokoro "p" lexicon targets Brazilian Portuguese specifically, NOT European Portuguese.
             return language == .portugueseBR || language == .englishUS || language == .spanishES
-        case .appleNaturalPCM, .autoLocal:
+        case .sherpaPiperVits, .appleNaturalPCM, .autoLocal:
             return true
-        case .sesameCSM:
+        case .sesameCSM, .diaTTS:
             return language == .englishUS
         case .cosyVoice2, .f5TTS:
-            return language == .englishUS
+            return language == .englishUS || language == .spanishES
         case .chatterbox:
-            return language != .portuguesePT
+            return true // Chatterbox Multilingual covers PT, EN, ES (with community PT-BR / PT-PT packs)
         }
     }
 }
@@ -683,6 +711,53 @@ public enum VoiceModelCatalog {
             supportedLanguages: ["en-US"],
             archiveFormat: .externalManual,
             description: "Catálogo técnico: modelo conversacional 1B em inglês inviável nativamente em 8 GB RAM."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "vits-piper-pt_BR-faber-medium",
+            displayName: "Piper VITS PT-BR (faber-medium · PoC ONNX)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "MIT (via sherpa-onnx C ABI)",
+            licenseWarning: "Instalação opcional via pasta local em Application Support/WisdAI/Voice/Models/vits-piper-pt_BR-faber-medium (reutiliza libsherpa-onnx-c-api.dylib já instalada).",
+            sizeBytes: 63_200_000,
+            minimumRAMProfile: .low8GB,
+            minimumRAMGB: 8.0,
+            supportedLanguages: ["pt-BR"],
+            supportsEmotionControl: false,
+            archiveFormat: .externalManual,
+            requiredRuntimeID: sherpaRuntimeID,
+            description: "Alternativa VITS ultraleve (~63 MB, latência baixa em CPU) sem substituir Kokoro-82M."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "vits-piper-pt_PT-tugao-medium",
+            displayName: "Piper VITS PT-PT (tugao-medium · PoC Nativo)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "MIT (via sherpa-onnx C ABI)",
+            licenseWarning: "Alternativa genuína em Português Europeu (pt-PT); instalação manual/local em Models/vits-piper-pt_PT-tugao-medium.",
+            sizeBytes: 63_500_000,
+            minimumRAMProfile: .low8GB,
+            minimumRAMGB: 8.0,
+            supportedLanguages: ["pt-PT"],
+            supportsEmotionControl: false,
+            archiveFormat: .externalManual,
+            requiredRuntimeID: sherpaRuntimeID,
+            description: "Modelo VITS local em Português Europeu nativo como prova de conceito para suprir lacuna pt-PT do Kokoro."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "nari-dia-1.6b",
+            displayName: "Nari Labs Dia-1.6B (Apache-2.0 · Inglês)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "Apache-2.0",
+            licenseWarning: "Exige 8–10+ GB de memória unificada e é focado em inglês; inviável simultaneamente com LLM em 8 GB RAM.",
+            sizeBytes: 6_400_000_000,
+            minimumRAMProfile: .balanced16GB,
+            minimumRAMGB: 16.0,
+            supportedLanguages: ["en-US"],
+            supportsEmotionControl: true,
+            archiveFormat: .externalManual,
+            description: "Catálogo técnico: gera risos/suspiros em inglês via servidor mlx-audio/PyTorch, sem suporte nativo a português."
         ),
         LocalVoiceModelDescriptor(
             id: "f5-tts-noncommercial",

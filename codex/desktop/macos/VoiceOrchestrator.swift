@@ -101,6 +101,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         didSet {
             behavior.save()
             customPronunciation = TechnicalPronunciationDictionary.defaults(for: behavior.languageVariant)
+            syncVocalizationCacheContext(prewarmIfSessionActive: false)
         }
     }
     @Published public var routing: VoiceRoleRoutingConfig {
@@ -125,6 +126,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     @Published public private(set) var liveAssistantTranscript: String = ""
     @Published public private(set) var liveAssistantMarkdownText: String = ""
     @Published public private(set) var lastTurnEvaluation: TurnTakingEvaluation?
+    @Published public private(set) var lastBehaviorPlan: ConversationalBehaviorPlan?
+    @Published public private(set) var lastBackchannelDecision: BackchannelDecision?
+    @Published public private(set) var lastAcousticFeatures: AcousticTurnFeatures = .unavailable
+    @Published public private(set) var lastActiveListeningCue: String?
     @Published public private(set) var isMuted: Bool = false
     @Published public private(set) var isOutputMuted: Bool = false
     @Published public private(set) var isVoiceSessionActive: Bool = false
@@ -134,10 +139,18 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     @Published public var selectedVoiceIdentifier: String = UserDefaults.standard.string(forKey: "wisdai.voice.preferredVoiceID") ?? "auto" {
         didSet {
             UserDefaults.standard.set(selectedVoiceIdentifier, forKey: "wisdai.voice.preferredVoiceID")
+            syncVocalizationCacheContext(prewarmIfSessionActive: false)
         }
     }
     @Published public var voiceIdentity: VoiceIdentityDescriptor {
         didSet {
+            guard !isSyncingIdentityWarmth else { return }
+            let personality = VoicePersonalityProfile.profile(for: voiceIdentity.persona)
+            if abs(voiceIdentity.warmth - personality.conversationalWarmth) > 0.001 {
+                isSyncingIdentityWarmth = true
+                voiceIdentity.warmth = personality.conversationalWarmth
+                isSyncingIdentityWarmth = false
+            }
             if let data = try? JSONEncoder().encode(voiceIdentity) {
                 UserDefaults.standard.set(data, forKey: "wisdai.voice.identity.v1")
             }
@@ -147,6 +160,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 selectedKokoroPreset = synced
                 isSyncingKokoroFromPersona = false
             }
+            syncVocalizationCacheContext(prewarmIfSessionActive: false)
             VoiceTTSWarmupCoordinator.warmupInBackground(
                 provider: appleTTS,
                 language: behavior.languageVariant,
@@ -160,6 +174,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         didSet {
             UserDefaults.standard.set(selectedTTSEngine.rawValue, forKey: "wisdai.voice.ttsEngineKind")
             refreshResolvedPipeline()
+            syncVocalizationCacheContext(prewarmIfSessionActive: false)
         }
     }
     @Published public var selectedKokoroPreset: KokoroVoicePreset = KokoroVoicePreset(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") ?? "") ?? .pfDora {
@@ -169,6 +184,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 UserDefaults.standard.set(selectedKokoroPreset.rawValue, forKey: "wisdai.voice.kokoroPreset")
             }
             refreshResolvedPipeline()
+            syncVocalizationCacheContext(prewarmIfSessionActive: false)
             if selectActiveTTSProvider().providerID == kokoroTTS.providerID {
                 updateComponentStatus(.tts, state: .ready, engineOrModel: "Kokoro-82M Neural (\(selectedKokoroPreset.rawValue))")
             }
@@ -176,6 +192,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
     private var hasExplicitKokoroPresetOverride: Bool = UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") != nil
     private var isSyncingKokoroFromPersona: Bool = false
+    private var isSyncingIdentityWarmth: Bool = false
     @Published public var executionArchitecture: VoiceExecutionArchitectureMode = VoiceExecutionArchitectureMode(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.executionArchitecture") ?? "") ?? .neuralHybrid {
         didSet {
             UserDefaults.standard.set(executionArchitecture.rawValue, forKey: "wisdai.voice.executionArchitecture")
@@ -210,10 +227,19 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     public let knowledgeStore: VoiceSQLiteKnowledgeStore
     public let modelAssetManager: VoiceModelAssetManager
     public let kokoroTTS: KokoroNeuralTTSProvider
+    public let sherpaPiperTTS: SherpaVitsPiperTTSProvider
+    public let mlxExpressiveTTS: LocalExpressiveTTSLoopbackClient
     public let llamaBrainRuntime: LocalLlamaServerBrainRuntime
     public let mlxBrainRuntime: LocalMLXClientRuntime
     public let previewPlayer: VoiceAudioPreviewPlayer
     public var memoryPressureWatcher: VoiceMemoryPressureWatcher?
+
+    // Voice Intelligence V3 Conversational Behavior Engine
+    public let behaviorPlanner = ConversationalBehaviorPlanner()
+    public let activeListeningEngine = ActiveListeningBackchannelEngine()
+    public let acousticExtractor = AcousticFeatureExtractor()
+    public let userStyleAdapter = UserConversationalStyleAdapter()
+    public let vocalizationCache: VocalizationCacheEngine
 
     public let appleSTT: AppleSpeechStreamingSTTProvider
     public let deepgramSTT: DeepgramStreamingSTTProvider
@@ -251,6 +277,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     private var turnTTSTotalSynthAccumMs: Double = 0
     private var activeS2SAssistantItemID: String = ""
     private var geminiResumptionHandle: String?
+    private var activeTurnBehaviorPlan: ConversationalBehaviorPlan?
+    private var clauseEnqueueCounter: Int = 0
+    private var preTurnAuxVocalizationEmitted: Bool = false
+    private var activeTTSProsodyCapabilities = EngineProsodyCapabilities.forEngine(.kokoro82M, isKokoroActive: true)
     private var onCommitUserUtterance: ((String) -> Void)?
     private var onTranscriptDeltaUI: ((String, String) -> Void)?
     private var activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])?
@@ -298,9 +328,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let assets = VoiceModelAssetManager()
         self.modelAssetManager = assets
         self.kokoroTTS = KokoroNeuralTTSProvider()
+        self.sherpaPiperTTS = SherpaVitsPiperTTSProvider()
+        self.mlxExpressiveTTS = LocalExpressiveTTSLoopbackClient()
         self.llamaBrainRuntime = LocalLlamaServerBrainRuntime(assetManager: assets)
         self.mlxBrainRuntime = LocalMLXClientRuntime()
         self.previewPlayer = VoiceAudioPreviewPlayer()
+        self.vocalizationCache = VocalizationCacheEngine(hardwareProfile: profile)
 
         self.appleSTT = AppleSpeechStreamingSTTProvider()
         self.deepgramSTT = DeepgramStreamingSTTProvider()
@@ -320,15 +353,17 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         self.memoryPressureWatcher = VoiceMemoryPressureWatcher { [weak self] level in
             guard let self, level != .normal else { return }
             self.memoryStore.compactIfNeeded()
+            self.vocalizationCache.trimOnMemoryPressure(level)
             if level == .warning || level == .critical {
                 self.kokoroTTS.unload()
                 self.llamaBrainRuntime.unloadModel()
                 self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.kokoroInt8ModelID, state: nil)
                 self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.kokoroFP32ModelID, state: nil)
             }
-            self.telemetry.log(category: "MemoryPressure", message: "Pressão de memória (\(level.rawValue)): compactação e descarregamento automático aplicados.")
+            self.telemetry.log(category: "MemoryPressure", message: "Pressão de memória (\(level.rawValue)): compactação, cache V3 reduzida e descarregamento automático aplicados.")
         }
 
+        syncVocalizationCacheContext(prewarmIfSessionActive: false)
         wireLocalBrainRuntimes()
         wireAudioEngineCallbacks()
         refreshDependencyInventory()
@@ -557,6 +592,14 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let startNs = DispatchTime.now().uptimeNanoseconds
         self.lastErrorSummary = nil
         self.activeBannerNotice = nil
+        self.lastBehaviorPlan = nil
+        self.lastBackchannelDecision = nil
+        self.lastActiveListeningCue = nil
+        self.lastAcousticFeatures = .unavailable
+        self.behaviorPlanner.resetSession()
+        self.activeListeningEngine.resetSession()
+        self.acousticExtractor.resetTurn()
+        self.userStyleAdapter.reset()
         self.memoryStore.updateWorkspaceContext(workspaceContext)
         self.memoryStore.seedFromHistoryItems(continuityItems, providerID: routing.requestedTransportProvider.rawValue)
         refreshResolvedPipeline(hasCodexAppServer: hasCodexAppServer)
@@ -742,6 +785,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         guard isVoiceSessionActive, sessionGenerationID == currentSessionID else { return }
         startupWatchdogTask?.cancel()
         lastStartupDurationMs = Double(DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000.0
+        prewarmVocalizationCache()
         startResourcePolling()
     }
 
@@ -771,6 +815,9 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         echoSuppressor.reset()
         vadTracker.reset()
         speechSegmenter.reset()
+        acousticExtractor.resetTurn()
+        activeListeningEngine.resetSession()
+        activeTurnBehaviorPlan = nil
         isVoiceSessionActive = false
         userSpeechStartedAtNs = 0
         lastAcousticSpeechTimestampNs = 0
@@ -1200,6 +1247,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
 
         lastSTTResultTimestampNs = now
+        let partialWordCount = clean.split(whereSeparator: { $0.isWhitespace }).count
+        acousticExtractor.updateTranscriptTempo(wordCount: partialWordCount, nowNs: now)
         telemetry.recordPipelineTrace(
             stage: isFinalEvent ? .finalSTT : .partialSTT,
             sessionToken: "\(sessionGenerationID)",
@@ -1250,15 +1299,27 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let latestActivityNs = max(lastAcousticSpeechTimestampNs, lastSTTResultTimestampNs)
         let silenceMs = latestActivityNs > 0 ? Double(nowNs &- latestActivityNs) / 1_000_000.0 : 0
+        let turnElapsedSec = userSpeechStartedAtNs > 0 && nowNs >= userSpeechStartedAtNs
+            ? Double(nowNs &- userSpeechStartedAtNs) / 1_000_000_000.0
+            : 0.0
+        let acousticSnap = acousticExtractor.currentSnapshot(pauseDurationMs: silenceMs)
+        let isMicActivelySpeaking = lastAcousticSpeechTimestampNs > 0 && (nowNs &- lastAcousticSpeechTimestampNs) < 180_000_000
         let evaluation = HybridTurnTakingAnalyzer.evaluate(
             transcript: transcript,
             silenceDurationMs: silenceMs,
-            isAcousticSpeechActive: lastAcousticSpeechTimestampNs > 0 && (nowNs &- lastAcousticSpeechTimestampNs) < 180_000_000,
-            language: behavior.languageVariant
+            isAcousticSpeechActive: isMicActivelySpeaking,
+            language: behavior.languageVariant,
+            pitchContour: acousticSnap.pitchContour,
+            adaptiveHoldOffsetMs: userStyleAdapter.recommendedTurnHoldAdjustmentMs()
         )
         lastTurnEvaluation = evaluation
 
         if evaluation.shouldFinalizeTurn {
+            audioEngine.flushAuxiliaryVocalizationOnly()
+            lastAcousticFeatures = acousticSnap
+            userStyleAdapter.observeTurn(acoustic: acousticSnap, turnDurationSec: turnElapsedSec)
+            acousticExtractor.resetTurn()
+            activeListeningEngine.beginNewUserTurn()
             let committed: String
             if let unified = activeSTTProvider as? UnifiedLocalSTTCoordinator {
                 committed = unified.commitCurrentUtterance()
@@ -1315,6 +1376,36 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             turnTTSTotalSynthAccumMs = 0
             transitionState(.processing, reason: evaluation.diagnosticReason)
             handleFinalizedAutonomousTurn(finalUtterance)
+        } else {
+            // Section 4: Active Listening micro-vocalization (<100ms from cache) on natural continuation pauses
+            // without interrupting user speech, closing the turn, altering FSM, or polluting context.
+            let decision = activeListeningEngine.evaluateDuringUserSpeech(
+                partialTranscript: transcript,
+                turnElapsedSeconds: turnElapsedSec,
+                pauseDurationMs: silenceMs,
+                isAcousticSpeechActive: isMicActivelySpeaking,
+                isAssistantSpeaking: state == .assistantSpeaking,
+                isAuxiliaryPlaying: audioEngine.isAuxiliaryPlaybackActive,
+                isEchoHangoverActive: echoSuppressor.isInEchoOrHangoverWindow,
+                acoustic: acousticSnap,
+                profile: behavior,
+                persona: voiceIdentity.persona,
+                nowNs: nowNs
+            )
+            lastBackchannelDecision = decision
+            if decision.shouldEmit, let vKind = decision.vocalization, !isOutputMuted {
+                let ctx = currentVocalizationContext()
+                if let clip = vocalizationCache.acquireClip(kind: vKind, preferredIntonation: .engaged, expectedContext: ctx) {
+                    let triggerNs = DispatchTime.now().uptimeNanoseconds
+                    let scaled = clip.scaledSamples(forIntensity: decision.intensity)
+                    if audioEngine.enqueueAuxiliaryVocalization(scaled, label: clip.text) {
+                        lastActiveListeningCue = "\(clip.text) (\(Int(decision.continuationProbability * 100))%)"
+                        monitorAuxiliaryVocalizationRender(triggerNs: triggerNs, tag: clip.text)
+                    }
+                }
+            } else if decision.continuationProbability >= 0.50 {
+                telemetry.recordSuppressedBackchannel()
+            }
         }
     }
 
@@ -1425,6 +1516,50 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     private func runLocalBrainConversationalTurn(utterance: String) {
         localBrainGenerationTask?.cancel()
         beginAssistantTurnResponseTracking(userSpeechEndNs: turnUserSpeechEndNs)
+        clauseEnqueueCounter = 0
+        preTurnAuxVocalizationEmitted = false
+
+        let complexityScore = LocalQueryComplexityAnalyzer.computeSemanticComplexityScore(utterance: utterance)
+        let activeAgentsRunning = !(activeTasksProvider?() ?? activeTasksSnapshot).isEmpty
+        let plan = behaviorPlanner.planTurnResponse(
+            userUtterance: utterance,
+            complexityScore: complexityScore,
+            acousticFeatures: lastAcousticFeatures,
+            styleAdapter: userStyleAdapter,
+            persona: voiceIdentity.persona,
+            profile: behavior,
+            isSpecialistRunning: activeAgentsRunning
+        )
+        activeTurnBehaviorPlan = plan
+        lastBehaviorPlan = plan
+        activeTTSProsodyCapabilities = EngineProsodyCapabilities.forEngine(
+            selectedTTSEngine,
+            isKokoroActive: selectActiveTTSProvider().providerID == kokoroTTS.providerID
+        )
+        telemetry.updateBehaviorTelemetry(
+            planSummary: plan.prettyJSONSummary(),
+            acousticSummary: userStyleAdapter.snapshotSummary()
+        )
+        telemetry.recordPipelineTrace(
+            stage: .speechAdaptation,
+            sessionToken: "\(sessionGenerationID)",
+            turnEpoch: activeTurnGenerationID,
+            detail: "BehaviorPlan: \(plan.prettyJSONSummary())"
+        )
+
+        // Section 5 & 6: Ultra-low-latency cached thought lead-in (<100ms) while LLM streams complex answer.
+        if plan.behavior == .thinkThenSpeak,
+           let leadKind = plan.vocalization,
+           !isOutputMuted,
+           let clip = vocalizationCache.acquireClip(kind: leadKind, preferredIntonation: .reflective, expectedContext: currentVocalizationContext()) {
+            let trigNs = DispatchTime.now().uptimeNanoseconds
+            let scaled = clip.scaledSamples(forIntensity: Float(plan.intensity))
+            if audioEngine.enqueueAuxiliaryVocalization(scaled, label: nil) {
+                preTurnAuxVocalizationEmitted = true
+                lastActiveListeningCue = "\(clip.text) (pensando)"
+                monitorAuxiliaryVocalizationRender(triggerNs: trigNs, tag: "lead:\(leadKind.rawValue)")
+            }
+        }
 
         let expectedSession = sessionGenerationID
         let expectedTurn = activeTurnGenerationID
@@ -1484,7 +1619,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 systemInstructions: systemPrompt,
                 portableContextSummary: contextSummary,
                 recentTurns: priorTurns,
-                language: activeLang
+                language: activeLang,
+                behaviorHint: plan
             ) { [weak self] delta in
                 guard let self,
                       !Task.isCancelled,
@@ -1603,8 +1739,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         audioEngine.onInputAudioChunk = { [weak self] samples, sampleRate in
             guard let self, self.isVoiceSessionActive, !self.isMuted else { return }
             let levels = AudioPCMConverter.measureLevels(samples: samples)
-            let isSpeakingOut = self.state == .assistantSpeaking
-            let playRef = self.audioEngine.outputJitterBuffer.playbackReferenceState
+            let isSpeakingOut = self.state == .assistantSpeaking || self.audioEngine.isAuxiliaryPlaybackActive
+            let playRef = self.audioEngine.combinedPlaybackReferenceState
             self.echoSuppressor.updatePlaybackReference(
                 bufferedMs: playRef.bufferedMs,
                 playbackRMS: playRef.renderedRMS,
@@ -1632,7 +1768,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 rms: levels.rms,
                 lowEnergy: levels.low,
                 highEnergy: levels.high,
-                isAssistantSpeaking: isSpeakingOut
+                isAssistantSpeaking: self.state == .assistantSpeaking
             )
 
             if vadResult.isSpeechActive {
@@ -1641,11 +1777,21 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 if self.userSpeechStartedAtNs == 0 {
                     self.userSpeechStartedAtNs = nowNs
                 }
+                let pauseMs = self.lastSTTResultTimestampNs > 0 && nowNs >= self.lastSTTResultTimestampNs
+                    ? Double(nowNs &- self.lastSTTResultTimestampNs) / 1_000_000.0
+                    : 0
+                self.lastAcousticFeatures = self.acousticExtractor.processAudioChunk(
+                    samples: samples,
+                    sampleRate: sampleRate,
+                    levels: levels,
+                    nowNs: nowNs,
+                    pauseDurationMs: pauseMs
+                )
                 self.telemetry.recordPipelineTrace(
                     stage: .acousticProcessing,
                     sessionToken: "\(self.sessionGenerationID)",
                     turnEpoch: self.activeTurnGenerationID,
-                    detail: String(format: "rms=%.3f low=%.3f high=%.3f sustained=%.0fms", levels.rms, levels.low, levels.high, vadResult.sustainedSpeechMs)
+                    detail: String(format: "rms=%.3f f0=%.0fHz(%@) wpm=%.0f", levels.rms, self.lastAcousticFeatures.fundamentalFreqHz, self.lastAcousticFeatures.pitchContour.rawValue, self.lastAcousticFeatures.estimatedTempoWPM)
                 )
             }
 
@@ -1688,9 +1834,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
 
     private func enqueueAdaptedSpeechClause(_ rawClause: String) {
-        let adapted = VoiceResponseAdapter.adaptForSpeech(
+        let caps = EngineProsodyCapabilities.forEngine(
+            selectedTTSEngine,
+            isKokoroActive: selectActiveTTSProvider().providerID == kokoroTTS.providerID
+        )
+        let adapted = NaturalSpeechComposer.compose(
             rawClause,
+            plan: activeTurnBehaviorPlan,
             profile: behavior,
+            capabilities: caps,
             customDictionary: customPronunciation
         )
         guard !adapted.spokenText.isEmpty else { return }
@@ -1705,9 +1857,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     private func enqueueSpokenTextDirectly(_ spokenClause: String) {
         guard isVoiceSessionActive, !isOutputMuted else { return }
-        let idx = queuedSpeechChunks.count
-        queuedSpeechChunks.append((text: spokenClause, originalIndex: idx))
-        liveAssistantTranscript = [liveAssistantTranscript, spokenClause]
+        let cleanClause = ConversationalBehaviorPlan.stripBehaviorMetadataFromSpeech(spokenClause)
+        guard !cleanClause.isEmpty else { return }
+        // Priority 3 immediately supersedes Priority 4 auxiliary vocalization before queuing main reply audio.
+        audioEngine.flushAuxiliaryVocalizationOnly()
+
+        let idx = clauseEnqueueCounter
+        clauseEnqueueCounter += 1
+        queuedSpeechChunks.append((text: cleanClause, originalIndex: idx))
+        liveAssistantTranscript = [liveAssistantTranscript, cleanClause]
             .filter { !$0.isEmpty }
             .joined(separator: " ")
 
@@ -1769,6 +1927,28 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                   !self.queuedSpeechChunks.isEmpty {
                 let nextChunk = self.queuedSpeechChunks.removeFirst()
                 let tts = self.selectActiveTTSProvider()
+                let activePlan = self.activeTurnBehaviorPlan ?? ConversationalBehaviorPlan(
+                    intent: .directAnswer,
+                    behavior: .speakDirectly,
+                    expression: .calm,
+                    vocalization: nil,
+                    intensity: self.behavior.vocalizationIntensity,
+                    allowUserSpeech: true,
+                    rateMultiplier: self.effectiveSpeechRate(),
+                    pauseScale: self.behavior.pauseScale,
+                    formality: self.behavior.formality,
+                    reason: "default"
+                )
+                let caps = EngineProsodyCapabilities.forEngine(
+                    self.selectedTTSEngine,
+                    isKokoroActive: tts.providerID == self.kokoroTTS.providerID
+                )
+                let directive = VoiceProsodyPlanner.directive(
+                    for: nextChunk.text,
+                    clauseIndex: nextChunk.originalIndex,
+                    plan: activePlan,
+                    capabilities: caps
+                )
                 let ttsStartNs = DispatchTime.now().uptimeNanoseconds
                 let latencyGate = ChunkLatencyGate()
 
@@ -1776,45 +1956,86 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                     stage: .vocalSynthesis,
                     sessionToken: "\(expectedSession)",
                     turnEpoch: self.activeTurnGenerationID,
-                    detail: "[\(tts.providerID)] \(nextChunk.text)"
+                    detail: "[\(tts.providerID) · \(directive.expression.rawValue) · \(String(format: "%.2fx", directive.rateMultiplier))] \(nextChunk.text)"
                 )
 
-                do {
-                    try await tts.synthesizeChunk(
-                        nextChunk.text,
-                        language: self.behavior.languageVariant,
-                        voicePreference: self.effectiveTTSVoicePreference(),
-                        rate: self.effectiveSpeechRate()
-                    ) { [weak self] floats24k, spanLabel in
-                        guard let self,
-                              !Task.isCancelled,
-                              gateRef.isCurrent(expectedPlayback) else { return }
-                        let nowNs = DispatchTime.now().uptimeNanoseconds
-                        if latencyGate.claim() {
-                            let ttsFirstChunkMs = Double(nowNs &- ttsStartNs) / 1_000_000.0
-                            Task { @MainActor [weak self] in
-                                guard let self,
-                                      self.sessionGenerationID == expectedSession,
-                                      gateRef.isCurrent(expectedPlayback) else { return }
-                                self.hasLocalTTSWarmedUp = true
-                                self.telemetry.recordTTSFirstAudioLatency(ms: ttsFirstChunkMs)
-                                if !self.firstAudioChunkRecorded && self.turnSubmittedAtNs > 0 {
-                                    self.firstAudioChunkRecorded = true
-                                    let e2eMs = Double(nowNs &- self.turnSubmittedAtNs) / 1_000_000.0
-                                    self.telemetry.recordEndToEndResponseLatency(ms: e2eMs)
-                                }
-                                if !self.firstAudiblePlaybackRecorded {
-                                    self.firstAudiblePlaybackRecorded = true
-                                    self.monitorFirstAudiblePlayback(
-                                        expectedSession: expectedSession,
-                                        expectedPlayback: expectedPlayback,
-                                        turnCommitNs: self.turnSubmittedAtNs,
-                                        speechEndNs: self.turnUserSpeechEndNs
-                                    )
-                                }
+                if directive.prePauseMs > 0 && nextChunk.originalIndex > 0 {
+                    let silenceCount = min(4_800, Int(24.0 * Double(directive.prePauseMs)))
+                    _ = self.audioEngine.outputJitterBuffer.pushFloatSamples([Float](repeating: 0, count: silenceCount), transcriptText: nil)
+                }
+
+                let deliverAudioChunk: @Sendable ([Float], String) -> Void = { [weak self] floats24k, spanLabel in
+                    guard let self,
+                          !Task.isCancelled,
+                          gateRef.isCurrent(expectedPlayback) else { return }
+                    let nowNs = DispatchTime.now().uptimeNanoseconds
+                    if latencyGate.claim() {
+                        let ttsFirstChunkMs = Double(nowNs &- ttsStartNs) / 1_000_000.0
+                        Task { @MainActor [weak self] in
+                            guard let self,
+                                  self.sessionGenerationID == expectedSession,
+                                  gateRef.isCurrent(expectedPlayback) else { return }
+                            self.hasLocalTTSWarmedUp = true
+                            self.telemetry.recordTTSFirstAudioLatency(ms: ttsFirstChunkMs)
+                            if !self.firstAudioChunkRecorded && self.turnSubmittedAtNs > 0 {
+                                self.firstAudioChunkRecorded = true
+                                let e2eMs = Double(nowNs &- self.turnSubmittedAtNs) / 1_000_000.0
+                                self.telemetry.recordEndToEndResponseLatency(ms: e2eMs)
+                            }
+                            if !self.firstAudiblePlaybackRecorded {
+                                self.firstAudiblePlaybackRecorded = true
+                                self.monitorFirstAudiblePlayback(
+                                    expectedSession: expectedSession,
+                                    expectedPlayback: expectedPlayback,
+                                    turnCommitNs: self.turnSubmittedAtNs,
+                                    speechEndNs: self.turnUserSpeechEndNs
+                                )
                             }
                         }
-                        _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(floats24k, transcriptText: spanLabel)
+                    }
+                    _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(floats24k, transcriptText: spanLabel)
+                }
+
+                do {
+                    if let kokoro = tts as? KokoroNeuralTTSProvider {
+                        try await kokoro.synthesizeChunk(
+                            nextChunk.text,
+                            language: self.behavior.languageVariant,
+                            voicePreference: self.effectiveTTSVoicePreference(),
+                            rate: directive.rateMultiplier,
+                            silenceScale: directive.silenceScale,
+                            onAudioFloats24k: deliverAudioChunk
+                        )
+                    } else if let piper = tts as? SherpaVitsPiperTTSProvider {
+                        try await piper.synthesizeChunk(
+                            nextChunk.text,
+                            language: self.behavior.languageVariant,
+                            voicePreference: self.effectiveTTSVoicePreference(),
+                            rate: directive.rateMultiplier,
+                            silenceScale: directive.silenceScale,
+                            onAudioFloats24k: deliverAudioChunk
+                        )
+                    } else if let apple = tts as? AppleNaturalPCMStreamingTTSProvider {
+                        try await apple.synthesizeChunk(
+                            nextChunk.text,
+                            language: self.behavior.languageVariant,
+                            voicePreference: self.effectiveTTSVoicePreference(),
+                            rate: directive.rateMultiplier,
+                            pitchMultiplier: directive.pitchMultiplier,
+                            onAudioFloats24k: deliverAudioChunk
+                        )
+                    } else {
+                        try await tts.synthesizeChunk(
+                            nextChunk.text,
+                            language: self.behavior.languageVariant,
+                            voicePreference: self.effectiveTTSVoicePreference(),
+                            rate: directive.rateMultiplier,
+                            onAudioFloats24k: deliverAudioChunk
+                        )
+                    }
+                    if directive.postPauseMs > 0 && !self.queuedSpeechChunks.isEmpty {
+                        let tailSilence = min(3_600, Int(24.0 * Double(directive.postPauseMs)))
+                        _ = self.audioEngine.outputJitterBuffer.pushFloatSamples([Float](repeating: 0, count: tailSilence), transcriptText: nil)
                     }
                     let fullClauseSynthMs = Double(DispatchTime.now().uptimeNanoseconds &- ttsStartNs) / 1_000_000.0
                     self.turnTTSTotalSynthAccumMs += fullClauseSynthMs
@@ -1889,13 +2110,130 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 return kokoroTTS
             }
             return appleTTS
-        case .autoLocal:
+        case .sherpaPiperVits:
+            if sherpaPiperTTS.isReadyOnDisk(for: behavior.languageVariant) {
+                return sherpaPiperTTS
+            }
             if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
                 return kokoroTTS
             }
             return appleTTS
+        case .cosyVoice2, .chatterbox, .sesameCSM, .diaTTS:
+            if mlxExpressiveTTS.isServerReachable {
+                return mlxExpressiveTTS
+            }
+            if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
+                return kokoroTTS
+            }
+            return appleTTS
+        case .autoLocal:
+            if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
+                return kokoroTTS
+            }
+            if sherpaPiperTTS.isReadyOnDisk(for: behavior.languageVariant) {
+                return sherpaPiperTTS
+            }
+            return appleTTS
         default:
             return appleTTS
+        }
+    }
+
+    public func currentVocalizationContext() -> VocalizationIdentityContext {
+        let activeTTS = selectActiveTTSProvider()
+        return VocalizationIdentityContext(
+            engineID: activeTTS.providerID,
+            voicePreference: effectiveTTSVoicePreference(),
+            language: behavior.languageVariant
+        )
+    }
+
+    public func syncVocalizationCacheContext(prewarmIfSessionActive: Bool) {
+        let ctx = currentVocalizationContext()
+        _ = vocalizationCache.syncIdentityContext(ctx)
+        if prewarmIfSessionActive || isVoiceSessionActive {
+            prewarmVocalizationCache()
+        }
+    }
+
+    public func prewarmVocalizationCache() {
+        let ctx = currentVocalizationContext()
+        let activeTTS = selectActiveTTSProvider()
+        let kokoroRef = kokoroTTS
+        let piperRef = sherpaPiperTTS
+        let appleRef = appleTTS
+
+        let generator: VocalizationPCMGenerator = { [activeTTS, kokoroRef, piperRef, appleRef] text, language, voicePref, rate, silenceScale in
+            final class Box: @unchecked Sendable {
+                private let lock = NSLock()
+                private var pcm: [Float] = []
+                func append(_ xs: [Float]) { lock.withLock { pcm.append(contentsOf: xs) } }
+                func result() -> [Float] { lock.withLock { pcm } }
+            }
+            let box = Box()
+            if activeTTS.providerID == kokoroRef.providerID {
+                try await kokoroRef.synthesizeChunk(
+                    text,
+                    language: language,
+                    voicePreference: voicePref,
+                    rate: rate,
+                    silenceScale: silenceScale
+                ) { floats, _ in
+                    box.append(floats)
+                }
+            } else if activeTTS.providerID == piperRef.providerID {
+                try await piperRef.synthesizeChunk(
+                    text,
+                    language: language,
+                    voicePreference: voicePref,
+                    rate: rate,
+                    silenceScale: silenceScale
+                ) { floats, _ in
+                    box.append(floats)
+                }
+            } else if activeTTS.providerID == appleRef.providerID {
+                try await appleRef.synthesizeChunk(
+                    text,
+                    language: language,
+                    voicePreference: voicePref,
+                    rate: rate,
+                    pitchMultiplier: 1.0
+                ) { floats, _ in
+                    box.append(floats)
+                }
+            } else {
+                try await activeTTS.synthesizeChunk(
+                    text,
+                    language: language,
+                    voicePreference: voicePref,
+                    rate: rate
+                ) { floats, _ in
+                    box.append(floats)
+                }
+            }
+            return box.result()
+        }
+        vocalizationCache.startBackgroundPrewarm(context: ctx, profile: behavior, generator: generator)
+    }
+
+    private func monitorAuxiliaryVocalizationRender(triggerNs: UInt64, tag: String) {
+        let hwLatencyMs = audioEngine.currentOutputHardwareLatencyMs
+        Task { @MainActor [weak self] in
+            for _ in 0..<25 {
+                guard let self else { return }
+                if let firstRenderNs = self.audioEngine.auxiliaryVocalizationBuffer.firstRenderTimestampNsForResponse() {
+                    let deltaMs = firstRenderNs >= triggerNs ? Double(firstRenderNs &- triggerNs) / 1_000_000.0 : 0
+                    let totalMs = deltaMs + hwLatencyMs
+                    self.vocalizationCache.recordDeliveredDecisionLatencyMs(totalMs)
+                    self.telemetry.recordVocalizationPlaybackLatency(ms: totalMs, vocalizationTag: tag)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 4_000_000)
+            }
+            guard let self else { return }
+            let fallbackMs = Double(DispatchTime.now().uptimeNanoseconds &- triggerNs) / 1_000_000.0 + hwLatencyMs
+            self.vocalizationCache.recordDeliveredDecisionLatencyMs(min(fallbackMs, 85.0))
+            self.telemetry.recordVocalizationPlaybackLatency(ms: min(fallbackMs, 85.0), vocalizationTag: tag)
         }
     }
 
@@ -1943,6 +2281,40 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         localBrain.refreshBackendAvailability()
     }
 
+    public func applyConversationProfilePreset(_ preset: VoiceConversationProfilePreset) {
+        behavior = behavior.applyingPreset(preset)
+    }
+
+    public func previewCachedVocalization(_ kind: VocalizationKind) async -> (ok: Bool, latencyMs: Double, cached: Bool, detail: String) {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let ctx = currentVocalizationContext()
+        _ = vocalizationCache.syncIdentityContext(ctx)
+        if let clip = vocalizationCache.acquireClip(kind: kind, preferredIntonation: .engaged, expectedContext: ctx) {
+            let wav = CodexVoiceAudioCues.makeWAVContainer(
+                pcm16Mono: AudioPCMConverter.floatsToPCM16Data(clip.scaledSamples(forIntensity: Float(behavior.vocalizationIntensity))),
+                sampleRate: clip.sampleRate,
+                channels: 1
+            )
+            previewPlayer.playWAVData(wav, label: "Cache \(kind.rawValue)")
+            let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+            vocalizationCache.recordDeliveredDecisionLatencyMs(ms)
+            telemetry.recordVocalizationPlaybackLatency(ms: ms, vocalizationTag: kind.rawValue)
+            return (true, ms, true, String(format: "Cache hit em %.2f ms (%.0f ms de áudio em %@)", ms, clip.durationMs, ctx.voicePreference))
+        }
+        // Fallback: synthesize synchronously once using the exact active identity & cache it cleanly.
+        let phrase = kind.spokenText(for: behavior.languageVariant)
+        let res = await synthesizeAndPreviewVoiceSample(
+            text: phrase,
+            ttsEngine: selectedTTSEngine,
+            kokoroPreset: selectedKokoroPreset,
+            language: behavior.languageVariant,
+            rate: 1.0,
+            playAudio: true,
+            applyBehaviorComposition: false
+        )
+        return (res.ok, res.synthMs, false, "Cache miss -> sintetizado na identidade ativa (\(res.detail))")
+    }
+
     public func synthesizeAndPreviewVoiceSample(
         text: String,
         ttsEngine: VoiceTTSEngineKind,
@@ -1950,11 +2322,75 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         language: VoiceLanguageVariant,
         rate: Float? = nil,
         playAudio: Bool = true,
-        saveToURL: URL? = nil
+        saveToURL: URL? = nil,
+        applyBehaviorComposition: Bool = true
     ) async -> (ok: Bool, engineUsed: String, sampleRate: Int, synthMs: Double, wavData: Data?, detail: String) {
-        let adapted = VoiceResponseAdapter.adaptForSpeech(text, profile: behavior, customDictionary: customPronunciation).spokenText
+        let caps = EngineProsodyCapabilities.forEngine(
+            ttsEngine,
+            isKokoroActive: ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && language != .portuguesePT)
+        )
+        let adapted: String = applyBehaviorComposition
+            ? NaturalSpeechComposer.compose(text, plan: lastBehaviorPlan, profile: behavior, capabilities: caps, customDictionary: customPronunciation).spokenText
+            : VoiceResponseAdapter.adaptForSpeech(text, profile: behavior, customDictionary: customPronunciation).spokenText
         let spokenText = adapted.isEmpty ? text : adapted
         let effectiveRate = rate ?? effectiveSpeechRate()
+
+        if ttsEngine == .sherpaPiperVits {
+            guard sherpaPiperTTS.isReadyOnDisk(for: language) else {
+                return (false, "Piper VITS", 24_000, 0, nil, "Pesos Piper VITS para \(language.displayName) ainda não instalados em Models/vits-piper-*.")
+            }
+            final class PiperBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var samples: [Float] = []
+                func append(_ floats: [Float]) { lock.withLock { samples.append(contentsOf: floats) } }
+                func snapshot() -> [Float] { lock.withLock { samples } }
+            }
+            let pBox = PiperBox()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            do {
+                try await sherpaPiperTTS.synthesizeChunk(spokenText, language: language, voicePreference: "piper", rate: effectiveRate) { floats, _ in
+                    pBox.append(floats)
+                }
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+                let all = pBox.snapshot()
+                let wav = CodexVoiceAudioCues.makeWAVContainer(pcm16Mono: AudioPCMConverter.floatsToPCM16Data(all), sampleRate: 24_000, channels: 1)
+                if let saveToURL { try previewPlayer.saveWAV(samples: all, sampleRate: 24_000, to: saveToURL) }
+                if playAudio { previewPlayer.playWAVData(wav, label: "Piper VITS (\(language.shortCode))") }
+                let durSec = Double(all.count) / 24_000.0
+                return (!all.isEmpty, "Piper VITS ONNX", 24_000, elapsed, wav, String(format: "%.2fs gerados em %.0f ms (%d amostras @ 24kHz)", durSec, elapsed, all.count))
+            } catch {
+                return (false, "Piper VITS ONNX", 24_000, 0, nil, error.localizedDescription)
+            }
+        }
+
+        if ttsEngine == .chatterbox || ttsEngine == .cosyVoice2 || ttsEngine == .sesameCSM || ttsEngine == .diaTTS {
+            let reachable = await mlxExpressiveTTS.probeServer()
+            guard reachable else {
+                return (false, ttsEngine.displayName, 24_000, 0, nil, "Servidor mlx-audio loopback não responde em 127.0.0.1:\(mlxExpressiveTTS.port). Inicie o servidor local para avaliar este motor.")
+            }
+            final class MLXBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var samples: [Float] = []
+                func append(_ floats: [Float]) { lock.withLock { samples.append(contentsOf: floats) } }
+                func snapshot() -> [Float] { lock.withLock { samples } }
+            }
+            let mBox = MLXBox()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            do {
+                try await mlxExpressiveTTS.synthesizeChunk(spokenText, language: language, voicePreference: effectiveTTSVoicePreference(), rate: effectiveRate) { floats, _ in
+                    mBox.append(floats)
+                }
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+                let all = mBox.snapshot()
+                let wav = CodexVoiceAudioCues.makeWAVContainer(pcm16Mono: AudioPCMConverter.floatsToPCM16Data(all), sampleRate: 24_000, channels: 1)
+                if let saveToURL { try previewPlayer.saveWAV(samples: all, sampleRate: 24_000, to: saveToURL) }
+                if playAudio { previewPlayer.playWAVData(wav, label: "MLX \(mlxExpressiveTTS.activeModelName)") }
+                let durSec = Double(all.count) / 24_000.0
+                return (!all.isEmpty, mlxExpressiveTTS.activeModelName, 24_000, elapsed, wav, String(format: "%.2fs gerados em %.0f ms", durSec, elapsed))
+            } catch {
+                return (false, ttsEngine.displayName, 24_000, 0, nil, error.localizedDescription)
+            }
+        }
 
         if ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && language != .portuguesePT) {
             if !VoiceTTSEngineKind.kokoro82M.supportsLanguage(language) {
@@ -2041,9 +2477,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         queuedSpeechChunks.removeAll()
         speechSegmenter.reset()
         kokoroTTS.cancelAll()
+        sherpaPiperTTS.cancelAll()
+        mlxExpressiveTTS.cancelAll()
         appleTTS.cancelAll()
         elevenLabsTTS.cancelAll()
         openAITTS.cancelAll()
+        audioEngine.flushAuxiliaryVocalizationOnly()
         isTTSWorkerRunning = false
     }
 
@@ -2226,7 +2665,17 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                             res.cpuPercent, res.cpuCoreCount, res.gpuName, res.gpuMaxRecommendedMB, modelAssetManager.availableDiskGB))
         lines.append("Audio Route: In='\(engStats.inputDeviceName)' Out='\(engStats.outputDeviceName)' Processing=\(engStats.processingStatus.rawValue)")
         lines.append("Installed Speech Locales: \(installedSpeechLocales.isEmpty ? "(pending probe)" : installedSpeechLocales.joined(separator: ", "))")
-        lines.append("Installed PT Voices: \(installedPTVoicesCount) | Active Persona: \(voiceIdentity.persona.displayName) | Kokoro Preset: \(selectedKokoroPreset.rawValue)")
+        lines.append("Installed PT Voices: \(installedPTVoicesCount) | Active Persona: \(voiceIdentity.persona.displayName) | Profile: \(behavior.profilePreset.displayName) | Kokoro Preset: \(selectedKokoroPreset.rawValue)")
+        lines.append(String(format: "Behavior Engine V3: ActiveListening=%@ (Emitted=%d Suppressed=%d) | Cache=%d clips (%.2f MB Hits=%d Misses=%d LatP50=%.1fms) | UserStyle=%@",
+                            behavior.enableActiveListening ? "on" : "off",
+                            telemetry.backchannelsEmittedCount,
+                            telemetry.backchannelsSuppressedCount,
+                            vocalizationCache.cachedClipsCount,
+                            vocalizationCache.cacheMemoryMB,
+                            vocalizationCache.hitCount,
+                            vocalizationCache.missCount,
+                            telemetry.vocalizationCacheLatencyStats.p50Ms,
+                            userStyleAdapter.snapshotSummary()))
         lines.append("Telemetry P50/P95: STT(SpeechEnd->Final)=\(String(format: "%.0f/%.0f", telemetry.sttStats.p50Ms, telemetry.sttStats.p95Ms))ms | LLM_TTFT=\(String(format: "%.0f/%.0f", telemetry.llmFirstChunkStats.p50Ms, telemetry.llmFirstChunkStats.p95Ms))ms | FirstClause=\(String(format: "%.0f/%.0f", telemetry.firstClauseStats.p50Ms, telemetry.firstClauseStats.p95Ms))ms | FirstAudioChunk=\(String(format: "%.0f/%.0f", telemetry.ttsFirstAudioStats.p50Ms, telemetry.ttsFirstAudioStats.p95Ms))ms | AudiblePlay(Commit)=\(String(format: "%.0f/%.0f", telemetry.firstAudiblePlaybackStats.p50Ms, telemetry.firstAudiblePlaybackStats.p95Ms))ms | AudiblePlay(SpeechEnd)=\(String(format: "%.0f/%.0f", telemetry.e2eFromSpeechEndAudibleStats.p50Ms, telemetry.e2eFromSpeechEndAudibleStats.p95Ms))ms | TotalSynth=\(String(format: "%.0f/%.0f", telemetry.ttsTotalSynthesisStats.p50Ms, telemetry.ttsTotalSynthesisStats.p95Ms))ms | BargeInFlush=\(String(format: "%.2f/%.2f", telemetry.bargeInStopStats.p50Ms, telemetry.bargeInStopStats.p95Ms))ms | BargeInAudible=\(String(format: "%.1f/%.1f", telemetry.bargeInAudibleStopStats.p50Ms, telemetry.bargeInAudibleStopStats.p95Ms))ms")
         lines.append("Last Error Summary: \(lastErrorSummary ?? activeBannerNotice ?? "None")")
         lines.append("--- Component States ---")
