@@ -597,7 +597,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         continuityMessages: [CodexContinuityItem],
         hasCodexAppServer: Bool,
         activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])? = nil,
-        onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> Void)? = nil,
+        onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> VoiceDelegationDispatchResult)? = nil,
         onRecordLocalExchangeToChat: ((String, String) -> Void)? = nil,
         greeting: String? = nil,
         onSpeech: @escaping (String) -> Void
@@ -623,7 +623,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         CodexVoiceAudioCues.shared.play(.realtimeStart, enabled: voiceSoundsEnabled)
 
         orchestrator.selectedVoiceIdentifier = (selectedVoiceID != "auto") ? selectedVoiceID : "auto"
-        orchestrator.behavior.speechRate = Float(speechSpeed)
+        speechSpeed = Double(orchestrator.behavior.speechRate)
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.orchestrator.startSessionWithContinuity(

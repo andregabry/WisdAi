@@ -323,9 +323,17 @@ public struct TechnicalPronunciationDictionary: Equatable, Codable, Sendable {
                 "macOS": "Mac O S",
                 "UUID": "U U I D"
             ])
-        case .englishUS, .spanishES:
+        case .englishUS:
             return TechnicalPronunciationDictionary(entries: [
-                "WisdAI": "Wisd A I",
+                "WisdAI": "Wiz D A I",
+                "SQLite": "S Q Lite",
+                "CLI": "C L I",
+                "UI": "U I",
+                "macOS": "Mac O S"
+            ])
+        case .spanishES:
+            return TechnicalPronunciationDictionary(entries: [
+                "WisdAI": "Uisd A I",
                 "SQLite": "S Q Lite",
                 "CLI": "C L I",
                 "UI": "U I",
@@ -659,6 +667,10 @@ public final class AcousticVADTracker: @unchecked Sendable {
         }
     }
 
+    public var currentSpeechOnsetUptimeNs: UInt64? {
+        lock.withLock { voiceActiveStartNs }
+    }
+
     public func reset() {
         lock.withLock {
             voiceActiveStartNs = nil
@@ -822,6 +834,7 @@ public struct BargeInOutcome: Equatable, Sendable {
     public let heardAssistantText: String
     public let discardedAssistantTail: String
     public let cancelledBufferedSamples: Int
+    public let flushTimestampUptimeNs: UInt64
 }
 
 @MainActor
@@ -855,7 +868,8 @@ public final class BargeInCoordinator {
             playedMilliseconds: snapshot.playedMilliseconds,
             heardAssistantText: snapshot.heardTranscriptPrefix,
             discardedAssistantTail: snapshot.unplayedTranscriptTail,
-            cancelledBufferedSamples: snapshot.discardedBufferedSamples
+            cancelledBufferedSamples: snapshot.discardedBufferedSamples,
+            flushTimestampUptimeNs: snapshot.flushTimestampUptimeNs
         )
     }
 }

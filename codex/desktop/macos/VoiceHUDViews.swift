@@ -823,8 +823,8 @@ struct WisdEnterpriseVoiceSettingsCard: View {
                         .foregroundStyle(DesktopStyle.muted)
                 }
 
-                ForEach(VoiceModelCatalog.availableLocalModels) { model in
-                    let fit = orchestrator.modelAssetManager.canFitOnDevice(model)
+                ForEach(VoiceModelCatalog.availableLocalModels.prefix(8)) { model in
+                    let st = orchestrator.modelAssetManager.installStates[model.id] ?? .notInstalled
                     HStack(alignment: .top, spacing: 10) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(model.displayName) · \(model.kind) · \(model.licenseName)")
@@ -834,9 +834,9 @@ struct WisdEnterpriseVoiceSettingsCard: View {
                                 .foregroundStyle(DesktopStyle.muted)
                         }
                         Spacer()
-                        Text(model.sizeBytes == 0 ? "Integrado" : (fit.ok ? "\(model.sizeMBText) · Compatível (Opt-In)" : "Espaço insuficiente"))
+                        Text(model.sizeBytes == 0 ? "Integrado" : "\(model.sizeMBText) · \(st.rawValue)")
                             .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(model.sizeBytes == 0 ? .green : (fit.ok ? WisdTheme.iconAccent : .orange))
+                            .foregroundStyle((st == .operational || st == .available) ? .green : (st == .incompatible ? .orange : WisdTheme.iconAccent))
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
                             .background(Color.secondary.opacity(0.10), in: Capsule())

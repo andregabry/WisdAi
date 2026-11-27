@@ -467,6 +467,68 @@ final class ChatStorage {
         guard let db else { return }
         sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_PASSIVE, nil, nil)
     }
+
+    func listAllTextItemsForHygieneScan() -> [(threadID: String, items: [CodexContinuityItem])] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return [] }
+        let sql = "SELECT thread_id, author, text FROM messages WHERE kind = 'text' ORDER BY thread_id ASC, seq ASC;"
+        var stmt: OpaquePointer?
+        var grouped: [String: [CodexContinuityItem]] = [:]
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let tid = readOptionalText(stmt, col: 0),
+                      let author = readOptionalText(stmt, col: 1),
+                      let text = readOptionalText(stmt, col: 2) else { continue }
+                let role = (author == "Você") ? "user" : "assistant"
+                grouped[tid, default: []].append(CodexContinuityItem(role: role, text: text))
+            }
+            sqlite3_finalize(stmt)
+        }
+        return grouped.sorted(by: { $0.key < $1.key }).map { (threadID: $0.key, items: $0.value) }
+    }
+
+    @discardableResult
+    func removeTextMessages(threadID: String, matchingNormalizedTexts: Set<String>) -> Int {
+        guard !matchingNormalizedTexts.isEmpty else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return 0 }
+
+        var toDeleteIDs: [String] = []
+        let selectSQL = "SELECT id, text FROM messages WHERE thread_id = ? AND kind = 'text';"
+        var selStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, selectSQL, -1, &selStmt, nil) == SQLITE_OK {
+            bindOptionalText(selStmt, index: 1, value: threadID)
+            while sqlite3_step(selStmt) == SQLITE_ROW {
+                guard let msgID = readOptionalText(selStmt, col: 0),
+                      let text = readOptionalText(selStmt, col: 1) else { continue }
+                let norm = VoiceMemoryHygieneAnalyzer.normalizeForComparison(text)
+                if matchingNormalizedTexts.contains(norm) {
+                    toDeleteIDs.append(msgID)
+                }
+            }
+            sqlite3_finalize(selStmt)
+        }
+        guard !toDeleteIDs.isEmpty else { return 0 }
+
+        executeSQL("BEGIN IMMEDIATE;")
+        var deleted = 0
+        var delStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "DELETE FROM messages WHERE id = ?;", -1, &delStmt, nil) == SQLITE_OK {
+            for msgID in toDeleteIDs {
+                sqlite3_reset(delStmt)
+                sqlite3_clear_bindings(delStmt)
+                bindOptionalText(delStmt, index: 1, value: msgID)
+                if sqlite3_step(delStmt) == SQLITE_DONE {
+                    deleted += Int(sqlite3_changes(db))
+                }
+            }
+            sqlite3_finalize(delStmt)
+        }
+        executeSQL("COMMIT;")
+        return deleted
+    }
 }
 
 struct Attachment: Identifiable {
@@ -687,9 +749,35 @@ final class Workspace: ObservableObject {
         self.voiceCancellable = voice.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        self.voice.orchestrator.onScanAdditionalChatThreads = {
+            ChatStorage.shared.listAllTextItemsForHygieneScan()
+        }
+        self.voice.orchestrator.onRemoveAdditionalChatItems = { [weak self] threadID, normalizedSet in
+            let removed = ChatStorage.shared.removeTextMessages(threadID: threadID, matchingNormalizedTexts: normalizedSet)
+            if let self, self.selected == threadID {
+                self.messages = ChatStorage.shared.loadMessages(for: threadID)
+            }
+            return removed
+        }
         if transport == nil {
             startRealtimeQuotaMonitor()
         }
+    }
+
+    func shutdownGracefully() {
+        voice.stopVoiceConversation()
+        voice.orchestrator.llamaBrainRuntime.unloadModel()
+        voice.orchestrator.kokoroTTS.unload()
+        if let cliProc = activeCLIProcess, cliProc.isRunning {
+            cliProc.terminate()
+        }
+        activeCLIProcess = nil
+        if let appProc = process, appProc.isRunning {
+            appProc.terminate()
+        }
+        process = nil
+        persistCurrentMessages()
+        ChatStorage.shared.checkpoint()
     }
     @Published var modelsNotice: String?
     private var modelRequestID = UUID()
@@ -1705,6 +1793,7 @@ final class Workspace: ObservableObject {
     private var didSpeakVoiceWaitNoticeForTurn: Bool = false
     private var voiceTurnBaselineMessageID: UUID?
     private var lastSpokenVoiceReplyMessageID: UUID?
+    private var activeVoiceDelegatedTaskTitle: String?
 
     func toggleVoiceConversation() {
         if voice.isVoiceModeActive {
@@ -1839,9 +1928,11 @@ final class Workspace: ObservableObject {
                         let finalText = Self.formatCompletedReplyForSpeech(reply.text, hadWaitNotice: hadWaitNotice)
                         voice.orchestrator.finishAssistantResponse(fullMarkdownText: finalText)
                     } else {
+                        let taskTitle = activeVoiceDelegatedTaskTitle ?? currentActivityNote ?? "a consulta solicitada"
+                        activeVoiceDelegatedTaskTitle = nil
                         voice.orchestrator.notifySpecialistTaskFinished(
                             agentName: selectedAccount?.name ?? "Agente",
-                            title: currentActivityNote ?? "a tarefa",
+                            title: taskTitle,
                             succeeded: failureText == nil,
                             summary: adapted.spokenText
                         )
@@ -2187,11 +2278,12 @@ final class Workspace: ObservableObject {
                 return list
             },
             onDelegateTaskToAgent: { [weak self] agentHint, instruction, riskTier in
-                guard let self else { return }
+                guard let self else { return .unavailable(reason: "Workspace encerrado.") }
                 let clean = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !clean.isEmpty else { return }
+                guard !clean.isEmpty else { return .unavailable(reason: "Instrução vazia.") }
 
                 // Roteamento explícito de especialista mantendo a voz/identidade WisdAI inalterada
+                var resolvedAgentLabel = self.selectedAccount?.name ?? "o agente ativo"
                 if agentHint != .autoActive, let local = self.localDataRef {
                     let targetProvider: AIProvider? = {
                         switch agentHint {
@@ -2205,12 +2297,9 @@ final class Workspace: ObservableObject {
                         if let matched = local.aiAccounts.first(where: { $0.provider == targetProvider && $0.supportsExecution }) {
                             local.setActiveAccount(id: matched.id)
                             self.selectedAccount = matched
+                            resolvedAgentLabel = matched.name
                         } else {
-                            self.messages.append(Message(
-                                author: "Sistema",
-                                text: "ℹ️ Conta \(agentHint.rawValue.capitalized) não encontrada/disponível; executando via agente ativo (\(self.selectedAccount?.name ?? "WisdAI"))."
-                            ))
-                            self.persistCurrentMessages()
+                            return .unavailable(reason: "Nenhuma conta \(agentHint.rawValue.capitalized) autenticada e ativa está disponível no momento.")
                         }
                     }
                 }
@@ -2223,15 +2312,29 @@ final class Workspace: ObservableObject {
                         text: "🛡️ Segurança por Voz: comando de risco alto colocado no campo de envio para sua confirmação manual antes de executar."
                     ))
                     self.persistCurrentMessages()
-                    return
+                    return .awaitingUserApproval(reason: "A instrução foi colocada no campo de envio para revisão manual.")
                 }
 
                 if self.voice.voiceContinuityEnabled, let tid = self.selected {
                     CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: clean)
                 }
                 self.voiceTurnBaselineMessageID = self.messages.last(where: { ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text })?.id
+                self.activeVoiceDelegatedTaskTitle = String(clean.prefix(64))
+                let prevError = self.error
+                self.error = nil
                 self.prompt = clean
-                self.send()
+                self.send(forceReadOnly: riskTier == .low)
+
+                if let sendErr = self.error, !sendErr.isEmpty, sendErr != prevError {
+                    self.activeVoiceDelegatedTaskTitle = nil
+                    return .unavailable(reason: sendErr)
+                }
+                let confirmed = self.busy || !self.activeTasks.isEmpty
+                guard confirmed else {
+                    self.activeVoiceDelegatedTaskTitle = nil
+                    return .unavailable(reason: self.error ?? "A execução não foi iniciada pelo orquestrador.")
+                }
+                return .dispatched(agentDisplayName: resolvedAgentLabel)
             },
             onRecordLocalExchangeToChat: { [weak self] userText, assistantText in
                 guard let self else { return }
@@ -2241,8 +2344,12 @@ final class Workspace: ObservableObject {
                 if let tid = self.selected ?? self.voice.realtimeThreadId {
                     self.ensureConversationRegistered(id: tid, title: u.isEmpty ? "Conversa por voz" : String(u.prefix(48)), cwd: self.project?.path ?? "")
                     if self.voice.voiceContinuityEnabled {
-                        if !u.isEmpty { CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: u) }
-                        if !a.isEmpty { CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "assistant", text: a) }
+                        if !u.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(u) {
+                            CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: u)
+                        }
+                        if !a.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(a) {
+                            CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "assistant", text: a)
+                        }
                     }
                 }
                 if !u.isEmpty {
@@ -2762,7 +2869,7 @@ final class Workspace: ObservableObject {
         }
     }
 
-    func send() {
+    func send(forceReadOnly: Bool = false) {
         let task = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !accountBusy, !recording, (!task.isEmpty || !attachments.isEmpty) else { return }
 
@@ -2836,9 +2943,12 @@ final class Workspace: ObservableObject {
             }
         }
 
-        let effectiveTurnInstruction = (voice.isVoiceModeActive && !voice.realtimeSessionActive)
+        let baseTurnInstruction = (voice.isVoiceModeActive && !voice.realtimeSessionActive)
             ? Self.wrapConversationalVoiceInstruction(task, projectName: project?.lastPathComponent)
             : task
+        let effectiveTurnInstruction = forceReadOnly
+            ? "[MODO CONSULTA SOMENTE LEITURA: Apenas leia/analise informações; NÃO edite, crie, remova nem modifique arquivos no workspace.]\n\n\(baseTurnInstruction)"
+            : baseTurnInstruction
         let effectiveVoiceModel = (voice.isVoiceModeActive && !voice.realtimeSessionActive)
             ? Self.resolveFastVoiceModelIfConversational(chosenModel: chosenModel, task: task, account: currentAccount)
             : chosenModel
@@ -2850,7 +2960,8 @@ final class Workspace: ObservableObject {
             account: currentAccount,
             model: effectiveVoiceModel,
             skipAddingUserMessage: false,
-            retryDepth: 0
+            retryDepth: 0,
+            forceReadOnly: forceReadOnly
         )
     }
 
@@ -2861,7 +2972,8 @@ final class Workspace: ObservableObject {
         account: AIAccount?,
         model: String,
         skipAddingUserMessage: Bool,
-        retryDepth: Int
+        retryDepth: Int,
+        forceReadOnly: Bool = false
     ) {
         let activeCwd = project?.path ?? FileManager.default.homeDirectoryForCurrentUser.path
         let isGemini = (account?.provider == .gemini) || (account == nil && model.lowercased().contains("gemini"))
@@ -2882,7 +2994,8 @@ final class Workspace: ObservableObject {
                     cliPath: agyCLI,
                     skipAddingUserMessage: skipAddingUserMessage,
                     accountID: account?.id,
-                    retryDepth: retryDepth
+                    retryDepth: retryDepth,
+                    forceReadOnly: forceReadOnly
                 )
                 return
             }
@@ -2911,7 +3024,8 @@ final class Workspace: ObservableObject {
                     cliPath: cli,
                     skipAddingUserMessage: skipAddingUserMessage,
                     accountID: account?.id,
-                    retryDepth: retryDepth
+                    retryDepth: retryDepth,
+                    forceReadOnly: forceReadOnly
                 )
                 return
             }
@@ -2967,11 +3081,12 @@ final class Workspace: ObservableObject {
 
         let startOrResume = { [weak self] in
             guard let self else { return }
-            let sandbox = ["read-only", "workspace-write", "danger-full-access"][min(max(self.mode, 0), 2)]
+            let effectiveMode = forceReadOnly ? 0 : self.mode
+            let sandbox = ["read-only", "workspace-write", "danger-full-access"][min(max(effectiveMode, 0), 2)]
             let safety: JSON = ["cwd": activeCwd, "sandbox": sandbox,
-                                "approvalPolicy": self.mode == 2 ? "never" : "on-request"]
+                                "approvalPolicy": effectiveMode == 2 ? "never" : "on-request"]
             if let existing = existingThreadId, self.resumed == existing {
-                self.startTurn(existing, task, instructionOverride: instruction, modelOverride: sanitizedModel, skipAddingUserMessage: skipAddingUserMessage)
+                self.startTurn(existing, task, instructionOverride: instruction, modelOverride: sanitizedModel, skipAddingUserMessage: skipAddingUserMessage, forceReadOnly: forceReadOnly)
                 return
             }
             var parameters = safety
@@ -2992,7 +3107,7 @@ final class Workspace: ObservableObject {
                     let newConv = Conversation(id: id, title: convTitle.isEmpty ? "Nova conversa" : convTitle, cwd: activeCwd)
                     self.conversations.insert(newConv, at: 0)
                 }
-                self.startTurn(id, task, instructionOverride: instruction, modelOverride: sanitizedModel, cwdOverride: activeCwd, skipAddingUserMessage: skipAddingUserMessage)
+                self.startTurn(id, task, instructionOverride: instruction, modelOverride: sanitizedModel, cwdOverride: activeCwd, skipAddingUserMessage: skipAddingUserMessage, forceReadOnly: forceReadOnly)
             }
         }
 
@@ -3712,7 +3827,8 @@ final class Workspace: ObservableObject {
         cliPath: String,
         skipAddingUserMessage: Bool = false,
         accountID: UUID? = nil,
-        retryDepth: Int = 0
+        retryDepth: Int = 0,
+        forceReadOnly: Bool = false
     ) {
         unseenCompletedThreads.remove(id)
         ensureConversationRegistered(id: id, title: task, cwd: projectURL?.path ?? "")
@@ -3749,7 +3865,14 @@ final class Workspace: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cliPath)
-        var args = ["--dangerously-skip-permissions"]
+        var args: [String] = []
+        if forceReadOnly {
+            if isAgy {
+                args.append(contentsOf: ["--mode", "plan", "--sandbox"])
+            }
+        } else {
+            args.append("--dangerously-skip-permissions")
+        }
         var effectiveInstruction = instruction
         if !attachedPaths.isEmpty {
             effectiveInstruction += "\n\n[Arquivos anexados: \(attachedPaths.joined(separator: ", "))]"
@@ -3905,7 +4028,7 @@ final class Workspace: ObservableObject {
         }
     }
 
-    func startTurn(_ id: String, _ task: String, instructionOverride: String? = nil, modelOverride: String? = nil, cwdOverride: String? = nil, skipAddingUserMessage: Bool = false) {
+    func startTurn(_ id: String, _ task: String, instructionOverride: String? = nil, modelOverride: String? = nil, cwdOverride: String? = nil, skipAddingUserMessage: Bool = false, forceReadOnly: Bool = false) {
         unseenCompletedThreads.remove(id)
         ensureConversationRegistered(id: id, title: task, cwd: cwdOverride ?? project?.path ?? "")
         let names = attachments.map(\.name).joined(separator: ", ")
@@ -3914,9 +4037,10 @@ final class Workspace: ObservableObject {
         let instruction = resolvedPrompt.isEmpty ? "Responda ao conteúdo anexado." : resolvedPrompt
         inputs.insert(["type": "text", "text": instruction, "textElements": []], at: 0)
         let modelToUse = modelOverride ?? (selectedModel != "auto" ? selectedModel : models.first(where: \.isDefault)?.id ?? models.first?.id)
+        let effectiveMode = forceReadOnly ? 0 : mode
         do {
             let chosen = modelToUse ?? "auto"
-            try recovery.begin(threadID: id, task: task, inputs: inputs, mode: mode, effort: selectedEffort,
+            try recovery.begin(threadID: id, task: task, inputs: inputs, mode: effectiveMode, effort: selectedEffort,
                                cwd: cwdOverride ?? project?.path ?? "", ephemeral: temporaryChat, model: chosen, baselineTurnID: knownLastTurns[id], baselineKnown: loadedHistories.contains(id))
         } catch { self.error = error.localizedDescription; busy = false; return }
         if !skipAddingUserMessage {
@@ -3926,12 +4050,12 @@ final class Workspace: ObservableObject {
         sentAttachments = attachments
         attachments = []
         prompt = ""
-        let sandboxType = ["readOnly", "workspaceWrite", "dangerFullAccess"][min(max(mode, 0), 2)]
+        let sandboxType = ["readOnly", "workspaceWrite", "dangerFullAccess"][min(max(effectiveMode, 0), 2)]
         var turnParameters: JSON = [
             "threadId": id,
             "input": inputs,
             "sandboxPolicy": ["type": sandboxType],
-            "approvalPolicy": mode == 2 ? "never" : "on-request",
+            "approvalPolicy": effectiveMode == 2 ? "never" : "on-request",
         ]
         if let modelToUse { turnParameters["model"] = modelToUse }
         if selectedEffort != "default" {
@@ -4568,8 +4692,7 @@ struct WisdAIApp: App {
                     ChatStorage.shared.checkpoint()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    workspace.persistCurrentMessages()
-                    ChatStorage.shared.checkpoint()
+                    workspace.shutdownGracefully()
                 }
         }
         .windowStyle(.hiddenTitleBar)

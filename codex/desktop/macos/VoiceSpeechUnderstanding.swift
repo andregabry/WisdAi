@@ -61,26 +61,55 @@ public enum BoundedVoicePermissions {
     }
 }
 
-// MARK: - Software Acoustic Echo Reference Suppressor (Section 10)
+// MARK: - Software Acoustic Echo Reference Suppressor (Section 10 & V2 Hangover Gate)
 
-/// Supplements hardware VoiceProcessingIO AEC by checking whether incoming mic energy is dominated by
-/// WisdAI's own active playback envelope on the jitter buffer, suppressing self-feedback loops.
+/// Supplements hardware VoiceProcessingIO AEC by tracking BOTH rendered playback RMS from
+/// AdaptiveJitterBuffer and an acoustic room-reverb hangover window (~420ms), preventing
+/// speaker output from feeding back as self-triggered ASR turns while still allowing genuine barge-in.
 public final class AcousticEchoSuppressor: @unchecked Sendable {
     private let lock = NSLock()
     private var recentSpeakerRMS: Float = 0
+    private var recentPlaybackRefRMS: Float = 0
     private var lastSpeakerActiveNs: UInt64 = 0
+    private let hangoverNs: UInt64 = 420_000_000
 
     public init() {}
 
     public func updateSpeakerEnvelope(bufferedMs: Double, micRMS: Float, isAssistantSpeaking: Bool) {
+        updatePlaybackReference(
+            bufferedMs: bufferedMs,
+            playbackRMS: micRMS,
+            renderAgeMs: bufferedMs > 15.0 ? 0.0 : 999.0,
+            micRMS: micRMS,
+            isAssistantSpeaking: isAssistantSpeaking
+        )
+    }
+
+    public func updatePlaybackReference(
+        bufferedMs: Double,
+        playbackRMS: Float,
+        renderAgeMs: Double,
+        micRMS: Float,
+        isAssistantSpeaking: Bool
+    ) {
         let nowNs = DispatchTime.now().uptimeNanoseconds
         lock.withLock {
-            if isAssistantSpeaking && bufferedMs > 15.0 {
-                recentSpeakerRMS = max(recentSpeakerRMS * 0.7, micRMS)
+            let activeRender = playbackRMS > 0.006 && renderAgeMs < 140.0
+            if (isAssistantSpeaking && bufferedMs > 12.0) || activeRender {
+                recentPlaybackRefRMS = max(recentPlaybackRefRMS * 0.72, playbackRMS)
+                recentSpeakerRMS = max(recentSpeakerRMS * 0.72, max(micRMS, playbackRMS * 0.55))
                 lastSpeakerActiveNs = nowNs
-            } else if bufferedMs <= 5.0 {
-                recentSpeakerRMS *= 0.5
+            } else if bufferedMs <= 5.0 && !activeRender {
+                recentSpeakerRMS *= 0.65
+                recentPlaybackRefRMS *= 0.65
             }
+        }
+    }
+
+    public var isInEchoOrHangoverWindow: Bool {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        return lock.withLock {
+            lastSpeakerActiveNs > 0 && (nowNs &- lastSpeakerActiveNs) < hangoverNs
         }
     }
 
@@ -89,13 +118,13 @@ public final class AcousticEchoSuppressor: @unchecked Sendable {
         lowEnergy: Float,
         isAssistantSpeaking: Bool
     ) -> Bool {
-        guard isAssistantSpeaking else { return false }
+        let nowNs = DispatchTime.now().uptimeNanoseconds
         return lock.withLock {
-            let nowNs = DispatchTime.now().uptimeNanoseconds
-            let speakerActiveRecently = lastSpeakerActiveNs > 0 && (nowNs &- lastSpeakerActiveNs) < 350_000_000
-            guard speakerActiveRecently else { return false }
+            let speakerActiveRecently = lastSpeakerActiveNs > 0 && (nowNs &- lastSpeakerActiveNs) < hangoverNs
+            guard isAssistantSpeaking || speakerActiveRecently else { return false }
+            let bleedCeiling = max(0.052, max(recentSpeakerRMS * 0.85, recentPlaybackRefRMS * 0.52))
             // Near-field human user interruption sits noticeably higher and carries strong vocal body compared to bleed/tail echo.
-            if micRMS < max(0.052, recentSpeakerRMS * 0.85) && lowEnergy < 0.08 {
+            if micRMS < bleedCeiling && lowEnergy < 0.08 {
                 return true
             }
             return false
@@ -105,12 +134,13 @@ public final class AcousticEchoSuppressor: @unchecked Sendable {
     public func reset() {
         lock.withLock {
             recentSpeakerRMS = 0
+            recentPlaybackRefRMS = 0
             lastSpeakerActiveNs = 0
         }
     }
 }
 
-// MARK: - macOS 26+ On-Device SpeechAnalyzer + SpeechTranscriber (Zero 60s Limit, Zero Cloud Lock)
+// MARK: - macOS 26+ On-Device SpeechAnalyzer + SpeechTranscriber (Epoch-Isolated, Zero Carryover)
 
 @available(macOS 26.0, *)
 public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvider, @unchecked Sendable {
@@ -122,11 +152,17 @@ public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvi
     private var transcriber: SpeechTranscriber?
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
     private var targetFormat: AVAudioFormat?
+    private var resolvedLocale: Locale = Locale(identifier: "pt-BR")
     private var resultTask: Task<Void, Never>?
     private var analyzerTask: Task<Void, Never>?
     private var committedPrefix: String = ""
     private var activeVolatileText: String = ""
+    private var currentSampleOffset: CMTimeValue = 0
+    private var utteranceEpoch: UInt64 = 0
     private var isStopped: Bool = true
+    private var onPartialCB: (@Sendable (String) -> Void)?
+    private var onFinalCB: (@Sendable (String) -> Void)?
+    private var onErrorCB: (@Sendable (String) -> Void)?
 
     public init() {}
 
@@ -151,7 +187,7 @@ public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvi
 
         let locale = Locale(identifier: language.appleLocaleIdentifier)
         let installed = await SpeechTranscriber.installedLocales
-        let resolvedLocale: Locale = {
+        let pickedLocale: Locale = {
             let wantNorm = locale.identifier.replacingOccurrences(of: "-", with: "_").lowercased()
             if let exactMatch = installed.first(where: { $0.identifier.replacingOccurrences(of: "-", with: "_").lowercased() == wantNorm }) {
                 return exactMatch
@@ -162,60 +198,103 @@ public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvi
             return locale
         }()
 
-        let newTranscriber = SpeechTranscriber(
-            locale: resolvedLocale,
-            preset: .progressiveTranscription
+        let probeTranscriber = SpeechTranscriber(
+            locale: pickedLocale,
+            preset: .timeIndexedProgressiveTranscription
         )
-        let bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [newTranscriber])
+        let bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [probeTranscriber])
             ?? AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)
 
-        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
-        let newAnalyzer = SpeechAnalyzer(modules: [newTranscriber])
-
         lock.withLock {
-            self.transcriber = newTranscriber
-            self.analyzer = newAnalyzer
+            self.resolvedLocale = pickedLocale
             self.targetFormat = bestFormat
-            self.inputContinuation = continuation
+            self.onPartialCB = onPartial
+            self.onFinalCB = onFinal
+            self.onErrorCB = onError
+            self.isStopped = false
+            self.utteranceEpoch &+= 1
+        }
+        startIsolatedSegment()
+    }
+
+    private func startIsolatedSegment() {
+        let oldState = lock.withLock { () -> (SpeechAnalyzer?, AsyncStream<AnalyzerInput>.Continuation?, Task<Void, Never>?, Task<Void, Never>?, Locale, UInt64, Bool) in
+            let prevA = self.analyzer
+            let prevC = self.inputContinuation
+            let prevR = self.resultTask
+            let prevAT = self.analyzerTask
+            self.analyzer = nil
+            self.inputContinuation = nil
+            self.resultTask = nil
+            self.analyzerTask = nil
             self.committedPrefix = ""
             self.activeVolatileText = ""
-            self.isStopped = false
+            self.currentSampleOffset = 0
+            return (prevA, prevC, prevR, prevAT, self.resolvedLocale, self.utteranceEpoch, self.isStopped)
         }
+
+        oldState.1?.finish()
+        oldState.2?.cancel()
+        oldState.3?.cancel()
+        if let prevAnalyzer = oldState.0 {
+            Task.detached(priority: .utility) {
+                await prevAnalyzer.cancelAndFinishNow()
+            }
+        }
+
+        guard !oldState.6 else { return }
+
+        let epoch = oldState.5
+        let newTranscriber = SpeechTranscriber(
+            locale: oldState.4,
+            preset: .timeIndexedProgressiveTranscription
+        )
+        let options = SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime)
+        let newAnalyzer = SpeechAnalyzer(modules: [newTranscriber], options: options)
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
 
         let rTask = Task { [weak self] in
             do {
                 for try await result in newTranscriber.results {
                     guard let self else { break }
-                    let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let (combined, finalized) = self.lock.withLock { () -> (String, Bool) in
-                        guard !self.isStopped else { return ("", false) }
+                    let raw = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Discard punctuation-only or zero-alphanumeric phantom segments
+                    let hasSemanticChars = raw.unicodeScalars.contains(where: { CharacterSet.alphanumerics.contains($0) })
+                    let (combined, finalized, partialCB, finalCB) = self.lock.withLock { () -> (String, Bool, (@Sendable (String) -> Void)?, (@Sendable (String) -> Void)?) in
+                        guard !self.isStopped, self.utteranceEpoch == epoch else {
+                            return ("", false, nil, nil)
+                        }
                         if result.isFinal {
-                            if !text.isEmpty {
-                                self.committedPrefix = [self.committedPrefix, text]
+                            if hasSemanticChars {
+                                self.committedPrefix = [self.committedPrefix, raw]
                                     .filter { !$0.isEmpty }
                                     .joined(separator: " ")
                             }
                             self.activeVolatileText = ""
-                            return (self.committedPrefix, true)
+                            return (self.committedPrefix, true, self.onPartialCB, self.onFinalCB)
                         } else {
-                            self.activeVolatileText = text
+                            if hasSemanticChars {
+                                self.activeVolatileText = raw
+                            }
                             let full = [self.committedPrefix, self.activeVolatileText]
                                 .filter { !$0.isEmpty }
                                 .joined(separator: " ")
-                            return (full, false)
+                            return (full, false, self.onPartialCB, self.onFinalCB)
                         }
                     }
                     guard !combined.isEmpty else { continue }
                     if finalized {
-                        onFinal(combined)
+                        finalCB?(combined)
                     } else {
-                        onPartial(combined)
+                        partialCB?(combined)
                     }
                 }
             } catch {
-                if self?.lock.withLock({ self?.isStopped }) == false {
-                    onError(error.localizedDescription)
+                let errCB = self?.lock.withLock { () -> (@Sendable (String) -> Void)? in
+                    guard let self, !self.isStopped, self.utteranceEpoch == epoch else { return nil }
+                    return self.onErrorCB
                 }
+                errCB?(error.localizedDescription)
             }
         }
 
@@ -223,15 +302,30 @@ public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvi
             do {
                 try await newAnalyzer.start(inputSequence: stream)
             } catch {
-                if self?.lock.withLock({ self?.isStopped }) == false {
-                    onError(error.localizedDescription)
+                let errCB = self?.lock.withLock { () -> (@Sendable (String) -> Void)? in
+                    guard let self, !self.isStopped, self.utteranceEpoch == epoch else { return nil }
+                    return self.onErrorCB
                 }
+                errCB?(error.localizedDescription)
             }
         }
 
-        lock.withLock {
+        let stillSameEpoch = lock.withLock { () -> Bool in
+            guard !self.isStopped, self.utteranceEpoch == epoch else { return false }
+            self.transcriber = newTranscriber
+            self.analyzer = newAnalyzer
+            self.inputContinuation = continuation
             self.resultTask = rTask
             self.analyzerTask = aTask
+            return true
+        }
+        if !stillSameEpoch {
+            continuation.finish()
+            rTask.cancel()
+            aTask.cancel()
+            Task.detached(priority: .utility) {
+                await newAnalyzer.cancelAndFinishNow()
+            }
         }
     }
 
@@ -245,22 +339,28 @@ public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvi
             : AudioPCMConverter.resampleLinear(samples: monoFloats, fromSampleRate: sampleRate, toSampleRate: targetRate)
         guard !resampled.isEmpty else { return }
 
-        let pcm16Data = AudioPCMConverter.floatsToPCM16Data(resampled)
-        let frameCount = AVAudioFrameCount(pcm16Data.count / MemoryLayout<Int16>.size)
+        let frameCount = AVAudioFrameCount(resampled.count)
         guard frameCount > 0,
-              pcm16Data.count > 0,
               let pcmBuffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frameCount) else { return }
         pcmBuffer.frameLength = frameCount
+
+        let bufferTS = lock.withLock { () -> CMTime in
+            let ts = CMTime(value: currentSampleOffset, timescale: CMTimeScale(targetRate))
+            currentSampleOffset += CMTimeValue(frameCount)
+            return ts
+        }
 
         if fmt.commonFormat == .pcmFormatInt16,
            let dst = pcmBuffer.int16ChannelData?[0],
            pcmBuffer.audioBufferList.pointee.mBuffers.mDataByteSize > 0 {
+            let pcm16Data = AudioPCMConverter.floatsToPCM16Data(resampled)
+            guard pcm16Data.count >= Int(frameCount) * MemoryLayout<Int16>.size else { return }
             pcm16Data.withUnsafeBytes { raw in
                 if let src = raw.bindMemory(to: Int16.self).baseAddress {
                     dst.update(from: src, count: Int(frameCount))
                 }
             }
-            cont.yield(AnalyzerInput(buffer: pcmBuffer))
+            cont.yield(AnalyzerInput(buffer: pcmBuffer, bufferStartTime: bufferTS))
         } else if fmt.commonFormat == .pcmFormatFloat32,
                   let dst = pcmBuffer.floatChannelData?[0],
                   pcmBuffer.audioBufferList.pointee.mBuffers.mDataByteSize > 0 {
@@ -269,47 +369,67 @@ public final class SpeechAnalyzerOnDeviceSTTProvider: StreamingSpeechToTextProvi
                     dst.update(from: src, count: Int(frameCount))
                 }
             }
-            cont.yield(AnalyzerInput(buffer: pcmBuffer))
+            cont.yield(AnalyzerInput(buffer: pcmBuffer, bufferStartTime: bufferTS))
         }
     }
 
     public func commitCurrentUtterance() -> String {
-        lock.withLock {
-            let full = [committedPrefix, activeVolatileText]
+        let joined = lock.withLock { () -> String in
+            let out = [committedPrefix, activeVolatileText]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
             committedPrefix = ""
             activeVolatileText = ""
-            return full
+            utteranceEpoch &+= 1
+            return out
         }
+        // Rotate SpeechTranscriber into a clean CMTime=0 segment so prior speech or punctuation NEVER leaks forward.
+        if lock.withLock({ !isStopped }) {
+            startIsolatedSegment()
+        }
+        return joined
     }
 
     public func resetUtteranceBuffer() {
         lock.withLock {
             committedPrefix = ""
             activeVolatileText = ""
+            utteranceEpoch &+= 1
+        }
+        if lock.withLock({ !isStopped }) {
+            startIsolatedSegment()
         }
     }
 
     public func stop() {
-        let (cont, rTask, aTask) = lock.withLock { () -> (AsyncStream<AnalyzerInput>.Continuation?, Task<Void, Never>?, Task<Void, Never>?) in
+        let (oldAnalyzer, cont, rTask, aTask) = lock.withLock { () -> (SpeechAnalyzer?, AsyncStream<AnalyzerInput>.Continuation?, Task<Void, Never>?, Task<Void, Never>?) in
             isStopped = true
+            utteranceEpoch &+= 1
+            let a = analyzer
             let c = inputContinuation
             let r = resultTask
-            let a = analyzerTask
+            let at = analyzerTask
             inputContinuation = nil
             resultTask = nil
             analyzerTask = nil
             analyzer = nil
             transcriber = nil
+            onPartialCB = nil
+            onFinalCB = nil
+            onErrorCB = nil
             committedPrefix = ""
             activeVolatileText = ""
-            return (c, r, a)
+            return (a, c, r, at)
         }
         cont?.finish()
         rTask?.cancel()
         aTask?.cancel()
+        if let oldAnalyzer {
+            Task.detached(priority: .utility) {
+                await oldAnalyzer.cancelAndFinishNow()
+            }
+        }
     }
 }
 

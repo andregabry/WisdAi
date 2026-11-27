@@ -402,6 +402,7 @@ public final class OpenAIRealtimeWebSocketTransport: RealtimeSpeechToSpeechTrans
     private var receiveTask: Task<Void, Never>?
     private var eventCallback: (@Sendable (RealtimeGatewayEvent) -> Void)?
     private var isConnected = false
+    private var connectionEpoch: UInt64 = 0
     private let stateLock = NSLock()
 
     public init(
@@ -448,13 +449,15 @@ public final class OpenAIRealtimeWebSocketTransport: RealtimeSpeechToSpeechTrans
         req.timeoutInterval = 20
 
         let task = urlSession.webSocketTask(with: req)
-        stateLock.withLock {
+        let epoch = stateLock.withLock { () -> UInt64 in
             self.session = urlSession
             self.wsTask = task
             self.isConnected = true
+            self.connectionEpoch &+= 1
+            return self.connectionEpoch
         }
         task.resume()
-        startReceiveLoop(task: task)
+        startReceiveLoop(task: task, epoch: epoch)
 
         let turnDetection: [String: Any] = config.semanticVADPreferred
             ? ["type": "semantic_vad", "eagerness": "medium", "interrupt_response": true, "create_response": true]
@@ -543,6 +546,8 @@ public final class OpenAIRealtimeWebSocketTransport: RealtimeSpeechToSpeechTrans
     public func disconnect() async {
         let (task, sess, rx) = stateLock.withLock { () -> (URLSessionWebSocketTask?, URLSession?, Task<Void, Never>?) in
             self.isConnected = false
+            self.connectionEpoch &+= 1
+            self.eventCallback = nil
             let t = self.wsTask
             let s = self.session
             let r = self.receiveTask
@@ -563,12 +568,12 @@ public final class OpenAIRealtimeWebSocketTransport: RealtimeSpeechToSpeechTrans
         try await task.send(.string(str))
     }
 
-    private func startReceiveLoop(task: URLSessionWebSocketTask) {
+    private func startReceiveLoop(task: URLSessionWebSocketTask, epoch: UInt64) {
         receiveTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
                     let message = try await task.receive()
-                    guard let self else { break }
+                    guard let self, self.stateLock.withLock({ self.connectionEpoch == epoch && self.isConnected }) else { break }
                     let rawData: Data?
                     switch message {
                     case .string(let s): rawData = s.data(using: .utf8)
@@ -577,56 +582,58 @@ public final class OpenAIRealtimeWebSocketTransport: RealtimeSpeechToSpeechTrans
                     }
                     if let rawData,
                        let json = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any] {
-                        self.handleServerEvent(json)
+                        self.handleServerEvent(json, epoch: epoch)
                     }
                 } catch {
-                    self?.emit(.disconnected(reason: error.localizedDescription))
+                    if let self, self.stateLock.withLock({ self.connectionEpoch == epoch }) {
+                        self.emit(.disconnected(reason: error.localizedDescription), epoch: epoch)
+                    }
                     break
                 }
             }
         }
     }
 
-    private func handleServerEvent(_ json: [String: Any]) {
+    private func handleServerEvent(_ json: [String: Any], epoch: UInt64) {
         guard let type = json["type"] as? String else { return }
         switch type {
         case "input_audio_buffer.speech_started":
-            emit(.userSpeechStarted)
+            emit(.userSpeechStarted, epoch: epoch)
         case "input_audio_buffer.speech_stopped":
-            emit(.userSpeechStopped)
+            emit(.userSpeechStopped, epoch: epoch)
         case "conversation.item.input_audio_transcription.completed":
             let itemId = json["item_id"] as? String ?? UUID().uuidString
             let text = json["transcript"] as? String ?? ""
-            emit(.inputTranscriptCompleted(itemId: itemId, text: text))
+            emit(.inputTranscriptCompleted(itemId: itemId, text: text), epoch: epoch)
         case "response.output_item.added":
             if let item = json["item"] as? [String: Any], let itemId = item["id"] as? String {
-                emit(.assistantItemStarted(itemId: itemId))
+                emit(.assistantItemStarted(itemId: itemId), epoch: epoch)
             }
         case "response.audio.delta":
             let itemId = json["item_id"] as? String ?? ""
             if let b64 = json["delta"] as? String, let pcm = Data(base64Encoded: b64) {
-                emit(.assistantAudioDelta(itemId: itemId, pcm16: pcm, sampleRate: outputSampleRateHz))
+                emit(.assistantAudioDelta(itemId: itemId, pcm16: pcm, sampleRate: outputSampleRateHz), epoch: epoch)
             }
         case "response.audio_transcript.delta", "response.text.delta":
             let itemId = json["item_id"] as? String ?? ""
             let delta = json["delta"] as? String ?? ""
-            if !delta.isEmpty { emit(.assistantTranscriptDelta(itemId: itemId, text: delta)) }
+            if !delta.isEmpty { emit(.assistantTranscriptDelta(itemId: itemId, text: delta), epoch: epoch) }
         case "response.audio_transcript.done", "response.done":
             let itemId = json["item_id"] as? String ?? ""
             let text = json["transcript"] as? String ?? ""
             if !text.isEmpty || type == "response.done" {
-                emit(.assistantTurnCompleted(itemId: itemId, finalText: text))
+                emit(.assistantTurnCompleted(itemId: itemId, finalText: text), epoch: epoch)
             }
         case "error":
             let msg = (json["error"] as? [String: Any])?["message"] as? String ?? "Erro na API OpenAI Realtime"
-            emit(.error(msg))
+            emit(.error(msg), epoch: epoch)
         default:
             break
         }
     }
 
-    private func emit(_ event: RealtimeGatewayEvent) {
-        let cb = stateLock.withLock { eventCallback }
+    private func emit(_ event: RealtimeGatewayEvent, epoch: UInt64) {
+        let cb = stateLock.withLock { (connectionEpoch == epoch) ? eventCallback : nil }
         cb?(event)
     }
 }
@@ -648,6 +655,7 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
     private var eventCallback: (@Sendable (RealtimeGatewayEvent) -> Void)?
     private var activeItemId = UUID().uuidString
     private var accumulatedTurnText = ""
+    private var connectionEpoch: UInt64 = 0
     private let stateLock = NSLock()
 
     public init(
@@ -695,12 +703,14 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
         req.timeoutInterval = 20
 
         let task = urlSession.webSocketTask(with: req)
-        stateLock.withLock {
+        let epoch = stateLock.withLock { () -> UInt64 in
             self.session = urlSession
             self.wsTask = task
+            self.connectionEpoch &+= 1
+            return self.connectionEpoch
         }
         task.resume()
-        startReceiveLoop(task: task)
+        startReceiveLoop(task: task, epoch: epoch)
 
         var setup: [String: Any] = [
             "model": modelID,
@@ -778,6 +788,8 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
 
     public func disconnect() async {
         let (task, sess, rx) = stateLock.withLock { () -> (URLSessionWebSocketTask?, URLSession?, Task<Void, Never>?) in
+            self.connectionEpoch &+= 1
+            self.eventCallback = nil
             let t = self.wsTask
             let s = self.session
             let r = self.receiveTask
@@ -798,12 +810,12 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
         try await task.send(.string(str))
     }
 
-    private func startReceiveLoop(task: URLSessionWebSocketTask) {
+    private func startReceiveLoop(task: URLSessionWebSocketTask, epoch: UInt64) {
         receiveTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
                     let message = try await task.receive()
-                    guard let self else { break }
+                    guard let self, self.stateLock.withLock({ self.connectionEpoch == epoch }) else { break }
                     let rawData: Data?
                     switch message {
                     case .string(let s): rawData = s.data(using: .utf8)
@@ -812,27 +824,29 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
                     }
                     if let rawData,
                        let json = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any] {
-                        self.handleServerJSON(json)
+                        self.handleServerJSON(json, epoch: epoch)
                     }
                 } catch {
-                    self?.emit(.disconnected(reason: error.localizedDescription))
+                    if let self, self.stateLock.withLock({ self.connectionEpoch == epoch }) {
+                        self.emit(.disconnected(reason: error.localizedDescription), epoch: epoch)
+                    }
                     break
                 }
             }
         }
     }
 
-    private func handleServerJSON(_ json: [String: Any]) {
+    private func handleServerJSON(_ json: [String: Any], epoch: UInt64) {
         if let resumption = json["sessionResumptionUpdate"] as? [String: Any],
            let handle = resumption["newHandle"] as? String, !handle.isEmpty {
-            emit(.resumptionHandleUpdated(handle))
+            emit(.resumptionHandleUpdated(handle), epoch: epoch)
         }
         guard let serverContent = json["serverContent"] as? [String: Any] else { return }
         if (serverContent["interrupted"] as? Bool) == true {
-            emit(.assistantInterrupted)
+            emit(.assistantInterrupted, epoch: epoch)
         }
         if let inputTrans = (serverContent["inputTranscription"] as? [String: Any])?["text"] as? String, !inputTrans.isEmpty {
-            emit(.inputTranscriptDelta(itemId: "user-live", text: inputTrans))
+            emit(.inputTranscriptDelta(itemId: "user-live", text: inputTrans), epoch: epoch)
         }
         if let modelTurn = serverContent["modelTurn"] as? [String: Any],
            let parts = modelTurn["parts"] as? [[String: Any]] {
@@ -843,11 +857,11 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
                    mime.contains("audio/pcm"),
                    let b64 = inline["data"] as? String,
                    let pcm = Data(base64Encoded: b64) {
-                    emit(.assistantAudioDelta(itemId: itemId, pcm16: pcm, sampleRate: outputSampleRateHz))
+                    emit(.assistantAudioDelta(itemId: itemId, pcm16: pcm, sampleRate: outputSampleRateHz), epoch: epoch)
                 }
                 if let txt = part["text"] as? String, !txt.isEmpty {
                     stateLock.withLock { accumulatedTurnText += txt }
-                    emit(.assistantTranscriptDelta(itemId: itemId, text: txt))
+                    emit(.assistantTranscriptDelta(itemId: itemId, text: txt), epoch: epoch)
                 }
             }
         }
@@ -859,12 +873,12 @@ public final class GeminiLiveWebSocketTransport: RealtimeSpeechToSpeechTransport
                 self.accumulatedTurnText = ""
                 return (id, t)
             }
-            emit(.assistantTurnCompleted(itemId: finishedId, finalText: finishedText))
+            emit(.assistantTurnCompleted(itemId: finishedId, finalText: finishedText), epoch: epoch)
         }
     }
 
-    private func emit(_ event: RealtimeGatewayEvent) {
-        let cb = stateLock.withLock { eventCallback }
+    private func emit(_ event: RealtimeGatewayEvent, epoch: UInt64) {
+        let cb = stateLock.withLock { (connectionEpoch == epoch) ? eventCallback : nil }
         cb?(event)
     }
 }
@@ -884,6 +898,7 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
     private var activePolicy: VoicePolicyPreferences = .strictDefault
     private var accumulatedPrefix: String = ""
     private var currentSegmentText: String = ""
+    private var segmentEpoch: UInt64 = 0
     private var isStopped: Bool = true
 
     private var onPartialCB: (@Sendable (String) -> Void)?
@@ -951,28 +966,45 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
     }
 
     public func commitCurrentUtterance() -> String {
-        let combined = lock.withLock { () -> String in
+        let (combined, shouldRotate) = lock.withLock { () -> (String, Bool) in
             let joined = [accumulatedPrefix, currentSegmentText]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
             accumulatedPrefix = ""
             currentSegmentText = ""
-            return joined
+            segmentEpoch &+= 1
+            return (joined, !isStopped)
+        }
+        if shouldRotate {
+            DispatchQueue.main.async { [weak self] in
+                self?.startRecognitionSegment()
+            }
         }
         return combined
     }
 
     public func resetUtteranceBuffer() {
-        lock.withLock {
+        let shouldRotate = lock.withLock { () -> Bool in
             accumulatedPrefix = ""
             currentSegmentText = ""
+            segmentEpoch &+= 1
+            return !isStopped
+        }
+        if shouldRotate {
+            DispatchQueue.main.async { [weak self] in
+                self?.startRecognitionSegment()
+            }
         }
     }
 
     public func stop() {
         let (t, r, timer) = lock.withLock { () -> (SFSpeechRecognitionTask?, SFSpeechAudioBufferRecognitionRequest?, DispatchSourceTimer?) in
             isStopped = true
+            segmentEpoch &+= 1
+            onPartialCB = nil
+            onFinalCB = nil
+            onErrorCB = nil
             let task = self.task
             let req = self.request
             let tmr = self.rotationTimer
@@ -989,10 +1021,12 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
     }
 
     private func startRecognitionSegment() {
-        let snapshot = lock.withLock { () -> (SFSpeechRecognizer?, VoicePolicyPreferences, Bool) in
-            return (recognizer, activePolicy, isStopped)
+        let snapshot = lock.withLock { () -> (SFSpeechRecognizer?, VoicePolicyPreferences, Bool, UInt64) in
+            segmentEpoch &+= 1
+            return (recognizer, activePolicy, isStopped, segmentEpoch)
         }
         guard !snapshot.2, let rec = snapshot.0 else { return }
+        let taskEpoch = snapshot.3
 
         let newReq = SFSpeechAudioBufferRecognitionRequest()
         newReq.shouldReportPartialResults = true
@@ -1011,43 +1045,53 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
             guard let self else { return }
             if let result {
                 let text = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
-                let (fullText, isFinal) = self.lock.withLock { () -> (String, Bool) in
-                    if !text.isEmpty {
+                let hasSemanticChars = text.unicodeScalars.contains(where: { CharacterSet.alphanumerics.contains($0) })
+                let (fullText, isFinal, partialCB) = self.lock.withLock { () -> (String, Bool, (@Sendable (String) -> Void)?) in
+                    guard !self.isStopped, self.segmentEpoch == taskEpoch else { return ("", false, nil) }
+                    if hasSemanticChars {
                         self.currentSegmentText = text
                     }
                     let full = [self.accumulatedPrefix, self.currentSegmentText]
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
                         .joined(separator: " ")
-                    return (full, result.isFinal)
+                    return (full, result.isFinal, self.onPartialCB)
                 }
                 if !fullText.isEmpty {
-                    self.lock.withLock { self.onPartialCB }?(fullText)
+                    partialCB?(fullText)
                 }
                 if isFinal {
-                    self.rotateAfterNaturalEnd()
+                    self.rotateAfterNaturalEnd(expectedEpoch: taskEpoch)
                 }
             }
             if let err {
                 let ns = err as NSError
-                let stopped = self.lock.withLock { self.isStopped }
-                guard !stopped else { return }
+                let (validEpoch, errCB) = self.lock.withLock { () -> (Bool, (@Sendable (String) -> Void)?) in
+                    guard !self.isStopped, self.segmentEpoch == taskEpoch else { return (false, nil) }
+                    return (true, self.onErrorCB)
+                }
+                guard validEpoch else { return }
                 // Recover seamlessly from Apple's 1110 "No speech detected" / timeout without dropping voice session.
                 if ns.code == 1110 || ns.code == 216 || ns.code == 203 {
-                    self.rotateAfterNaturalEnd()
+                    self.rotateAfterNaturalEnd(expectedEpoch: taskEpoch)
                 } else {
-                    self.lock.withLock { self.onErrorCB }?(err.localizedDescription)
+                    errCB?(err.localizedDescription)
                 }
             }
         }
         lock.withLock {
-            self.task = newTask
+            if self.segmentEpoch == taskEpoch && !self.isStopped {
+                self.task = newTask
+            } else {
+                newTask.cancel()
+            }
         }
     }
 
-    private func rotateAfterNaturalEnd() {
+    private func rotateAfterNaturalEnd(expectedEpoch: UInt64? = nil) {
         let shouldRestart = lock.withLock { () -> Bool in
             guard !self.isStopped else { return false }
+            if let expectedEpoch, self.segmentEpoch != expectedEpoch { return false }
             let seg = self.currentSegmentText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !seg.isEmpty {
                 self.accumulatedPrefix = [self.accumulatedPrefix, seg]
@@ -1059,7 +1103,11 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
         }
         if shouldRestart {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.startRecognitionSegment()
+                guard let self else { return }
+                if let expectedEpoch, self.lock.withLock({ self.segmentEpoch != expectedEpoch || self.isStopped }) {
+                    return
+                }
+                self.startRecognitionSegment()
             }
         }
     }
@@ -1095,6 +1143,7 @@ public final class DeepgramStreamingSTTProvider: StreamingSpeechToTextProvider, 
     private var onFinalCB: (@Sendable (String) -> Void)?
     private var onErrorCB: (@Sendable (String) -> Void)?
     private var lastSourceRate: Double = 48_000
+    private var sessionEpoch: UInt64 = 0
 
     public init(
         model: String = "nova-3",
@@ -1136,12 +1185,14 @@ public final class DeepgramStreamingSTTProvider: StreamingSpeechToTextProvider, 
         req.timeoutInterval = 15
 
         let task = urlSession.webSocketTask(with: req)
-        lock.withLock {
+        let epoch = lock.withLock { () -> UInt64 in
             self.session = urlSession
             self.wsTask = task
             self.onPartialCB = onPartial
             self.onFinalCB = onFinal
             self.onErrorCB = onError
+            self.sessionEpoch &+= 1
+            return self.sessionEpoch
         }
         task.resume()
 
@@ -1149,7 +1200,7 @@ public final class DeepgramStreamingSTTProvider: StreamingSpeechToTextProvider, 
             while !Task.isCancelled {
                 do {
                     let msg = try await task.receive()
-                    guard let self else { break }
+                    guard let self, self.lock.withLock({ self.sessionEpoch == epoch }) else { break }
                     let raw: Data? = {
                         switch msg {
                         case .string(let s): return s.data(using: .utf8)
@@ -1165,12 +1216,14 @@ public final class DeepgramStreamingSTTProvider: StreamingSpeechToTextProvider, 
                           !transcript.isEmpty else { continue }
                     let isFinal = (json["is_final"] as? Bool) ?? false
                     if isFinal {
-                        self.lock.withLock { self.onFinalCB }?(transcript)
+                        self.lock.withLock { self.sessionEpoch == epoch ? self.onFinalCB : nil }?(transcript)
                     } else {
-                        self.lock.withLock { self.onPartialCB }?(transcript)
+                        self.lock.withLock { self.sessionEpoch == epoch ? self.onPartialCB : nil }?(transcript)
                     }
                 } catch {
-                    self?.lock.withLock { self?.onErrorCB }?(error.localizedDescription)
+                    if let self {
+                        self.lock.withLock { self.sessionEpoch == epoch ? self.onErrorCB : nil }?(error.localizedDescription)
+                    }
                     break
                 }
             }
@@ -1188,6 +1241,10 @@ public final class DeepgramStreamingSTTProvider: StreamingSpeechToTextProvider, 
 
     public func stop() {
         let (t, s, r) = lock.withLock { () -> (URLSessionWebSocketTask?, URLSession?, Task<Void, Never>?) in
+            sessionEpoch &+= 1
+            onPartialCB = nil
+            onFinalCB = nil
+            onErrorCB = nil
             let a = wsTask; let b = session; let c = rxTask
             wsTask = nil; session = nil; rxTask = nil
             return (a, b, c)

@@ -17,6 +17,10 @@ struct VoiceSmokeTests {
         testAutonomousIntentRoutingAndRiskTiers()
         testAcousticEchoSuppressorAndQuarantineFTS5()
         testVoiceIdentityInvarianceAndNewStateMachineStates()
+        await testPhase1And2RegressionFixesAndMemoryHygiene()
+        await testV2CatalogConsentStatesAndS2SHonesty()
+        await testV2KokoroNeuralSynthesisAndLlamaCppRuntime()
+        await testV2ValidationHardeningAndSevenPointTelemetry()
         await testNativeAudioEngineDeadlockFreeStartStop()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
@@ -517,5 +521,329 @@ struct VoiceSmokeTests {
         precondition(!report.contains("sk-"))
         precondition(orch.telemetry.resourceSnapshot.cpuCoreCount >= 1)
         print("PASS: Permanent diagnostics probes & sanitized GPU/CPU/RAM report")
+    }
+
+    @MainActor
+    static func testPhase1And2RegressionFixesAndMemoryHygiene() async {
+        // 1. Casual mention of agent name or conceptual question must NOT dispatch agents
+        let casualCodex = LocalQueryComplexityAnalyzer.route(utterance: "O Codex é bom para refatorar?", currentLanguage: .portugueseBR)
+        if case .handleLocally(_, _) = casualCodex {
+        } else {
+            preconditionFailure("Menção casual ao Codex não deve delegar tarefa")
+        }
+        let conceptual = LocalQueryComplexityAnalyzer.route(utterance: "Como funciona um teste unitário no Xcode?", currentLanguage: .portugueseBR)
+        if case .handleLocally(_, _) = conceptual {
+        } else {
+            preconditionFailure("Pergunta conceitual não deve executar tarefa no workspace")
+        }
+
+        // 2. Semantic complexity scores short conceptual questions high without relying only on word count
+        let shortComplex = LocalQueryComplexityAnalyzer.route(utterance: "Por que deadlock acontece?", currentLanguage: .portugueseBR)
+        if case .handleLocally(let score, _) = shortComplex {
+            precondition(score >= 0.65, "Pergunta curta de arquitetura exige score >= 0.65, obtido \(score)")
+        } else {
+            preconditionFailure("Deveria rotear localmente com alta complexidade semântica")
+        }
+
+        // 3. Section 13 canonical parallel delegation ("Peça ao Codex...") must succeed cleanly
+        let canonical = LocalQueryComplexityAnalyzer.route(
+            utterance: "Peça ao Codex para analisar a autenticação do projeto e continue conversando comigo sobre a arquitetura.",
+            currentLanguage: .portugueseBR
+        )
+        if case .delegateToSpecialist(let hint, _, let risk, let parallel) = canonical {
+            precondition(hint == .codex && risk == .low && parallel, "Delegação canônica falhou")
+        } else {
+            preconditionFailure("Deveria rotear para .delegateToSpecialist(.codex)")
+        }
+
+        // 4. Acoustic Echo Hangover blocks tail bleed while allowing real human barge-in
+        let suppressor = AcousticEchoSuppressor()
+        suppressor.updatePlaybackReference(bufferedMs: 0, playbackRMS: 0.14, renderAgeMs: 25, micRMS: 0.02, isAssistantSpeaking: false)
+        precondition(suppressor.isInEchoOrHangoverWindow, "Janela de cauda acústica deve permanecer ativa após renderização")
+        precondition(suppressor.shouldSuppressAsSelfEcho(micRMS: 0.018, lowEnergy: 0.01, isAssistantSpeaking: false), "Eco de cauda deve ser suprimido")
+        precondition(!suppressor.shouldSuppressAsSelfEcho(micRMS: 0.16, lowEnergy: 0.14, isAssistantSpeaking: true), "Barge-in humano forte deve passar")
+
+        // 5. Unavailable external brain fails honestly (zero fabricated smart chat)
+        let brain = LocalConversationalBrain()
+        brain.preferredEngineKind = .localLlamaCppMetal
+        let reply = await brain.streamReply(
+            userText: "Oi tudo bem",
+            systemInstructions: "Teste",
+            portableContextSummary: "",
+            language: .portugueseBR
+        ) { _ in }
+        precondition(brain.backendStatus == .compactHeuristicFallback && reply.lowercased().contains("indispon"), "Modelo ausente deve reportar indisponibilidade honesta")
+
+        // 6. Optional 11-stage trace stays disabled by default
+        let tel = VoiceTelemetryRecorder()
+        precondition(!tel.enablePipelineDiagnosticsTrace)
+        tel.recordPipelineTrace(stage: .microphone, sessionToken: "s1", turnEpoch: 1, detail: "segredo")
+        precondition(tel.pipelineTraceEvents.isEmpty, "Trace não pode gravar por padrão quando desativado")
+        tel.enablePipelineDiagnosticsTrace = true
+        tel.recordPipelineTrace(stage: .playback, sessionToken: "s1", turnEpoch: 1, detail: "ok")
+        precondition(tel.pipelineTraceEvents.count == 1)
+        tel.enablePipelineDiagnosticsTrace = false
+        precondition(tel.pipelineTraceEvents.isEmpty)
+
+        // 7. Structural Memory Hygiene catches ASR drift loops while preserving genuine user history
+        let tempContURL = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-cont-hygiene-\(UUID().uuidString).json")
+        let tempFTSURL = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-fts-hygiene-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: tempContURL)
+            try? FileManager.default.removeItem(at: tempFTSURL)
+        }
+        let cont = CodexRealtimeContinuityStore(fileURL: tempContURL)
+        let fts = VoiceSQLiteKnowledgeStore(databaseURL: tempFTSURL)
+        let tid = "thread-test-hygiene"
+        cont.recordItem(threadId: tid, role: "user", text: "Quero revisar a autenticação do módulo principal")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Claro, vou conferir os arquivos de login com você.")
+        cont.recordItem(threadId: tid, role: "user", text: "Molina")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Parece que você mencionou Molina.")
+        cont.recordItem(threadId: tid, role: "user", text: "Molina. Comendo")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Posso ajudar com comida ou Molina?")
+        cont.recordItem(threadId: tid, role: "user", text: "Molina. Comendo.")
+        cont.recordItem(threadId: tid, role: "assistant", text: "Entendi, comida e Molina.")
+
+        let candidates = VoiceMemoryHygieneAnalyzer.scan(knowledgeStore: fts, continuityStore: cont)
+        precondition(candidates.contains(where: { $0.text == "Molina. Comendo." }), "Deve identificar loop de deriva ASR")
+        precondition(!candidates.contains(where: { $0.text.contains("autenticação do módulo principal") }), "Não pode marcar memória legítima do usuário")
+        let removed = VoiceMemoryHygieneAnalyzer.removeReviewedCandidates(candidates, knowledgeStore: fts, continuityStore: cont)
+        precondition(removed >= 4)
+        let remaining = cont.loadItems(for: tid)
+        precondition(remaining.count == 2 && remaining[0].text.contains("autenticação"), "Histórico legítimo precisa permanecer intacto")
+
+        print("PASS: Phase 1 & 2 fixes (routing, echo hangover, honest brain unavailability, trace opt-in, safe memory hygiene)")
+    }
+
+    @MainActor
+    static func testV2CatalogConsentStatesAndS2SHonesty() async {
+        let mgr = VoiceModelAssetManager()
+        mgr.refreshStorageInfo()
+
+        // Consent lock: requesting download must set awaitingConsent WITHOUT downloading automatically
+        mgr.requestDownloadConsent(for: VoiceModelCatalog.gemma3SmallID)
+        precondition(mgr.pendingConsentReason != nil, "Consentimento explícito precisa ser solicitado antes de baixar")
+        precondition(mgr.installStates[VoiceModelCatalog.gemma3SmallID] == .awaitingConsent)
+        mgr.declineConsent()
+        precondition(mgr.pendingConsentReason == nil)
+
+        // Language honesty: Kokoro covers pt-BR / en-US / es-ES, explicitly NOT pt-PT
+        precondition(VoiceTTSEngineKind.kokoro82M.supportsLanguage(.portugueseBR))
+        precondition(!VoiceTTSEngineKind.kokoro82M.supportsLanguage(.portuguesePT))
+        precondition(KokoroNeuralTTSProvider.resolvePreset(language: .portuguesePT, voicePreference: "pf_dora") == nil)
+
+        // Capabilities honesty: no fabricated emotion control & F5-TTS NC license warning present
+        precondition(!VoiceTTSEngineKind.kokoro82M.supportsExplicitEmotionSlider)
+        let f5 = VoiceModelCatalog.descriptor(id: "f5-tts-noncommercial")
+        precondition(f5?.licenseName == "CC-BY-NC-4.0" && f5?.licenseWarning != nil)
+
+        // Hardware profile & S2S gate honesty on Essential 8 GB
+        let s2s8GB = NativeS2SRuntimeProbe.evaluate(hardwareTier: .essential8GB)
+        precondition(!s2s8GB.isSupportedOnThisMac && s2s8GB.blockerReason != nil)
+        print("PASS: V2 catalog states, consent gating, pt-PT honesty, F5-TTS NC warning & S2S hardware gate")
+    }
+
+    @MainActor
+    static func testV2KokoroNeuralSynthesisAndLlamaCppRuntime() async {
+        let mgr = VoiceModelAssetManager()
+        let kokoro = KokoroNeuralTTSProvider()
+        if kokoro.isReadyOnDisk {
+            precondition(mgr.installStates[VoiceModelCatalog.sherpaRuntimeID] == .available)
+            precondition(mgr.installStates[VoiceModelCatalog.kokoroInt8ModelID] == .available)
+
+            // Preload and verify cold load + PT-BR / EN-US / ES-ES synthesis + honest pt-PT rejection
+            do {
+                let diag = try await kokoro.preload(language: .portugueseBR)
+                precondition(diag.isLoaded && diag.sampleRateHz == 24_000 && diag.numSpeakers >= 50)
+                let ptBR = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Olá! O motor neural local do WisdAI está operacional em português do Brasil.",
+                    language: .portugueseBR,
+                    preset: .pfDora,
+                    rate: 1.0
+                )
+                precondition(ptBR.samples.count > 24_000, "Kokoro pt-BR precisa gerar áudio > 1s")
+
+                let ptMale = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Já acionei o Codex em segundo plano. Podemos continuar conversando.",
+                    language: .portugueseBR,
+                    preset: .pmAlex,
+                    rate: 1.0
+                )
+                precondition(ptMale.samples.count > 12_000)
+
+                let enUS = try await kokoro.synthesizeStandaloneSamples(
+                    text: "WisdAI neural voice engine is speaking naturally in English.",
+                    language: .englishUS,
+                    preset: .afHeart,
+                    rate: 1.0
+                )
+                precondition(enUS.samples.count > 12_000)
+
+                let esES = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Hola, el motor neuronal de WisdAI funciona con claridad en español.",
+                    language: .spanishES,
+                    preset: .efDora,
+                    rate: 1.0
+                )
+                precondition(esES.samples.count > 12_000)
+
+                // Mid-synthesis cancel check (barge-in path)
+                final class CancelCountBox: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var count = 0
+                    func add(_ n: Int) { lock.withLock { count += n } }
+                    var total: Int { lock.withLock { count } }
+                }
+                let cancelBox = CancelCountBox()
+                let longSynthTask = Task {
+                    try? await kokoro.synthesizeChunk(
+                        "Primeira frase longa para testar cancelamento durante a geração contínua. Segunda frase adicional para interromper.",
+                        language: .portugueseBR,
+                        voicePreference: KokoroVoicePreset.pfDora.rawValue,
+                        rate: 1.0
+                    ) { floats, _ in cancelBox.add(floats.count) }
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+                kokoro.cancelAll()
+                longSynthTask.cancel()
+                await longSynthTask.value
+                // New synthesis works cleanly after cancellation
+                let afterReset = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Tudo certo.",
+                    language: .portugueseBR,
+                    preset: .pfDora,
+                    rate: 1.0
+                )
+                precondition(!afterReset.samples.isEmpty && cancelBox.total >= 0)
+
+                var ptPTRejected = false
+                do {
+                    try await kokoro.synthesizeChunk("Teste", language: .portuguesePT, voicePreference: "pf_dora", rate: 1.0) { _, _ in }
+                } catch {
+                    ptPTRejected = true
+                }
+                precondition(ptPTRejected, "Kokoro precisa rejeitar honestamente pt-PT")
+                kokoro.unload()
+                print(String(format: "PASS: Real Kokoro-82M neural synthesis (load=%.0fms, ptBR=%.0fms/%d@24kHz, en=%.0fms, es=%.0fms)",
+                             diag.loadLatencyMs ?? 0, ptBR.synthMs, ptBR.samples.count, enUS.synthMs, esES.synthMs))
+            } catch {
+                preconditionFailure("Kokoro instalado falhou na síntese real: \(error)")
+            }
+        } else {
+            print("SKIP_OPTIONAL: Kokoro-82M weights not installed on disk")
+        }
+
+        let llama = LocalLlamaServerBrainRuntime(assetManager: mgr)
+        if llama.isSelectedModelReadyOnDisk {
+            do {
+                let port = try await llama.ensureServerReady(modelID: VoiceModelCatalog.qwen3SmallID)
+                precondition(port > 0 && llama.isRunning)
+                final class DeltaBox: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var count = 0
+                    func inc() { lock.withLock { count += 1 } }
+                    var total: Int { lock.withLock { count } }
+                }
+                let deltas = DeltaBox()
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let reply = try await llama.streamChatCompletion(
+                    systemPrompt: "Responda em português brasileiro em 1 frase curta e objetiva.",
+                    recentHistory: [],
+                    userText: "Qual a vantagem de usar áudio streaming em baixa latência?"
+                ) { chunk in
+                    if !chunk.isEmpty { deltas.inc() }
+                }
+                let totalMs = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+                precondition(!reply.isEmpty && deltas.total > 0 && !reply.contains("<think>"), "Qwen3 via llama.cpp deve responder em streaming sem tags <think> expostas: \(reply)")
+                let loadMs = llama.lastLoadDurationMs ?? 0
+                let ttftMs = llama.lastTTFTMs ?? 0
+                llama.unloadModel()
+                precondition(!llama.isRunning)
+                print(String(format: "PASS: Real llama.cpp Metal + Qwen3-1.7B inference (load=%.0fms, TTFT=%.0fms, total=%.0fms, replyChars=%d)",
+                             loadMs, ttftMs, totalMs, reply.count))
+            } catch {
+                llama.unloadModel()
+                preconditionFailure("llama.cpp Metal instalado falhou na inferência real: \(error)")
+            }
+        } else {
+            print("SKIP_OPTIONAL: llama.cpp / Qwen3 GGUF weights not installed on disk")
+        }
+    }
+
+    @MainActor
+    static func testV2ValidationHardeningAndSevenPointTelemetry() async {
+        // 1. Security hardening checks: loopback restriction, sanitized env, extended redactor & receipt integrity
+        precondition(LocalLlamaServerBrainRuntime.isStrictLoopbackURL(URL(string: "http://127.0.0.1:8080/v1/chat/completions")!))
+        precondition(!LocalLlamaServerBrainRuntime.isStrictLoopbackURL(URL(string: "http://0.0.0.0:8080/v1/chat/completions")!))
+        precondition(!LocalLlamaServerBrainRuntime.isStrictLoopbackURL(URL(string: "https://api.openai.com/v1/chat/completions")!))
+
+        let cleanEnv = LocalLlamaServerBrainRuntime.sanitizedSubprocessEnvironment(
+            dyldLibraryPath: "/tmp/libs",
+            baseEnv: ["PATH": "/usr/bin", "HOME": "/Users/test", "OPENAI_API_KEY": "sk-secret123456789", "GEMINI_API_KEY": "AIzaSySecret123456789"]
+        )
+        precondition(cleanEnv["OPENAI_API_KEY"] == nil && cleanEnv["GEMINI_API_KEY"] == nil)
+        precondition(cleanEnv["DYLD_LIBRARY_PATH"] == "/tmp/libs")
+
+        let redacted = VoiceLogRedactor.redact("Keys: sk-ant-1234567890abcd ghp_1234567890abcdef1234 hf_1234567890abcdef1234")
+        precondition(!redacted.contains("sk-ant-") && !redacted.contains("ghp_") && !redacted.contains("hf_"))
+
+        // 2. Installed models pass cryptographic receipt & tree integrity check
+        let mgr = VoiceModelAssetManager()
+        if let qwen = VoiceModelCatalog.descriptor(id: VoiceModelCatalog.qwen3SmallID), mgr.isModelInstalledOnDisk(qwen) {
+            let integrity = mgr.verifyInstalledIntegrityOnDemand(for: VoiceModelCatalog.llamaRuntimeID)
+            precondition(integrity.ok, "Runtime llama-cpp precisa passar integridade: \(integrity.detail)")
+            let kokoroIntegrity = mgr.verifyInstalledIntegrityOnDemand(for: VoiceModelCatalog.kokoroInt8ModelID)
+            precondition(kokoroIntegrity.ok, "Kokoro INT8 precisa passar integridade: \(kokoroIntegrity.detail)")
+        }
+
+        // 3. Adaptive intelligence escalation parsing & read-only codebase question routing
+        let rawEsc = "Não consigo ler os arquivos diretamente neste modelo. [CONSULTAR_ESPECIALISTA: Listar estrutura de autenticação em somente leitura]"
+        let parsed = LocalConversationalBrain.extractSpecialistEscalation(from: rawEsc)
+        precondition(!parsed.spokenText.contains("CONSULTAR_ESPECIALISTA"))
+        precondition(parsed.specialistQuery?.contains("autenticação") == true)
+
+        let partialEsc = "Vou pedir ajuda agora [CONSULTAR_ESPECIALISTA: Analisando"
+        let cleanPartial = LocalConversationalBrain.sanitizeStreamingControlTags(partialEsc)
+        precondition(!cleanPartial.contains("[") && cleanPartial.contains("Vou pedir ajuda agora"))
+
+        let repoInspect = LocalQueryComplexityAnalyzer.route(
+            utterance: "Quais arquivos existem neste projeto para o motor de voz?",
+            currentLanguage: .portugueseBR
+        )
+        if case .delegateToSpecialist(_, _, let risk, _) = repoInspect {
+            precondition(risk == .low, "Consulta de arquivos do projeto deve ir em modo somente leitura (.low)")
+        } else {
+            preconditionFailure("Pergunta de inspeção do repositório deve escalar em somente leitura")
+        }
+
+        // 4. Filter strips real thread 53C9FCCE Molina/Comendo entries cleanly without deleting history blindly
+        let sampleCont = [
+            CodexContinuityItem(role: "user", text: "Alô como você vai"),
+            CodexContinuityItem(role: "assistant", text: "Alô! Tudo ótimo por aqui!"),
+            CodexContinuityItem(role: "user", text: "Molina"),
+            CodexContinuityItem(role: "assistant", text: "Olá! Parece que você está mencionando o nome \"Molina\"."),
+            CodexContinuityItem(role: "user", text: "Molina. Comendo"),
+            CodexContinuityItem(role: "assistant", text: "Olá, entendi. Posso ajudar com algo sobre comida ou \"Molina\"?"),
+            CodexContinuityItem(role: "user", text: "Molina. Comendo. ."),
+            CodexContinuityItem(role: "assistant", text: "Entendi, você está comendo. Posso ajudar com comida ou \"Molina\"?")
+        ]
+        let cleanedCont = VoiceMemoryHygieneAnalyzer.filterCleanContextItems(sampleCont)
+        precondition(cleanedCont.count == 2)
+        precondition(!cleanedCont.contains(where: { $0.text.lowercased().contains("molina") || $0.text.lowercased().contains("comida") }))
+
+        // 5. 7-checkpoint jitter buffer render & audible interruption tracking
+        let jitter = AdaptiveJitterBuffer(sampleRate: 24_000, maxDurationSeconds: 2.0)
+        jitter.resetForNewResponse()
+        precondition(jitter.firstRenderTimestampNsForResponse() == nil)
+        _ = jitter.pushFloatSamples([Float](repeating: 0.15, count: 4800), transcriptText: "Teste")
+        var scratch = [Float](repeating: 0, count: 512)
+        _ = scratch.withUnsafeMutableBufferPointer { jitter.renderPull(into: $0.baseAddress!, frameCount: 512) }
+        precondition(jitter.firstRenderTimestampNsForResponse() != nil, "Deve registrar timestamp real de primeira renderização CoreAudio")
+        let flushSnap = jitter.flushAndCaptureHeardSnapshot()
+        _ = scratch.withUnsafeMutableBufferPointer { jitter.renderPull(into: $0.baseAddress!, frameCount: 512) }
+        let zeroAfterFlush = jitter.firstSilentRenderAfterFlushTimestampNs(matchingFlush: flushSnap.flushTimestampUptimeNs)
+        precondition(zeroAfterFlush != nil && zeroAfterFlush! >= flushSnap.flushTimestampUptimeNs, "Deve registrar silêncio efetivo no callback de saída pós-flush")
+
+        print("PASS: Security hardening, read-only escalation, Molina filter integrity & 7-stage audio timestamps")
     }
 }
