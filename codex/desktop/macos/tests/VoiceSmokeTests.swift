@@ -23,6 +23,7 @@ struct VoiceSmokeTests {
         await testV2ValidationHardeningAndSevenPointTelemetry()
         await testV3BehaviorEngineAndVocalizationCache()
         await testNativeAudioEngineDeadlockFreeStartStop()
+        await testNativeAudioEngineThirtyCycleAndRecoveryRegression()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
         runPerformanceBenchmarks()
@@ -505,7 +506,119 @@ struct VoiceSmokeTests {
         precondition(playRes.ok, "Reprodução real precisa drenar frames: \(playRes.detail)")
         engine.stop()
         precondition(!engine.isRunning)
+        precondition(engine.lifecycleState == .idle)
+        precondition(!engine.isTapInstalled)
         print("PASS: Deadlock-free FullDuplex startup/teardown & real audio playback probe")
+    }
+
+    @MainActor
+    static func testNativeAudioEngineThirtyCycleAndRecoveryRegression() async {
+        // 1. Validate CoreAudio device filter never exposes transient CADefaultDeviceAggregate devices
+        let enumerated = CoreAudioDeviceCatalog.enumerateDevices()
+        precondition(!enumerated.contains(where: { $0.name.hasPrefix("CADefaultDeviceAggregate") || $0.uid.hasPrefix("CADefaultDeviceAggregate") }),
+                     "CADefaultDeviceAggregate interno não deve aparecer na listagem pública")
+
+        let engine = VoiceNativeAudioEngine(memoryProfile: .detect())
+
+        // 2. Real-hardware >=30 open/start/render/stop cycles (32 cycles) with VPIO enabled
+        var vpioEnabledCount = 0
+        for cycle in 1...32 {
+            do {
+                try await engine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+            } catch {
+                preconditionFailure("Ciclo \(cycle)/32 falhou ao iniciar motor nativo: \(error.localizedDescription) | fault=\(engine.lastFault ?? "nil") | fail=\(engine.lastFailure?.formattedSummary ?? "nil")")
+            }
+            let snap = engine.telemetrySnapshot()
+            precondition(engine.isRunning, "Ciclo \(cycle): motor deveria estar ativo")
+            precondition(snap.tapInstalled, "Ciclo \(cycle): tap de entrada ausente")
+            precondition(snap.inputSampleRateHz > 0 && snap.inputChannels > 0, "Ciclo \(cycle): formato de entrada inválido")
+            precondition(snap.outputSampleRateHz > 0 && snap.outputChannels > 0, "Ciclo \(cycle): formato de saída inválido")
+            if snap.vpioActive {
+                vpioEnabledCount += 1
+            }
+
+            // Enqueue vocalization buffer + main reply + barge-in flush while active
+            _ = engine.enqueueAuxiliaryVocalization([Float](repeating: 0.05, count: 1200), label: "Uhum")
+            let silenceTone = [Float](repeating: 0.01, count: 2400)
+            _ = engine.outputJitterBuffer.pushFloatSamples(silenceTone, transcriptText: nil)
+            if cycle % 8 == 0 {
+                try? await Task.sleep(nanoseconds: 65_000_000)
+                precondition(engine.outputJitterBuffer.stats.playedMs > 0, "Ciclo \(cycle): callback CoreAudio não drenou frames")
+            }
+            _ = engine.bargeInFlushPlayback()
+            engine.stop()
+            precondition(!engine.isRunning && engine.lifecycleState == .idle && !engine.isTapInstalled,
+                         "Ciclo \(cycle): teardown incompleto após stop()")
+        }
+        precondition(vpioEnabledCount >= 30, "VPIO hardware AEC deve permanecer operacional nos 32 ciclos quando rota Built-In ativa (vpioCount=\(vpioEnabledCount))")
+
+        // 3. Concurrency / re-entrancy stress test: concurrent startFullDuplexAsync + delayed stop serialization
+        let t1 = Task { @MainActor in
+            try? await engine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+        }
+        let t2 = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            try? await engine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+        }
+        await t1.value
+        await t2.value
+        precondition(engine.isRunning, "Serialização concorrente de startup deve convergir em estado ativo consistente")
+        engine.stop()
+        precondition(!engine.isRunning)
+
+        // 4. Continuity / Split-Engine compatibility route verification (if iPhone Continuity / virtual mic attached)
+        if let continuityMic = engine.inputDevices.first(where: { $0.transport == .continuityOrVirtual }) {
+            let previousInputUID = engine.selectedInputDeviceUID
+            engine.selectInputDevice(uid: continuityMic.uid)
+            do {
+                try await engine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+                let snap = engine.telemetrySnapshot()
+                precondition(engine.isRunning, "Rota Continuity/Virtual deve operar sem erro -10875 via SplitEngine ou fallback compatível")
+                precondition(snap.lifecycleState == .degradedCompatibility || snap.lifecycleState == .running)
+            } catch {
+                preconditionFailure("Rota Continuity/Virtual '\(continuityMic.name)' não deveria lançar -10875 não tratado: \(error.localizedDescription)")
+            }
+            engine.stop()
+            if let previousInputUID {
+                engine.selectInputDevice(uid: previousInputUID)
+            }
+        }
+
+        // 5. Device switch cycle during active playback/capture (awaits async bounded recovery)
+        if engine.inputDevices.count >= 2,
+           let firstIn = engine.inputDevices.first(where: { $0.uid != engine.selectedInputDeviceUID }),
+           let origIn = engine.selectedInputDeviceUID {
+            try? await engine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+            precondition(engine.isRunning)
+            engine.selectInputDevice(uid: firstIn.uid)
+            for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if engine.isRunning && (engine.lifecycleState == .running || engine.lifecycleState == .degradedCompatibility) {
+                    break
+                }
+            }
+            precondition(engine.isRunning, "Motor deve concluir recuperação controlada após troca de entrada (state=\(engine.lifecycleState.rawValue), fault=\(engine.lastFault ?? "nil"))")
+            engine.selectInputDevice(uid: origIn)
+            for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if engine.isRunning && (engine.lifecycleState == .running || engine.lifecycleState == .degradedCompatibility) {
+                    break
+                }
+            }
+            precondition(engine.isRunning, "Motor deve restaurar rota original após retorno")
+            engine.stop()
+        } else if let firstOut = engine.outputDevices.first {
+            try? await engine.startFullDuplexAsync(enableCapture: true, enablePlayback: true, enableVoiceProcessing: true)
+            engine.selectOutputDevice(uid: firstOut.uid)
+            for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if engine.isRunning { break }
+            }
+            precondition(engine.isRunning, "Motor deve permanecer ativo após seleção de saída")
+            engine.stop()
+        }
+
+        print("PASS: Native AudioEngine 32-cycle VPIO, concurrency serialization, split-engine Continuity & route switch regression")
     }
 
     @MainActor
@@ -519,6 +632,12 @@ struct VoiceSmokeTests {
         precondition(orch.componentStatuses[.vad]?.state == .ready)
         let report = orch.exportSanitizedDiagnosticsReport()
         precondition(report.contains("WisdAI Voice Engine Diagnostic Report"))
+        precondition(report.contains("AudioEngine Lifecycle:"))
+        precondition(report.contains("AudioUnit:"))
+        precondition(report.contains("AudioGraph:"))
+        precondition(report.contains("AudioOperations:"))
+        precondition(report.contains("AudioLastFailure:"))
+        precondition(report.contains("Active Engines:"))
         precondition(!report.contains("sk-"))
         precondition(orch.telemetry.resourceSnapshot.cpuCoreCount >= 1)
         print("PASS: Permanent diagnostics probes & sanitized GPU/CPU/RAM report")
