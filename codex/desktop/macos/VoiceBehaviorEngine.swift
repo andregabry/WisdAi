@@ -16,6 +16,18 @@ public struct VoicePersonalityProfile: Equatable, Codable, Sendable {
 
     public static func profile(for persona: WisdVoicePersona) -> VoicePersonalityProfile {
         switch persona {
+        case .jarvis:
+            return VoicePersonalityProfile(
+                persona: .jarvis,
+                conversationalWarmth: 0.72,
+                formality: .balanced,
+                energy: 0.58,
+                cadenceRate: 0.97,
+                backchannelFrequency: 0.48,
+                expressivity: .balanced,
+                directness: 0.90,
+                interactionStyle: "Estrategista executivo sereno, articulado e direto; transmite calma, precisão e leve ironia refinada sem clichês."
+            )
         case .aurora:
             return VoicePersonalityProfile(
                 persona: .aurora,
@@ -274,13 +286,41 @@ public final class AcousticFeatureExtractor: @unchecked Sendable {
         return Double(last.rms - first.rms) / dt
     }
 
-    /// Lightweight time-domain normalized autocorrelation F0 detector (75–350 Hz) using vDSP.
+    /// Computes median fundamental frequency (65–340 Hz) across voiced frames for objective acoustic voice-identity verification.
+    public static func measureMedianFundamentalFrequencyHz(samples: [Float], sampleRate: Double) -> Double? {
+        guard sampleRate >= 12_000, samples.count >= 512 else { return nil }
+        let win = max(384, min(samples.count, Int(0.048 * sampleRate)))
+        let hop = max(192, win / 2)
+        var series: [Double] = []
+        var offset = 0
+        while offset + win <= samples.count {
+            let frame = Array(samples[offset..<(offset + win)])
+            var rms: Float = 0
+            vDSP_rmsqv(frame, 1, &rms, vDSP_Length(win))
+            if rms >= 0.014 {
+                let f0 = computeNormalizedAutocorrelationF0(samples: frame, sampleRate: sampleRate)
+                if f0 >= 65.0 && f0 <= 340.0 {
+                    series.append(f0)
+                }
+            }
+            offset += hop
+        }
+        guard !series.isEmpty else { return nil }
+        series.sort()
+        return series[series.count / 2]
+    }
+
+    /// Lightweight time-domain normalized autocorrelation F0 detector (65–350 Hz) using vDSP.
     private func estimateFundamentalFrequencyHz(samples: [Float], sampleRate: Double) -> Double {
+        Self.computeNormalizedAutocorrelationF0(samples: samples, sampleRate: sampleRate)
+    }
+
+    private static func computeNormalizedAutocorrelationF0(samples: [Float], sampleRate: Double) -> Double {
         let winSize = min(samples.count, max(512, Int(sampleRate * 0.032)))
         guard winSize >= 384 else { return 0 }
         let start = samples.count - winSize
         let minLag = max(16, Int(sampleRate / 350.0))
-        let maxLag = min(winSize - 32, Int(sampleRate / 75.0))
+        let maxLag = min(winSize - 32, Int(sampleRate / 65.0))
         guard maxLag > minLag + 8 else { return 0 }
 
         var zeroMean = Array(samples[start..<samples.count])
@@ -342,7 +382,7 @@ public final class AcousticFeatureExtractor: @unchecked Sendable {
         }
         guard refinedLag > 0 else { return 0 }
         let hz = sampleRate / Double(refinedLag)
-        return (hz >= 75.0 && hz <= 350.0) ? hz : 0
+        return (hz >= 65.0 && hz <= 350.0) ? hz : 0
     }
 }
 
@@ -438,11 +478,11 @@ public enum VocalizationKind: String, CaseIterable, Identifiable, Codable, Senda
 
     public func spokenText(for language: VoiceLanguageVariant) -> String {
         switch language {
-        case .englishUS:
+        case .englishGB, .englishUS:
             switch self {
             case .uhum: return "Uh-huh."
             case .aham: return "Mhm!"
-            case .hmm: return "Hmm…"
+            case .hmm: return "Hum…"
             case .sei: return "I see…"
             case .entendi: return "Got it…"
             case .certo: return "Right…"
@@ -455,7 +495,7 @@ public enum VocalizationKind: String, CaseIterable, Identifiable, Codable, Senda
             switch self {
             case .uhum: return "Ajá…"
             case .aham: return "Mm-hm!"
-            case .hmm: return "Hmm…"
+            case .hmm: return "Hum…"
             case .sei: return "Ya…"
             case .entendi: return "Entiendo…"
             case .certo: return "Claro…"
@@ -468,7 +508,7 @@ public enum VocalizationKind: String, CaseIterable, Identifiable, Codable, Senda
             switch self {
             case .uhum: return "Uhum…"
             case .aham: return "Aham!"
-            case .hmm: return "Hmm…"
+            case .hmm: return "Hum…"
             case .sei: return "Sei…"
             case .entendi: return "Entendi…"
             case .certo: return "Certo…"
@@ -641,7 +681,7 @@ public final class ConversationalBehaviorPlanner: @unchecked Sendable {
                 case .enthusiasm:
                     return .interessante
                 case .technicalExplanation where profile.profilePreset == .casual || profile.profilePreset == .expressive:
-                    return .olha
+                    return persona == .jarvis ? .certo : .olha
                 default:
                     return nil
                 }
@@ -881,14 +921,25 @@ public struct EngineProsodyCapabilities: Equatable, Sendable {
     public let supportsDynamicSilenceScale: Bool
     public let supportsPitchModulation: Bool
     public let supportsNativeAudioTags: Bool
+    public let supportsFlowMatchingSteps: Bool
 
-    public static func forEngine(_ engine: VoiceTTSEngineKind, isKokoroActive: Bool) -> EngineProsodyCapabilities {
+    public static func forEngine(_ engine: VoiceTTSEngineKind, isKokoroActive: Bool, isSupertonicActive: Bool = false) -> EngineProsodyCapabilities {
+        if isSupertonicActive || engine == .supertonic3 {
+            return EngineProsodyCapabilities(
+                supportsRateControl: true,
+                supportsDynamicSilenceScale: true,
+                supportsPitchModulation: false, // Honest: timbre comes from speaker style vector + Flow Matching, not fake pitch shifting
+                supportsNativeAudioTags: false,
+                supportsFlowMatchingSteps: true
+            )
+        }
         if isKokoroActive || engine == .kokoro82M {
             return EngineProsodyCapabilities(
                 supportsRateControl: true,
                 supportsDynamicSilenceScale: true,
                 supportsPitchModulation: false, // Honest: Kokoro has no direct pitch knob
-                supportsNativeAudioTags: false
+                supportsNativeAudioTags: false,
+                supportsFlowMatchingSteps: false
             )
         }
         switch engine {
@@ -897,28 +948,32 @@ public struct EngineProsodyCapabilities: Equatable, Sendable {
                 supportsRateControl: true,
                 supportsDynamicSilenceScale: false,
                 supportsPitchModulation: true, // Subtle AVSpeechUtterance.pitchMultiplier
-                supportsNativeAudioTags: false
+                supportsNativeAudioTags: false,
+                supportsFlowMatchingSteps: false
             )
         case .sherpaPiperVits:
             return EngineProsodyCapabilities(
                 supportsRateControl: true,
                 supportsDynamicSilenceScale: true,
                 supportsPitchModulation: false,
-                supportsNativeAudioTags: false
+                supportsNativeAudioTags: false,
+                supportsFlowMatchingSteps: false
             )
         case .cosyVoice2, .chatterbox:
             return EngineProsodyCapabilities(
                 supportsRateControl: true,
                 supportsDynamicSilenceScale: false,
                 supportsPitchModulation: false,
-                supportsNativeAudioTags: true
+                supportsNativeAudioTags: true,
+                supportsFlowMatchingSteps: false
             )
         default:
             return EngineProsodyCapabilities(
                 supportsRateControl: false,
                 supportsDynamicSilenceScale: false,
                 supportsPitchModulation: false,
-                supportsNativeAudioTags: false
+                supportsNativeAudioTags: false,
+                supportsFlowMatchingSteps: false
             )
         }
     }

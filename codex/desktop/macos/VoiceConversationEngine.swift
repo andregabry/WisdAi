@@ -148,6 +148,7 @@ public final class ConversationStateMachine: @unchecked Sendable {
 
 public enum VoicePersonalityStyle: String, CaseIterable, Identifiable, Codable, Sendable {
     case naturalPartner
+    case jarvisExecutive
     case conciseExecutive
     case calmMentor
     case creativeBrainstorm
@@ -157,6 +158,7 @@ public enum VoicePersonalityStyle: String, CaseIterable, Identifiable, Codable, 
     public var displayName: String {
         switch self {
         case .naturalPartner: return "Parceiro Natural (Padrão)"
+        case .jarvisExecutive: return "JARVIS · Estrategista Sereno"
         case .conciseExecutive: return "Direto & Executivo"
         case .calmMentor: return "Calmo & Didático"
         case .creativeBrainstorm: return "Criativo & Exploratório"
@@ -389,6 +391,7 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
             switch languageVariant {
             case .portugueseBR: return "Speak exclusively in natural, spoken Brazilian Portuguese unless the user switches languages."
             case .portuguesePT: return "Speak in natural European Portuguese unless the user switches languages."
+            case .englishGB: return "Speak in natural, articulate British English (restrained, refined phrasing) unless the user switches languages."
             case .englishUS: return "Speak in natural conversational English unless the user switches languages."
             case .spanishES: return "Habla en español natural a menos que el usuario cambie de idioma."
             }
@@ -396,6 +399,7 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
         let personalityInstr: String = {
             switch personality {
             case .naturalPartner: return "Participate like an attentive human partner: warm, spontaneous, clear, never robotic or overly formal."
+            case .jarvisExecutive: return "Embody JARVIS — WisdAI's composed executive voice: lucid, attentive, calm under pressure, articulate, strategically proactive, with occasional understated poise and dry wit, never theatrical, never verbose, and never echoing generic assistant filler."
             case .conciseExecutive: return "Be crisp, concise, and direct without unnecessary filler."
             case .calmMentor: return "Explain concepts calmly, clearly, and naturally step-by-step."
             case .creativeBrainstorm: return "Collaborate energetically, explore angles, and engage conversationally."
@@ -442,7 +446,7 @@ public struct TechnicalPronunciationDictionary: Equatable, Codable, Sendable {
                 "macOS": "Mac O S",
                 "UUID": "U U I D"
             ])
-        case .englishUS:
+        case .englishGB, .englishUS:
             return TechnicalPronunciationDictionary(entries: [
                 "WisdAI": "Wiz D A I",
                 "SQLite": "S Q Lite",

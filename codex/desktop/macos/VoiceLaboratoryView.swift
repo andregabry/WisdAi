@@ -15,6 +15,7 @@ struct VoiceLaboratoryView: View {
     @ObservedObject private var previewPlayer: VoiceAudioPreviewPlayer
     @ObservedObject private var vocalizationCache: VocalizationCacheEngine
     @ObservedObject private var mlxTTS: LocalExpressiveTTSLoopbackClient
+    @ObservedObject private var identityManager: VoiceIdentityManager
 
     @State private var activeSection: LabSection = .enginesAndAudio
     @State private var sampleText: String = "Olá! Eu sou a voz neural local do WisdAI. Agora consigo conversar com naturalidade, baixa latência e interrupção imediata."
@@ -53,6 +54,7 @@ struct VoiceLaboratoryView: View {
         self.previewPlayer = orchestrator.previewPlayer
         self.vocalizationCache = orchestrator.vocalizationCache
         self.mlxTTS = orchestrator.mlxExpressiveTTS
+        self.identityManager = orchestrator.identityManager
     }
 
     var body: some View {
@@ -324,21 +326,57 @@ struct VoiceLaboratoryView: View {
 
             Divider()
 
-            // Neural TTS selector + honest capability gating + audio testing
+            // Section A: Identidade Vocal (JARVIS, Aurora, Atlas, Aria)
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("3. Síntese Vocal Neural & Teste Comparativo")
+                Text("3A. Identidade Vocal (Fonte Única de Verdade)")
+                    .font(.system(size: 12.5, weight: .semibold))
+
+                HStack(spacing: 8) {
+                    Picker("Identidade", selection: Binding(
+                        get: { identityManager.config.identityId },
+                        set: { identityManager.selectPersona($0) }
+                    )) {
+                        ForEach(WisdVoicePersona.allCases) { persona in
+                            Text(persona.displayName).tag(persona)
+                        }
+                    }
+
+                    Picker("Timbre", selection: Binding(
+                        get: { identityManager.config.vocalGender },
+                        set: { identityManager.selectGender($0) }
+                    )) {
+                        Text("Masculina").tag(WisdVoiceTimbre.male)
+                        Text("Feminina").tag(WisdVoiceTimbre.female)
+                    }
+                    .frame(maxWidth: 210)
+                }
+
+                Text(identityManager.config.identityId.subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(DesktopStyle.muted)
+            }
+
+            Divider()
+
+            // Section B: Motor Neural + Speaker + Honest Voice Design Controls
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Text("3B. Motor Neural & Voice Design")
                         .font(.system(size: 12.5, weight: .semibold))
                     Spacer()
+                    let supState = assetManager.installStates[VoiceModelCatalog.supertonic3Int8ModelID] ?? .notInstalled
                     let kokoroState = assetManager.installStates[VoiceModelCatalog.kokoroInt8ModelID] ?? .notInstalled
-                    Text("Kokoro-82M: \(kokoroState.rawValue)")
+                    Text("Supertonic-3: \(supState.rawValue) · Kokoro: \(kokoroState.rawValue)")
                         .font(.system(size: 10.5, weight: .medium))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 3)
                         .background(Color.secondary.opacity(0.12), in: Capsule())
                 }
 
-                Picker("Motor TTS", selection: $orchestrator.selectedTTSEngine) {
+                Picker("Motor TTS", selection: Binding(
+                    get: { identityManager.config.engineId },
+                    set: { identityManager.selectEngine($0) }
+                )) {
                     ForEach(VoiceTTSEngineKind.allCases) { eng in
                         Text(eng.displayName).tag(eng)
                     }
@@ -369,14 +407,29 @@ struct VoiceLaboratoryView: View {
                 }
 
                 HStack(spacing: 10) {
-                    Picker("Idioma do Teste", selection: $orchestrator.behavior.languageVariant) {
+                    Picker("Idioma", selection: Binding(
+                        get: { identityManager.config.language },
+                        set: { identityManager.selectLanguage($0) }
+                    )) {
                         ForEach(VoiceLanguageVariant.allCases) { lang in
                             Text(lang.displayName).tag(lang)
                         }
                     }
 
-                    if !matchingPresets.isEmpty {
-                        Picker("Voz Kokoro", selection: $orchestrator.selectedKokoroPreset) {
+                    if orchestrator.selectActiveTTSProvider().providerID == orchestrator.supertonicTTS.providerID {
+                        Picker("Voz Supertonic-3", selection: Binding(
+                            get: { orchestrator.selectedSupertonicPreset },
+                            set: { identityManager.selectSpeaker($0.rawValue) }
+                        )) {
+                            ForEach(SupertonicVoicePreset.allCases) { preset in
+                                Text(preset.displayName).tag(preset)
+                            }
+                        }
+                    } else if !matchingPresets.isEmpty {
+                        Picker("Voz Kokoro", selection: Binding(
+                            get: { orchestrator.effectiveKokoroPreset(for: orchestrator.behavior.languageVariant) },
+                            set: { identityManager.selectSpeaker($0.rawValue) }
+                        )) {
                             ForEach(matchingPresets) { preset in
                                 Text(preset.displayName).tag(preset)
                             }
@@ -385,64 +438,131 @@ struct VoiceLaboratoryView: View {
                 }
 
                 if orchestrator.behavior.languageVariant == .portuguesePT &&
-                    (orchestrator.selectedTTSEngine == .kokoro82M || orchestrator.selectedTTSEngine == .autoLocal) {
+                    orchestrator.selectedTTSEngine == .kokoro82M {
                     Label(
-                        "Honestidade linguística: Kokoro-82M não possui fonetização pt-PT nativa (seu código 'p' gera pt-BR). Use Apple Voz Natural para pt-PT.",
+                        "Honestidade linguística: Kokoro-82M não possui fonetização pt-PT nativa (apenas pt-BR). Use Supertonic-3 ou Apple Voz Natural para pt-PT.",
                         systemImage: "info.circle.fill"
                     )
                     .font(.system(size: 11))
                     .foregroundStyle(.orange)
                 }
 
-                if orchestrator.selectedTTSEngine.supportsSpeedControl {
+                // Voice Design Controls strictly gated by real active engine capabilities
+                let designCaps = EngineProsodyCapabilities.forEngine(
+                    orchestrator.selectedTTSEngine,
+                    isKokoroActive: orchestrator.selectActiveTTSProvider().providerID == orchestrator.kokoroTTS.providerID,
+                    isSupertonicActive: orchestrator.selectActiveTTSProvider().providerID == orchestrator.supertonicTTS.providerID
+                )
+
+                if designCaps.supportsRateControl {
                     HStack {
                         Text("Velocidade Real (\(String(format: "%.2f×", orchestrator.behavior.speechRate)))")
                             .font(.system(size: 11.5))
                         Slider(value: $orchestrator.behavior.speechRate, in: 0.75...1.30, step: 0.05)
                             .tint(WisdTheme.accent)
                     }
-                } else {
-                    Text("Controles avançados de cadência/emoção estão ocultos porque este adaptador não os suporta nativamente neste dispositivo.")
+                }
+                if designCaps.supportsFlowMatchingSteps {
+                    HStack {
+                        Text("Passos Flow Matching Supertonic (\(identityManager.config.design.flowMatchingSteps) passos · qualidade × velocidade)")
+                            .font(.system(size: 11.5))
+                        Slider(
+                            value: Binding(
+                                get: { Double(identityManager.config.design.flowMatchingSteps) },
+                                set: { val in
+                                    identityManager.updateConfig(invalidateCache: true) { cfg in
+                                        cfg.design.flowMatchingSteps = Int(val.rounded())
+                                    }
+                                }
+                            ),
+                            in: 4...12,
+                            step: 1
+                        )
+                        .tint(WisdTheme.accent)
+                    }
+                }
+                if !designCaps.supportsPitchModulation && !designCaps.supportsNativeAudioTags {
+                    Text("Controles honestos: timbre e entonação vêm dos vetores neurais nativos do speaker; ajustes falsos de pitch/emoção permanecem ocultos para este motor.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(DesktopStyle.muted)
                 }
+
+                Divider()
+
+                // Section C: Voz Efetiva (Solicitada vs Configurada vs Carregada vs Inferida)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("3C. Voz Efetiva em Execução (Diagnóstico em Tempo Real)")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Solicitada: \(identityManager.requestedSnapshot.summary)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                    Text("Configurada: \(identityManager.configuredSnapshot.summary)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(WisdTheme.softAccentText)
+                    let loadedSnap = identityManager.loadedSnapshot
+                    Text("Carregada em RAM: \(loadedSnap.isLoaded ? "\(loadedSnap.modelId) @ \(loadedSnap.sampleRateHz)Hz (\(loadedSnap.loadedSpeakerCount) vozes)" : "Sob demanda (ainda não carregada)")")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(DesktopStyle.muted)
+                    let infSnap = identityManager.inferredSnapshot
+                    let f0Text = infSnap.estimatedF0Hz.map { String(format: " · F0=%.0f Hz", $0) } ?? ""
+                    let sidText = infSnap.actualNumericSID.map { " sid=\($0)" } ?? ""
+                    Text("Última Inferência Real: \(infSnap.actualEngineId) · \(infSnap.actualSpeakerId)\(sidText) · \(infSnap.actualSampleRateHz)Hz\(f0Text)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(infSnap.fallbackOccurred ? .orange : .green)
+                    if let divAlert = identityManager.divergenceAlert {
+                        Label(divAlert, systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DesktopStyle.surface.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
 
                 TextField("Texto para prévia e comparação de áudio…", text: $sampleText)
                     .textFieldStyle(.roundedBorder)
 
                 HStack(spacing: 8) {
-                    Button(isSynthesizingSample ? "Sintetizando…" : "Ouvir Motor Selecionado") {
-                        synthesizeSample(using: orchestrator.selectedTTSEngine)
+                    Button(isSynthesizingSample ? "Sintetizando…" : "Aplicar e testar voz") {
+                        applyAndTestConfiguredVoice()
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(isSynthesizingSample || sampleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                    if orchestrator.behavior.languageVariant == .portugueseBR && orchestrator.kokoroTTS.isReadyOnDisk {
-                        Button("Ouvir pf_dora") {
-                            synthesizePresetSample(.pfDora)
+                    if orchestrator.supertonicTTS.isReadyOnDisk {
+                        Button("JARVIS Barítono (M2)") {
+                            synthesizeSupertonicPresetSample(.m2)
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(isSynthesizingSample)
 
-                        Button("Ouvir pm_alex") {
+                        Button("JARVIS Articulado (M4)") {
+                            synthesizeSupertonicPresetSample(.m4)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isSynthesizingSample)
+                    }
+
+                    if orchestrator.behavior.languageVariant == .portugueseBR && orchestrator.kokoroTTS.isReadyOnDisk {
+                        Button("Kokoro pm_alex") {
                             synthesizePresetSample(.pmAlex)
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(isSynthesizingSample)
+
+                        Button("Kokoro pf_dora") {
+                            synthesizePresetSample(.pfDora)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isSynthesizingSample)
                     }
 
-                    Button("Comparar Kokoro vs Apple") {
+                    Button("Comparar Motores") {
                         runComparativeABTest()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(isSynthesizingSample)
-
-                    Button("Comparar V2 vs V3") {
-                        runV2vsV3BehaviorComparison()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -466,7 +586,13 @@ struct VoiceLaboratoryView: View {
 
                     Spacer()
 
-                    if !orchestrator.kokoroTTS.isReadyOnDisk {
+                    if !orchestrator.supertonicTTS.isReadyOnDisk {
+                        Button("Instalar Supertonic-3 (~123 MB)") {
+                            assetManager.requestDownloadConsent(for: VoiceModelCatalog.supertonic3Int8ModelID)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    } else if !orchestrator.kokoroTTS.isReadyOnDisk {
                         Button("Instalar Kokoro-82M INT8 (~135 MB)") {
                             assetManager.requestDownloadConsent(for: VoiceModelCatalog.kokoroInt8ModelID)
                         }
@@ -476,7 +602,7 @@ struct VoiceLaboratoryView: View {
                 }
 
                 if orchestrator.behavior.languageVariant == .portugueseBR {
-                    Text("Avaliação PT-BR ativa: pf_dora e pm_alex disponíveis para comparação A/B e uso imediato em sessão; seleção final permanece aberta até aprovação.")
+                    Text("Candidatos masculinos JARVIS disponíveis para escuta imediata (Supertonic-3 M2/M4 @ 44.1 kHz e Kokoro pm_alex/pm_santa @ 24 kHz); seleção definitiva permanece aberta até sua aprovação.")
                         .font(.system(size: 10.5))
                         .foregroundStyle(DesktopStyle.muted)
                 }
@@ -984,6 +1110,41 @@ struct VoiceLaboratoryView: View {
         }
     }
 
+    private func applyAndTestConfiguredVoice() {
+        isSynthesizingSample = true
+        comparisonSummary = nil
+        orchestrator.refreshConfiguredTruthSnapshot()
+        Task {
+            let text = sampleText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let res = await orchestrator.previewCurrentConfiguredVoice(
+                sampleText: text.isEmpty ? nil : text,
+                playAudio: true
+            )
+            sampleResultMessage = "Voz efetiva testada (\(res.engineUsed)): \(res.detail)"
+            lastGeneratedWAV = res.wavData
+            isSynthesizingSample = false
+        }
+    }
+
+    private func synthesizeSupertonicPresetSample(_ preset: SupertonicVoicePreset) {
+        isSynthesizingSample = true
+        comparisonSummary = nil
+        identityManager.selectSpeaker(preset.rawValue)
+        Task {
+            let res = await orchestrator.synthesizeAndPreviewVoiceSample(
+                text: sampleText,
+                ttsEngine: .supertonic3,
+                kokoroPreset: orchestrator.selectedKokoroPreset,
+                language: orchestrator.behavior.languageVariant,
+                playAudio: true,
+                supertonicPresetOverride: preset
+            )
+            sampleResultMessage = "Avaliação \(preset.rawValue): \(res.detail)"
+            lastGeneratedWAV = res.wavData
+            isSynthesizingSample = false
+        }
+    }
+
     private func synthesizeSample(using engine: VoiceTTSEngineKind) {
         isSynthesizingSample = true
         comparisonSummary = nil
@@ -1004,6 +1165,7 @@ struct VoiceLaboratoryView: View {
     private func synthesizePresetSample(_ preset: KokoroVoicePreset) {
         isSynthesizingSample = true
         comparisonSummary = nil
+        identityManager.selectSpeaker(preset.rawValue)
         Task {
             let res = await orchestrator.synthesizeAndPreviewVoiceSample(
                 text: sampleText,
@@ -1021,23 +1183,30 @@ struct VoiceLaboratoryView: View {
     private func runComparativeABTest() {
         isSynthesizingSample = true
         Task {
-            let kokoro = await orchestrator.synthesizeAndPreviewVoiceSample(
+            let sup = await orchestrator.synthesizeAndPreviewVoiceSample(
                 text: sampleText,
-                ttsEngine: .kokoro82M,
+                ttsEngine: .supertonic3,
                 kokoroPreset: orchestrator.selectedKokoroPreset,
                 language: orchestrator.behavior.languageVariant,
                 playAudio: true
+            )
+            let kokoro = await orchestrator.synthesizeAndPreviewVoiceSample(
+                text: sampleText,
+                ttsEngine: .kokoro82M,
+                kokoroPreset: orchestrator.effectiveKokoroPreset(for: orchestrator.behavior.languageVariant),
+                language: orchestrator.behavior.languageVariant,
+                playAudio: !sup.ok
             )
             let apple = await orchestrator.synthesizeAndPreviewVoiceSample(
                 text: sampleText,
                 ttsEngine: .appleNaturalPCM,
                 kokoroPreset: orchestrator.selectedKokoroPreset,
                 language: orchestrator.behavior.languageVariant,
-                playAudio: !kokoro.ok
+                playAudio: !sup.ok && !kokoro.ok
             )
-            lastGeneratedWAV = kokoro.wavData ?? apple.wavData
-            comparisonSummary = "Kokoro: \(kokoro.ok ? String(format: "%.0f ms", kokoro.synthMs) : kokoro.detail) | Apple Natural: \(apple.ok ? String(format: "%.0f ms", apple.synthMs) : apple.detail)"
-            sampleResultMessage = kokoro.ok ? "Reproduzindo Kokoro (\(kokoro.detail))." : "Comparação concluída usando Apple Natural."
+            lastGeneratedWAV = sup.wavData ?? kokoro.wavData ?? apple.wavData
+            comparisonSummary = "Supertonic-3: \(sup.ok ? String(format: "%.0f ms", sup.synthMs) : "indisp.") | Kokoro: \(kokoro.ok ? String(format: "%.0f ms", kokoro.synthMs) : kokoro.detail) | Apple: \(apple.ok ? String(format: "%.0f ms", apple.synthMs) : apple.detail)"
+            sampleResultMessage = sup.ok ? "Reproduzindo Supertonic-3 (\(sup.detail))." : (kokoro.ok ? "Reproduzindo Kokoro (\(kokoro.detail))." : "Comparação concluída usando Apple Natural.")
             isSynthesizingSample = false
         }
     }

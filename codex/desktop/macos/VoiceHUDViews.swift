@@ -262,7 +262,7 @@ struct VoiceHUDModalView: View {
                                     .font(.system(size: 18, weight: .semibold))
                                     .foregroundStyle(.white)
 
-                                Text("Voz: \(orchestrator.voiceIdentity.persona.displayName) · STT: \(orchestrator.resolvedPipeline.activeSTTName)")
+                                Text("Identidade: \(orchestrator.identityManager.configuredSnapshot.summary) · STT: \(orchestrator.resolvedPipeline.activeSTTName)")
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(Color.white.opacity(0.76))
 

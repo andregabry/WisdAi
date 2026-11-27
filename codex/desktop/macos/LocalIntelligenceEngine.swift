@@ -164,6 +164,9 @@ public enum LocalQueryComplexityAnalyzer {
         if lower.contains("encerrar voz") || lower.contains("desligar voz") || lower.contains("fechar assistente") {
             return .voiceControl(.stopVoiceSession)
         }
+        if lower.contains("fala em inglês britânico") || lower.contains("british english") || lower.contains("inglês britânico") {
+            return .voiceControl(.switchLanguage(.englishGB))
+        }
         if lower.contains("fala em inglês") || lower.contains("switch to english") || lower.contains("em inglês") {
             return .voiceControl(.switchLanguage(.englishUS))
         }
@@ -567,7 +570,7 @@ public final class LocalConversationalBrain: ObservableObject {
 
     private func deterministicNaturalFallback(for input: String, language: VoiceLanguageVariant, errorDetail: String? = nil) -> String {
         switch language {
-        case .englishUS:
+        case .englishGB, .englishUS:
             return "The local conversation model is unavailable right now. Please try again or explicitly ask me to consult an agent."
         case .spanishES:
             return "El modelo de conversación local no está disponible ahora mismo. Inténtalo de nuevo o pide que consulte a un agente."

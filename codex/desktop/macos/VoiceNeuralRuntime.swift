@@ -185,6 +185,59 @@ private let kokoroProgressTrampoline: SherpaProgressCallbackWithArg = { samplesP
     return ctx.cancelCheck() ? 0 : 1
 }
 
+private struct SherpaTtsFunctions {
+    let ortHandle: UnsafeMutableRawPointer?
+    let sherpaHandle: UnsafeMutableRawPointer
+    let createTts: FnCreateOfflineTts
+    let destroyTts: FnDestroyOfflineTts
+    let sampleRateFn: FnOfflineTtsSampleRate
+    let numSpeakersFn: FnOfflineTtsNumSpeakers
+    let genWithCfgFn: FnOfflineTtsGenerateWithConfig
+    let destroyAudioFn: FnDestroyGeneratedAudio
+}
+
+private enum SherpaDynamicBridge {
+    static func open(runtimeDir: URL) throws -> SherpaTtsFunctions {
+        let fm = FileManager.default
+        let libs = (try? fm.contentsOfDirectory(at: runtimeDir, includingPropertiesForKeys: nil)) ?? []
+        var ortHandle: UnsafeMutableRawPointer? = nil
+        if let ortURL = libs.first(where: { $0.lastPathComponent.hasPrefix("libonnxruntime") && $0.pathExtension == "dylib" }) {
+            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL)
+        }
+        let sherpaURL = runtimeDir.appendingPathComponent("libsherpa-onnx-c-api.dylib")
+        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL) else {
+            let err = dlerror().map { String(cString: $0) } ?? "dlopen falhou"
+            throw VoiceGatewayError.protocolError("Falha ao carregar libsherpa-onnx-c-api.dylib: \(err)")
+        }
+        func sym<T>(_ name: String) throws -> T {
+            guard let ptr = dlsym(sherpaHandle, name) else {
+                throw VoiceGatewayError.protocolError("Símbolo C ausente em libsherpa-onnx-c-api.dylib: \(name)")
+            }
+            return unsafeBitCast(ptr, to: T.self)
+        }
+        return SherpaTtsFunctions(
+            ortHandle: ortHandle,
+            sherpaHandle: sherpaHandle,
+            createTts: try sym("SherpaOnnxCreateOfflineTts"),
+            destroyTts: try sym("SherpaOnnxDestroyOfflineTts"),
+            sampleRateFn: try sym("SherpaOnnxOfflineTtsSampleRate"),
+            numSpeakersFn: try sym("SherpaOnnxOfflineTtsNumSpeakers"),
+            genWithCfgFn: try sym("SherpaOnnxOfflineTtsGenerateWithConfig"),
+            destroyAudioFn: try sym("SherpaOnnxDestroyOfflineTtsGeneratedAudio")
+        )
+    }
+}
+
+public struct NeuralSynthesisExecutionInfo: Equatable, Sendable {
+    public let engineID: String
+    public let modelID: String
+    public let speakerID: String
+    public let numericSID: Int32
+    public let langCode: String
+    public let sampleRateHz: Int
+    public let synthMs: Double
+}
+
 // MARK: - Kokoro-82M Neural Local TTS Provider (ONNX via sherpa-onnx C ABI)
 
 public struct KokoroEngineDiagnosticsSnapshot: Equatable, Sendable {
@@ -235,6 +288,7 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
     private var cancelledEpoch: UInt64 = 0
     private var lastIdleUnloadWorkItem: DispatchWorkItem?
     private var diagnosticsSnapshot: KokoroEngineDiagnosticsSnapshot = .idle
+    private var lastExecutionInfoSnapshot: NeuralSynthesisExecutionInfo?
 
     private let appSupportVoiceRoot: URL
 
@@ -268,6 +322,10 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         stateLock.withLock { diagnosticsSnapshot }
     }
 
+    public func lastExecutionInfo() -> NeuralSynthesisExecutionInfo? {
+        stateLock.withLock { lastExecutionInfoSnapshot }
+    }
+
     public func resolveInstalledPaths() -> (runtimeDir: URL, modelDir: URL, modelFile: URL, modelID: String)? {
         let fm = FileManager.default
         let rtRoot = appSupportVoiceRoot
@@ -297,6 +355,18 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         return nil
     }
 
+    public static func normalizeForEspeakG2P(_ text: String, langCode: String) -> String {
+        var out = text.replacingOccurrences(of: "…", with: "...")
+            .replacingOccurrences(of: "—", with: ", ")
+        if langCode == "pt-br" {
+            if let rx = try? NSRegularExpression(pattern: "\\bh+m+\\b", options: [.caseInsensitive]) {
+                let range = NSRange(out.startIndex..<out.endIndex, in: out)
+                out = rx.stringByReplacingMatches(in: out, range: range, withTemplate: "hum")
+            }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public static func resolvePreset(language: VoiceLanguageVariant, voicePreference: String) -> KokoroVoicePreset? {
         if language == .portuguesePT {
             return nil // Strictly honest: Kokoro "p" covers pt-BR only, NOT pt-PT
@@ -314,15 +384,18 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
                 return KokoroVoicePreset.defaultPreset(for: persona, language: language)
             }
         }
-        if cleaned.contains("mascul") || cleaned.contains("atlas") || cleaned.contains("alex") {
+        if cleaned.contains("jarvis") {
+            return KokoroVoicePreset.defaultPreset(for: .jarvis, language: language)
+        }
+        if cleaned.contains("mascul") || cleaned.contains("homem") || cleaned.contains("male") || cleaned.contains("atlas") || cleaned.contains("alex") {
             return KokoroVoicePreset.defaultPreset(for: .atlas, language: language)
         }
         return KokoroVoicePreset.defaultPreset(for: .aurora, language: language)
     }
 
     public func preload(language: VoiceLanguageVariant = .portugueseBR) async throws -> KokoroEngineDiagnosticsSnapshot {
-        guard let preset = Self.resolvePreset(language: language, voicePreference: "persona:aurora") else {
-            throw VoiceGatewayError.protocolError("Kokoro-82M suporta apenas PT-BR, EN-US e ES-ES (não suporta pt-PT nativo).")
+        guard let preset = Self.resolvePreset(language: language, voicePreference: "persona:jarvis") ?? KokoroVoicePreset.defaultPreset(for: .jarvis, language: language) else {
+            throw VoiceGatewayError.protocolError("Kokoro-82M suporta apenas PT-BR, EN-GB, EN-US e ES-ES (não suporta pt-PT nativo).")
         }
         return try await withCheckedThrowingContinuation { continuation in
             synthQueue.async {
@@ -350,36 +423,14 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
 
         let t0 = DispatchTime.now().uptimeNanoseconds
         let fm = FileManager.default
-        let libs = (try? fm.contentsOfDirectory(at: paths.runtimeDir, includingPropertiesForKeys: nil)) ?? []
-        var ortHandle: UnsafeMutableRawPointer? = nil
-        if let ortURL = libs.first(where: { $0.lastPathComponent.hasPrefix("libonnxruntime") && $0.pathExtension == "dylib" }) {
-            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL)
-        }
-        let sherpaURL = paths.runtimeDir.appendingPathComponent("libsherpa-onnx-c-api.dylib")
-        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL) else {
-            let err = dlerror().map { String(cString: $0) } ?? "dlopen falhou"
-            throw VoiceGatewayError.protocolError("Falha ao carregar libsherpa-onnx-c-api.dylib: \(err)")
-        }
-
-        func resolveSymbol<T>(_ name: String) throws -> T {
-            guard let ptr = dlsym(sherpaHandle, name) else {
-                throw VoiceGatewayError.protocolError("Símbolo C ausente em libsherpa-onnx-c-api.dylib: \(name)")
-            }
-            return unsafeBitCast(ptr, to: T.self)
-        }
-
-        let createFn: FnCreateOfflineTts = try resolveSymbol("SherpaOnnxCreateOfflineTts")
-        let destroyFn: FnDestroyOfflineTts = try resolveSymbol("SherpaOnnxDestroyOfflineTts")
-        let srFn: FnOfflineTtsSampleRate = try resolveSymbol("SherpaOnnxOfflineTtsSampleRate")
-        let spkFn: FnOfflineTtsNumSpeakers = try resolveSymbol("SherpaOnnxOfflineTtsNumSpeakers")
-        let genCfgFn: FnOfflineTtsGenerateWithConfig = try resolveSymbol("SherpaOnnxOfflineTtsGenerateWithConfig")
-        let destroyAudioFn: FnDestroyGeneratedAudio = try resolveSymbol("SherpaOnnxDestroyOfflineTtsGeneratedAudio")
+        let fns = try SherpaDynamicBridge.open(runtimeDir: paths.runtimeDir)
 
         let arena = CStringArena()
         let voicesPath = paths.modelDir.appendingPathComponent("voices.bin").path
         let tokensPath = paths.modelDir.appendingPathComponent("tokens.txt").path
         let dataDirPath = paths.modelDir.appendingPathComponent("espeak-ng-data").path
         let lexiconUS = paths.modelDir.appendingPathComponent("lexicon-us-en.txt")
+        let lexiconGB = paths.modelDir.appendingPathComponent("lexicon-gb-en.txt")
 
         var config = SherpaOfflineTtsConfigC()
         config.model.num_threads = 4
@@ -391,6 +442,8 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         config.model.kokoro.data_dir = arena.cString(dataDirPath)
         if langCode == "en-us" && fm.fileExists(atPath: lexiconUS.path) {
             config.model.kokoro.lexicon = arena.cString(lexiconUS.path)
+        } else if langCode == "en-GB-x-rp" && fm.fileExists(atPath: lexiconGB.path) {
+            config.model.kokoro.lexicon = arena.cString(lexiconGB.path)
         }
         config.model.kokoro.length_scale = 1.0
         config.model.kokoro.lang = arena.cString(langCode)
@@ -398,24 +451,24 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         config.silence_scale = 0.2
 
         let ttsPtr = withUnsafePointer(to: &config) { ptr in
-            createFn(ptr)
+            fns.createTts(ptr)
         }
         guard let ttsPtr else {
             throw VoiceGatewayError.protocolError("SherpaOnnxCreateOfflineTts retornou NULL para modelo \(paths.modelID) (lang=\(langCode)).")
         }
 
-        let sr = Int(srFn(ttsPtr))
-        let spk = Int(spkFn(ttsPtr))
+        let sr = Int(fns.sampleRateFn(ttsPtr))
+        let spk = Int(fns.numSpeakersFn(ttsPtr))
         let loadMs = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
         let handles = LoadedHandles(
-            ortHandle: ortHandle,
-            sherpaHandle: sherpaHandle,
-            createTts: createFn,
-            destroyTts: destroyFn,
-            sampleRateFn: srFn,
-            numSpeakersFn: spkFn,
-            generateWithConfigFn: genCfgFn,
-            destroyAudioFn: destroyAudioFn,
+            ortHandle: fns.ortHandle,
+            sherpaHandle: fns.sherpaHandle,
+            createTts: fns.createTts,
+            destroyTts: fns.destroyTts,
+            sampleRateFn: fns.sampleRateFn,
+            numSpeakersFn: fns.numSpeakersFn,
+            generateWithConfigFn: fns.genWithCfgFn,
+            destroyAudioFn: fns.destroyAudioFn,
             ttsPointer: ttsPtr,
             modelID: paths.modelID,
             langCode: langCode,
@@ -494,11 +547,14 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         silenceScale: Float,
         onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
     ) async throws {
-        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
         guard let preset = Self.resolvePreset(language: language, voicePreference: voicePreference) else {
-            throw VoiceGatewayError.protocolError("Kokoro-82M suporta apenas PT-BR, EN-US e ES-ES (não suporta pt-PT nativo).")
+            throw VoiceGatewayError.protocolError("Kokoro-82M suporta apenas PT-BR, EN-GB, EN-US e ES-ES (não suporta pt-PT nativo).")
         }
+        let clean = Self.normalizeForEspeakG2P(
+            text.trimmingCharacters(in: .whitespacesAndNewlines),
+            langCode: preset.kokoroLangCode
+        )
+        guard !clean.isEmpty else { return }
 
         let startEpoch = stateLock.withLock { cancelledEpoch }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -589,9 +645,19 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
                     }
 
                     let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+                    let execInfo = NeuralSynthesisExecutionInfo(
+                        engineID: self.providerID,
+                        modelID: handles.modelID,
+                        speakerID: preset.rawValue,
+                        numericSID: preset.speakerID,
+                        langCode: handles.langCode,
+                        sampleRateHz: handles.sampleRate,
+                        synthMs: elapsedMs
+                    )
                     self.stateLock.withLock {
                         self.diagnosticsSnapshot.lastSynthesisMs = elapsedMs
                         self.diagnosticsSnapshot.lastError = nil
+                        self.lastExecutionInfoSnapshot = execInfo
                     }
                     self.scheduleIdleUnload()
                     continuation.resume()
@@ -637,6 +703,405 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
         stateLock.withLock {
             cancelledEpoch &+= 1
         }
+    }
+}
+
+// MARK: - Supertonic-3 Flow Matching Neural TTS Provider (ONNX 44.1 kHz via sherpa-onnx C ABI)
+
+public final class SupertonicNeuralTTSProvider: StreamingTextToSpeechProvider, @unchecked Sendable {
+    public let providerID = "supertonic_3_local_onnx"
+    public let requiresPaidOptIn = false
+
+    private struct LoadedSupertonicHandles {
+        let fns: SherpaTtsFunctions
+        let ttsPointer: OpaquePointer
+        let modelID: String
+        let sampleRate: Int
+        let numSpeakers: Int
+    }
+
+    private let synthQueue = DispatchQueue(label: "local.wisdai.voice.supertonic3", qos: .userInitiated)
+    private let stateLock = NSLock()
+    private var loaded: LoadedSupertonicHandles?
+    private var cancelledEpoch: UInt64 = 0
+    private var lastIdleUnloadWorkItem: DispatchWorkItem?
+    private var defaultFlowSteps: Int = 8
+    private var diagnosticsSnapshot: KokoroEngineDiagnosticsSnapshot = KokoroEngineDiagnosticsSnapshot(
+        isLoaded: false,
+        activeModelID: nil,
+        loadedLangCode: nil,
+        loadLatencyMs: nil,
+        lastSynthesisMs: nil,
+        sampleRateHz: 44_100,
+        numSpeakers: 0,
+        lastError: nil
+    )
+    private var lastExecutionInfoSnapshot: NeuralSynthesisExecutionInfo?
+    private let appSupportVoiceRoot: URL
+
+    public init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        self.appSupportVoiceRoot = appSupport.appendingPathComponent("WisdAI/Voice", isDirectory: true)
+    }
+
+    deinit {
+        lastIdleUnloadWorkItem?.cancel()
+        lastIdleUnloadWorkItem = nil
+        let old = stateLock.withLock { () -> LoadedSupertonicHandles? in
+            let current = loaded
+            loaded = nil
+            diagnosticsSnapshot.isLoaded = false
+            return current
+        }
+        if let old {
+            synthQueue.async { old.fns.destroyTts(old.ttsPointer) }
+        }
+    }
+
+    public func setDefaultFlowMatchingSteps(_ steps: Int) {
+        stateLock.withLock { defaultFlowSteps = min(12, max(4, steps)) }
+    }
+
+    public var isReadyOnDisk: Bool {
+        resolveInstalledPaths() != nil
+    }
+
+    public func currentDiagnostics() -> KokoroEngineDiagnosticsSnapshot {
+        stateLock.withLock { diagnosticsSnapshot }
+    }
+
+    public func lastExecutionInfo() -> NeuralSynthesisExecutionInfo? {
+        stateLock.withLock { lastExecutionInfoSnapshot }
+    }
+
+    public func resolveInstalledPaths() -> (runtimeDir: URL, modelDir: URL, modelID: String)? {
+        let fm = FileManager.default
+        let rtRoot = appSupportVoiceRoot
+            .appendingPathComponent("Runtimes/\(VoiceModelCatalog.sherpaRuntimeID)/sherpa-onnx-v1.13.8-osx-arm64-shared-lib/lib", isDirectory: true)
+        guard fm.fileExists(atPath: rtRoot.appendingPathComponent("libsherpa-onnx-c-api.dylib").path) else {
+            return nil
+        }
+        let modelDir = appSupportVoiceRoot
+            .appendingPathComponent("Models/\(VoiceModelCatalog.supertonic3Int8ModelID)/sherpa-onnx-supertonic-3-tts-int8-2026-05-11", isDirectory: true)
+        let requiredFiles = [
+            "duration_predictor.int8.onnx",
+            "text_encoder.int8.onnx",
+            "vector_estimator.int8.onnx",
+            "vocoder.int8.onnx",
+            "tts.json",
+            "unicode_indexer.bin",
+            "voice.bin"
+        ]
+        for file in requiredFiles {
+            if !fm.fileExists(atPath: modelDir.appendingPathComponent(file).path) {
+                return nil
+            }
+        }
+        return (rtRoot, modelDir, VoiceModelCatalog.supertonic3Int8ModelID)
+    }
+
+    public static func normalizeForSupertonic(_ text: String, langTag: String) -> String {
+        var out = text.replacingOccurrences(of: "…", with: ", ")
+            .replacingOccurrences(of: "...", with: ", ")
+            .replacingOccurrences(of: "—", with: ", ")
+            .replacingOccurrences(of: "–", with: ", ")
+        if langTag == "pt" {
+            if let rx = try? NSRegularExpression(pattern: "\\bh+m+\\b", options: [.caseInsensitive]) {
+                let range = NSRange(out.startIndex..<out.endIndex, in: out)
+                out = rx.stringByReplacingMatches(in: out, range: range, withTemplate: "Hum")
+            }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func resolvePreset(voicePreference: String) -> SupertonicVoicePreset {
+        let cleaned = voicePreference.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let exact = SupertonicVoicePreset.from(identifier: cleaned) {
+            return exact
+        }
+        if cleaned.hasPrefix("persona:") {
+            let rawPersona = String(cleaned.dropFirst("persona:".count))
+            if let persona = WisdVoicePersona(rawValue: rawPersona) {
+                return SupertonicVoicePreset.defaultPreset(for: persona)
+            }
+        }
+        if cleaned.contains("jarvis") { return .m2 }
+        if cleaned.contains("atlas") || cleaned.contains("pm_santa") || cleaned.contains("bm_lewis") { return .m5 }
+        if cleaned.contains("pm_alex") || cleaned.contains("bm_") || cleaned.contains("am_") || cleaned.contains("male") || cleaned.contains("homem") {
+            return .m4
+        }
+        if cleaned.contains("aria") { return .f4 }
+        return .f1
+    }
+
+    public func preload() async throws -> KokoroEngineDiagnosticsSnapshot {
+        try await withCheckedThrowingContinuation { continuation in
+            synthQueue.async {
+                do {
+                    _ = try self.ensureLoadedSync()
+                    continuation.resume(returning: self.currentDiagnostics())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func ensureLoadedSync() throws -> LoadedSupertonicHandles {
+        if let existing = stateLock.withLock({ loaded }) {
+            scheduleIdleUnload()
+            return existing
+        }
+        guard let paths = resolveInstalledPaths() else {
+            throw VoiceGatewayError.protocolError("Pesos Supertonic-3 ou runtime sherpa-onnx não instalados em Application Support.")
+        }
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let fns = try SherpaDynamicBridge.open(runtimeDir: paths.runtimeDir)
+        let arena = CStringArena()
+        var config = SherpaOfflineTtsConfigC()
+        config.model.num_threads = 4
+        config.model.debug = 0
+        config.model.provider = arena.cString("cpu")
+        config.model.supertonic.duration_predictor = arena.cString(paths.modelDir.appendingPathComponent("duration_predictor.int8.onnx").path)
+        config.model.supertonic.text_encoder = arena.cString(paths.modelDir.appendingPathComponent("text_encoder.int8.onnx").path)
+        config.model.supertonic.vector_estimator = arena.cString(paths.modelDir.appendingPathComponent("vector_estimator.int8.onnx").path)
+        config.model.supertonic.vocoder = arena.cString(paths.modelDir.appendingPathComponent("vocoder.int8.onnx").path)
+        config.model.supertonic.tts_json = arena.cString(paths.modelDir.appendingPathComponent("tts.json").path)
+        config.model.supertonic.unicode_indexer = arena.cString(paths.modelDir.appendingPathComponent("unicode_indexer.bin").path)
+        config.model.supertonic.voice_style = arena.cString(paths.modelDir.appendingPathComponent("voice.bin").path)
+        config.max_num_sentences = 1
+        config.silence_scale = 0.2
+
+        let ttsPtr = withUnsafePointer(to: &config) { fns.createTts($0) }
+        guard let ttsPtr else {
+            throw VoiceGatewayError.protocolError("SherpaOnnxCreateOfflineTts retornou NULL para Supertonic-3.")
+        }
+        let sr = Int(fns.sampleRateFn(ttsPtr))
+        let spk = Int(fns.numSpeakersFn(ttsPtr))
+        let loadMs = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+        let h = LoadedSupertonicHandles(
+            fns: fns,
+            ttsPointer: ttsPtr,
+            modelID: paths.modelID,
+            sampleRate: sr > 0 ? sr : 44_100,
+            numSpeakers: spk
+        )
+        stateLock.withLock {
+            loaded = h
+            diagnosticsSnapshot = KokoroEngineDiagnosticsSnapshot(
+                isLoaded: true,
+                activeModelID: paths.modelID,
+                loadedLangCode: "multilang(31)",
+                loadLatencyMs: loadMs,
+                lastSynthesisMs: diagnosticsSnapshot.lastSynthesisMs,
+                sampleRateHz: h.sampleRate,
+                numSpeakers: spk,
+                lastError: nil
+            )
+        }
+        scheduleIdleUnload()
+        return h
+    }
+
+    public func unload() {
+        synthQueue.async { [weak self] in self?.unloadSync() }
+    }
+
+    private func unloadSync() {
+        lastIdleUnloadWorkItem?.cancel()
+        lastIdleUnloadWorkItem = nil
+        let old = stateLock.withLock { () -> LoadedSupertonicHandles? in
+            let cur = loaded
+            loaded = nil
+            diagnosticsSnapshot.isLoaded = false
+            return cur
+        }
+        if let old { old.fns.destroyTts(old.ttsPointer) }
+    }
+
+    private func scheduleIdleUnload() {
+        lastIdleUnloadWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.unloadSync() }
+        lastIdleUnloadWorkItem = work
+        synthQueue.asyncAfter(deadline: .now() + 240.0, execute: work)
+    }
+
+    public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
+        let steps = stateLock.withLock { defaultFlowSteps }
+        try await synthesizeChunk(
+            text,
+            language: language,
+            voicePreference: voicePreference,
+            rate: rate,
+            silenceScale: 0.20,
+            flowSteps: steps,
+            targetSampleRate: 24_000,
+            onAudioFloats: onAudioFloats24k
+        )
+    }
+
+    public func synthesizeChunk(
+        _ text: String,
+        language: VoiceLanguageVariant,
+        voicePreference: String,
+        rate: Float,
+        silenceScale: Float,
+        flowSteps: Int,
+        targetSampleRate: Int = 24_000,
+        onAudioFloats: @escaping @Sendable ([Float], String) -> Void
+    ) async throws {
+        let preset = Self.resolvePreset(voicePreference: voicePreference)
+        let langTag = preset.supertonicLangCode(for: language)
+        let clean = Self.normalizeForSupertonic(
+            text.trimmingCharacters(in: .whitespacesAndNewlines),
+            langTag: langTag
+        )
+        guard !clean.isEmpty else { return }
+        let startEpoch = stateLock.withLock { cancelledEpoch }
+        let clampedSteps = Int32(min(12, max(4, flowSteps)))
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            synthQueue.async { [weak self] in
+                guard let self else { continuation.resume(); return }
+                do {
+                    guard !Task.isCancelled, self.stateLock.withLock({ self.cancelledEpoch == startEpoch }) else {
+                        continuation.resume()
+                        return
+                    }
+                    let handles = try self.ensureLoadedSync()
+                    let t0 = DispatchTime.now().uptimeNanoseconds
+
+                    let arena = CStringArena()
+                    guard let cText = arena.cString(clean),
+                          let cExtra = arena.cString("{\"lang\":\"\(langTag)\"}") else {
+                        throw VoiceGatewayError.protocolError("Falha ao alocar parâmetros UTF-8 do Supertonic-3.")
+                    }
+
+                    var genCfg = SherpaGenerationConfigC()
+                    genCfg.silence_scale = min(0.60, max(0.10, silenceScale))
+                    genCfg.speed = min(1.30, max(0.75, rate))
+                    genCfg.sid = preset.speakerID
+                    genCfg.num_steps = clampedSteps
+                    genCfg.extra = cExtra
+
+                    final class SupertonicLabelState: @unchecked Sendable {
+                        private let lock = NSLock()
+                        private var labelled = false
+                        private let text: String
+                        init(text: String) { self.text = text }
+                        func claimLabel() -> String {
+                            lock.withLock {
+                                guard !labelled else { return "" }
+                                labelled = true
+                                return text
+                            }
+                        }
+                    }
+                    let labelState = SupertonicLabelState(text: clean)
+                    let ctx = KokoroGenerationContext(
+                        sampleRate: handles.sampleRate,
+                        cancelCheck: { self.stateLock.withLock { self.cancelledEpoch != startEpoch } },
+                        chunkHandler: { rawSamples, sr in
+                            let converted = (sr != targetSampleRate)
+                                ? AudioPCMConverter.resampleHighQuality(samples: rawSamples, fromSampleRate: Double(sr), toSampleRate: Double(targetSampleRate))
+                                : rawSamples
+                            guard !converted.isEmpty else { return }
+                            onAudioFloats(converted, labelState.claimLabel())
+                        }
+                    )
+
+                    let audioPtr = withUnsafePointer(to: &genCfg) { cfgPtr in
+                        handles.fns.genWithCfgFn(
+                            handles.ttsPointer,
+                            cText,
+                            cfgPtr,
+                            kokoroProgressTrampoline,
+                            Unmanaged.passUnretained(ctx).toOpaque()
+                        )
+                    }
+                    if let audioPtr {
+                        defer { handles.fns.destroyAudioFn(audioPtr) }
+                        let cancelled = self.stateLock.withLock { self.cancelledEpoch != startEpoch }
+                        if !cancelled && ctx.streamedSamplesCount == 0 {
+                            let audio = audioPtr.assumingMemoryBound(to: SherpaGeneratedAudioC.self).pointee
+                            if audio.n > 0, let ptr = audio.samples {
+                                let raw = Array(UnsafeBufferPointer(start: ptr, count: Int(audio.n)))
+                                let sr = audio.sample_rate > 0 ? Int(audio.sample_rate) : handles.sampleRate
+                                let out = (sr != targetSampleRate)
+                                    ? AudioPCMConverter.resampleHighQuality(samples: raw, fromSampleRate: Double(sr), toSampleRate: Double(targetSampleRate))
+                                    : raw
+                                if !out.isEmpty { onAudioFloats(out, clean) }
+                            }
+                        }
+                    }
+
+                    let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+                    let execInfo = NeuralSynthesisExecutionInfo(
+                        engineID: self.providerID,
+                        modelID: handles.modelID,
+                        speakerID: preset.rawValue,
+                        numericSID: preset.speakerID,
+                        langCode: langTag,
+                        sampleRateHz: targetSampleRate,
+                        synthMs: elapsedMs
+                    )
+                    self.stateLock.withLock {
+                        self.diagnosticsSnapshot.lastSynthesisMs = elapsedMs
+                        self.diagnosticsSnapshot.loadedLangCode = langTag
+                        self.diagnosticsSnapshot.lastError = nil
+                        self.lastExecutionInfoSnapshot = execInfo
+                    }
+                    self.scheduleIdleUnload()
+                    continuation.resume()
+                } catch {
+                    self.stateLock.withLock { self.diagnosticsSnapshot.lastError = error.localizedDescription }
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func synthesizeStandaloneSamples(
+        text: String,
+        language: VoiceLanguageVariant,
+        preset: SupertonicVoicePreset,
+        rate: Float = 0.98,
+        flowSteps: Int = 8,
+        silenceScale: Float = 0.20,
+        targetSampleRate: Int = 44_100
+    ) async throws -> (samples: [Float], sampleRate: Int, synthMs: Double) {
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var samples: [Float] = []
+            func append(_ c: [Float]) { lock.withLock { samples.append(contentsOf: c) } }
+            func snap() -> [Float] { lock.withLock { samples } }
+        }
+        let box = Box()
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        try await synthesizeChunk(
+            text,
+            language: language,
+            voicePreference: preset.rawValue,
+            rate: rate,
+            silenceScale: silenceScale,
+            flowSteps: flowSteps,
+            targetSampleRate: targetSampleRate
+        ) { floats, _ in
+            box.append(floats)
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1_000_000.0
+        return (box.snap(), targetSampleRate, elapsed)
+    }
+
+    public func cancelAll() {
+        stateLock.withLock { cancelledEpoch &+= 1 }
     }
 }
 
@@ -1184,6 +1649,8 @@ public final class SherpaVitsPiperTTSProvider: StreamingTextToSpeechProvider, @u
                 return ["vits-piper-pt_PT-tugao-medium", "vits-piper-pt_PT-dii-high", "vits-piper-pt_PT-miro-high"]
             case .portugueseBR:
                 return ["vits-piper-pt_BR-faber-medium", "vits-piper-pt_BR-cadu-medium", "vits-piper-pt_BR-edresson-low"]
+            case .englishGB:
+                return ["vits-piper-en_GB-alan-medium", "vits-piper-en_GB-southern_english_male-medium", "vits-piper-en_GB-cori-medium"]
             case .englishUS:
                 return ["vits-piper-en_US-lessac-medium", "vits-piper-en_US-amy-medium"]
             case .spanishES:
@@ -1241,7 +1708,10 @@ public final class SherpaVitsPiperTTSProvider: StreamingTextToSpeechProvider, @u
         silenceScale: Float,
         onAudioFloats24k: @escaping @Sendable ([Float], String) -> Void
     ) async throws {
-        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = KokoroNeuralTTSProvider.normalizeForEspeakG2P(
+            text.trimmingCharacters(in: .whitespacesAndNewlines),
+            langCode: language.rawValue.lowercased()
+        )
         guard !clean.isEmpty else { return }
         let startEpoch = lock.withLock { cancelledEpoch }
 

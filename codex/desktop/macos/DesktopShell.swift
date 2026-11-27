@@ -1256,13 +1256,26 @@ struct DesktopView: View {
                     .accessibilityLabel(workspace.voice.isVoiceModeActive ? "Encerrar conversa por voz" : (workspace.messages.isEmpty ? "Iniciar novo chat por voz" : "Iniciar conversa por voz"))
                     .help(workspace.messages.isEmpty ? "Iniciar novo chat por voz · Clique direito para ajustar voz" : "Iniciar conversa por voz · Clique direito para ajustar voz")
                     .contextMenu {
+                        ForEach(WisdVoicePersona.allCases) { persona in
+                            let active = workspace.voice.orchestrator.identityManager.config.identityId == persona
+                            Button {
+                                workspace.voice.selectedVoiceID = "auto"
+                                workspace.voice.orchestrator.identityManager.selectPersona(persona)
+                            } label: {
+                                Label(
+                                    "Identidade: \(persona.shortName)\(active ? " ✓" : "")",
+                                    systemImage: persona.recommendedTimbre == .male ? "person.wave.2" : "person.wave.2.fill"
+                                )
+                            }
+                        }
+                        Divider()
                         ForEach(AgentVoiceGender.allCases) { gender in
                             Button {
                                 workspace.voice.selectedVoiceID = "auto"
                                 workspace.voice.voiceGender = gender
                             } label: {
                                 Label(
-                                    "Voz: \(gender.displayName)\(workspace.voice.voiceGender == gender ? " ✓" : "")",
+                                    "Timbre: \(gender.displayName)\(workspace.voice.voiceGender == gender ? " ✓" : "")",
                                     systemImage: gender.iconName
                                 )
                             }
@@ -3807,7 +3820,7 @@ private struct InlineVoiceBarView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(statusAccent)
 
-                    Text("· \(voice.orchestrator.voiceIdentity.persona.displayName)")
+                    Text("· \(voice.orchestrator.voiceIdentity.persona.shortName) · \(voice.orchestrator.identityManager.configuredSnapshot.speakerId)")
                         .font(.system(size: 10.5))
                         .foregroundStyle(DesktopStyle.muted)
                         .lineLimit(1)

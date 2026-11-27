@@ -101,7 +101,20 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         didSet {
             behavior.save()
             customPronunciation = TechnicalPronunciationDictionary.defaults(for: behavior.languageVariant)
-            syncVocalizationCacheContext(prewarmIfSessionActive: false)
+            if !isApplyingIdentityManagerUpdate {
+                let b = behavior
+                identityManager.updateConfig(invalidateCache: true) { cfg in
+                    cfg.language = b.languageVariant
+                    cfg.speechRate = Double(b.speechRate)
+                    cfg.personalityId = b.personality
+                    cfg.design.expressivity = b.expressivity
+                    cfg.design.formality = b.formality
+                    cfg.design.detailLevel = b.detailLevel
+                    cfg.design.pauseScale = b.pauseScale
+                    cfg.design.warmth = cfg.identityId.recommendedTimbre == .male ? 0.72 : 0.80
+                }
+            }
+            syncVocalizationCacheContext(prewarmIfSessionActive: isVoiceSessionActive)
         }
     }
     @Published public var routing: VoiceRoleRoutingConfig {
@@ -139,6 +152,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     @Published public var selectedVoiceIdentifier: String = UserDefaults.standard.string(forKey: "wisdai.voice.preferredVoiceID") ?? "auto" {
         didSet {
             UserDefaults.standard.set(selectedVoiceIdentifier, forKey: "wisdai.voice.preferredVoiceID")
+            if !isApplyingIdentityManagerUpdate && selectedVoiceIdentifier != "auto" {
+                let rawID = selectedVoiceIdentifier
+                identityManager.selectSpeaker(rawID)
+            }
             syncVocalizationCacheContext(prewarmIfSessionActive: false)
         }
     }
@@ -151,47 +168,35 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 voiceIdentity.warmth = personality.conversationalWarmth
                 isSyncingIdentityWarmth = false
             }
-            if let data = try? JSONEncoder().encode(voiceIdentity) {
-                UserDefaults.standard.set(data, forKey: "wisdai.voice.identity.v1")
+            if !isApplyingIdentityManagerUpdate {
+                identityManager.selectPersona(voiceIdentity.persona)
             }
-            hasExplicitKokoroPresetOverride = false
-            if let synced = KokoroVoicePreset.defaultPreset(for: voiceIdentity.persona, language: behavior.languageVariant) {
-                isSyncingKokoroFromPersona = true
-                selectedKokoroPreset = synced
-                isSyncingKokoroFromPersona = false
-            }
-            syncVocalizationCacheContext(prewarmIfSessionActive: false)
-            VoiceTTSWarmupCoordinator.warmupInBackground(
-                provider: appleTTS,
-                language: behavior.languageVariant,
-                voicePreference: effectiveTTSVoicePreference()
-            )
         }
     }
     @Published public private(set) var brainStatus: LocalBrainBackendStatus = .compactHeuristicFallback
     @Published public private(set) var hasLocalTTSWarmedUp: Bool = false
-    @Published public var selectedTTSEngine: VoiceTTSEngineKind = VoiceTTSEngineKind(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.ttsEngineKind") ?? "") ?? .autoLocal {
+    @Published public var selectedTTSEngine: VoiceTTSEngineKind = .kokoro82M {
         didSet {
-            UserDefaults.standard.set(selectedTTSEngine.rawValue, forKey: "wisdai.voice.ttsEngineKind")
-            refreshResolvedPipeline()
-            syncVocalizationCacheContext(prewarmIfSessionActive: false)
-        }
-    }
-    @Published public var selectedKokoroPreset: KokoroVoicePreset = KokoroVoicePreset(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") ?? "") ?? .pfDora {
-        didSet {
-            if !isSyncingKokoroFromPersona {
-                hasExplicitKokoroPresetOverride = true
-                UserDefaults.standard.set(selectedKokoroPreset.rawValue, forKey: "wisdai.voice.kokoroPreset")
-            }
-            refreshResolvedPipeline()
-            syncVocalizationCacheContext(prewarmIfSessionActive: false)
-            if selectActiveTTSProvider().providerID == kokoroTTS.providerID {
-                updateComponentStatus(.tts, state: .ready, engineOrModel: "Kokoro-82M Neural (\(selectedKokoroPreset.rawValue))")
+            if !isApplyingIdentityManagerUpdate {
+                identityManager.selectEngine(selectedTTSEngine)
             }
         }
     }
-    private var hasExplicitKokoroPresetOverride: Bool = UserDefaults.standard.string(forKey: "wisdai.voice.kokoroPreset") != nil
-    private var isSyncingKokoroFromPersona: Bool = false
+    @Published public var selectedKokoroPreset: KokoroVoicePreset = .pmAlex {
+        didSet {
+            if !isApplyingIdentityManagerUpdate {
+                identityManager.selectSpeaker(selectedKokoroPreset.rawValue)
+            }
+        }
+    }
+    @Published public var selectedSupertonicPreset: SupertonicVoicePreset = .m2 {
+        didSet {
+            if !isApplyingIdentityManagerUpdate {
+                identityManager.selectSpeaker(selectedSupertonicPreset.rawValue)
+            }
+        }
+    }
+    private var isApplyingIdentityManagerUpdate: Bool = false
     private var isSyncingIdentityWarmth: Bool = false
     @Published public var executionArchitecture: VoiceExecutionArchitectureMode = VoiceExecutionArchitectureMode(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.executionArchitecture") ?? "") ?? .neuralHybrid {
         didSet {
@@ -226,6 +231,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     public let echoSuppressor: AcousticEchoSuppressor
     public let knowledgeStore: VoiceSQLiteKnowledgeStore
     public let modelAssetManager: VoiceModelAssetManager
+    public let identityManager: VoiceIdentityManager
+    public let supertonicTTS: SupertonicNeuralTTSProvider
     public let kokoroTTS: KokoroNeuralTTSProvider
     public let sherpaPiperTTS: SherpaVitsPiperTTSProvider
     public let mlxExpressiveTTS: LocalExpressiveTTSLoopbackClient
@@ -294,21 +301,38 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     public init() {
         let initialPolicy = VoicePolicyPreferences.load()
-        let initialBehavior = VoiceBehaviorProfile.load()
+        var initialBehavior = VoiceBehaviorProfile.load()
         let initialRouting = VoiceRoleRoutingConfig.load()
         let profile = HardwareMemoryProfile.detect()
-        let initialIdentity: VoiceIdentityDescriptor = {
-            if let data = UserDefaults.standard.data(forKey: "wisdai.voice.identity.v1"),
-               let decoded = try? JSONDecoder().decode(VoiceIdentityDescriptor.self, from: data) {
-                return decoded
-            }
-            return .wisdAIDefault
-        }()
+        let idMgr = VoiceIdentityManager()
+        let unified = idMgr.config
+        initialBehavior.languageVariant = unified.language
+        initialBehavior.speechRate = Float(unified.speechRate)
+        initialBehavior.personality = unified.personalityId
+        initialBehavior.expressivity = unified.design.expressivity
+        initialBehavior.formality = unified.design.formality
+        initialBehavior.detailLevel = unified.design.detailLevel
+        initialBehavior.pauseScale = unified.design.pauseScale
 
+        let personality = VoicePersonalityProfile.profile(for: unified.identityId)
+        let initialIdentity = VoiceIdentityDescriptor(
+            persona: unified.identityId,
+            warmth: personality.conversationalWarmth,
+            clarityEmphasis: unified.design.directness,
+            brandName: "WisdAI"
+        )
+
+        self.identityManager = idMgr
         self.policy = initialPolicy
         self.behavior = initialBehavior
         self.routing = initialRouting
         self.voiceIdentity = initialIdentity
+        self.selectedTTSEngine = unified.engineId
+        self.selectedKokoroPreset = KokoroVoicePreset(rawValue: unified.speakerId.lowercased())
+            ?? KokoroVoicePreset.defaultPreset(for: unified.identityId, language: unified.language)
+            ?? .pmAlex
+        self.selectedSupertonicPreset = SupertonicVoicePreset.from(identifier: unified.speakerId)
+            ?? SupertonicVoicePreset.defaultPreset(for: unified.identityId)
         self.presentationMode = VoicePresentationMode(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.presentationMode") ?? "") ?? .floatingOverlay
         self.orbPalette = WisdVoiceOrbPalette(rawValue: UserDefaults.standard.string(forKey: "wisdai.voice.orbPalette") ?? "") ?? .wisdAIBrand
         self.customPronunciation = TechnicalPronunciationDictionary.defaults(for: initialBehavior.languageVariant)
@@ -327,6 +351,9 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         self.knowledgeStore = VoiceSQLiteKnowledgeStore()
         let assets = VoiceModelAssetManager()
         self.modelAssetManager = assets
+        let supertonic = SupertonicNeuralTTSProvider()
+        supertonic.setDefaultFlowMatchingSteps(unified.design.flowMatchingSteps)
+        self.supertonicTTS = supertonic
         self.kokoroTTS = KokoroNeuralTTSProvider()
         self.sherpaPiperTTS = SherpaVitsPiperTTSProvider()
         self.mlxExpressiveTTS = LocalExpressiveTTSLoopbackClient()
@@ -356,13 +383,20 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             self.vocalizationCache.trimOnMemoryPressure(level)
             if level == .warning || level == .critical {
                 self.kokoroTTS.unload()
+                self.supertonicTTS.unload()
                 self.llamaBrainRuntime.unloadModel()
                 self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.kokoroInt8ModelID, state: nil)
                 self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.kokoroFP32ModelID, state: nil)
+                self.modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.supertonic3Int8ModelID, state: nil)
             }
-            self.telemetry.log(category: "MemoryPressure", message: "Pressão de memória (\(level.rawValue)): compactação, cache V3 reduzida e descarregamento automático aplicados.")
+            self.telemetry.log(category: "MemoryPressure", message: "Pressão de memória (\(level.rawValue)): compactação, cache V5 reduzida e descarregamento automático aplicados.")
         }
 
+        idMgr.onDidChangeConfiguration = { [weak self] nextCfg, invalidateCache in
+            self?.handleIdentityManagerChange(nextCfg, invalidateCache: invalidateCache)
+        }
+
+        refreshConfiguredTruthSnapshot()
         syncVocalizationCacheContext(prewarmIfSessionActive: false)
         wireLocalBrainRuntimes()
         wireAudioEngineCallbacks()
@@ -447,11 +481,23 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         var activeTTSLabel = next.activeTTSName
         var banner = next.advisoryBanner
         if !next.effectiveProvider.isSpeechToSpeech && !next.isUsingPaidCloud {
-            if selectedTTSEngine == .kokoro82M || selectedTTSEngine == .autoLocal {
-                if behavior.languageVariant == .portuguesePT && selectedTTSEngine == .kokoro82M {
-                    banner = "Kokoro-82M não suporta Português Europeu (pt-PT) nativo; utilizando Apple Natural."
-                } else if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
-                    activeTTSLabel = "Kokoro-82M Neural (\(selectedKokoroPreset.rawValue))"
+            let activeTTS = selectActiveTTSProvider()
+            if activeTTS.providerID == supertonicTTS.providerID {
+                activeTTSLabel = "Supertonic-3 44.1kHz (\(selectedSupertonicPreset.rawValue))"
+            } else if activeTTS.providerID == kokoroTTS.providerID {
+                let kokPreset = effectiveKokoroPreset(for: behavior.languageVariant)
+                activeTTSLabel = "Kokoro-82M Neural (\(kokPreset.rawValue))"
+            } else if activeTTS.providerID == appleTTS.providerID {
+                let appleName = AppleNaturalPCMStreamingTTSProvider.selectBestNaturalVoice(
+                    for: behavior.languageVariant,
+                    preferredIdentifier: effectiveTTSVoicePreference()
+                )?.name ?? "Apple Natural"
+                activeTTSLabel = "\(appleName) (Apple Natural PCM)"
+                if selectedTTSEngine == .kokoro82M && behavior.languageVariant == .portuguesePT {
+                    banner = "Kokoro-82M não suporta Português Europeu (pt-PT) nativo; selecione Supertonic-3 ou Apple Natural."
+                } else if identityManager.config.vocalGender == .male &&
+                            !AppleNaturalPCMStreamingTTSProvider.hasInstalledNonEloquenceMaleVoice(for: behavior.languageVariant) {
+                    banner = "macOS sem voz masculina nativa instalada para \(behavior.languageVariant.displayName) (Apple fallback pode usar Luciana feminina)."
                 }
             }
         }
@@ -498,18 +544,141 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     // MARK: - Session Lifecycle
 
+    private func handleIdentityManagerChange(_ nextCfg: UnifiedVoiceConfig, invalidateCache: Bool) {
+        let prevPersona = voiceIdentity.persona
+        let prevLanguage = behavior.languageVariant
+        isApplyingIdentityManagerUpdate = true
+        defer { isApplyingIdentityManagerUpdate = false }
+
+        let personality = VoicePersonalityProfile.profile(for: nextCfg.identityId)
+        voiceIdentity = VoiceIdentityDescriptor(
+            persona: nextCfg.identityId,
+            warmth: personality.conversationalWarmth,
+            clarityEmphasis: nextCfg.design.directness,
+            brandName: "WisdAI"
+        )
+        selectedTTSEngine = nextCfg.engineId
+        if let st = SupertonicVoicePreset.from(identifier: nextCfg.speakerId) {
+            selectedSupertonicPreset = st
+        } else {
+            selectedSupertonicPreset = SupertonicVoicePreset.defaultPreset(for: nextCfg.identityId)
+        }
+        if let kok = KokoroVoicePreset(rawValue: nextCfg.speakerId.lowercased()) {
+            selectedKokoroPreset = kok
+        } else if let matched = KokoroVoicePreset.defaultPreset(for: nextCfg.identityId, language: nextCfg.language) {
+            selectedKokoroPreset = matched
+        }
+        behavior.languageVariant = nextCfg.language
+        behavior.speechRate = Float(nextCfg.speechRate)
+        behavior.personality = nextCfg.personalityId
+        behavior.expressivity = nextCfg.design.expressivity
+        behavior.formality = nextCfg.design.formality
+        behavior.detailLevel = nextCfg.design.detailLevel
+        behavior.pauseScale = nextCfg.design.pauseScale
+        supertonicTTS.setDefaultFlowMatchingSteps(nextCfg.design.flowMatchingSteps)
+
+        refreshResolvedPipeline()
+        refreshConfiguredTruthSnapshot()
+        if invalidateCache {
+            syncVocalizationCacheContext(prewarmIfSessionActive: isVoiceSessionActive)
+            if isVoiceSessionActive {
+                cancelPendingSpeechForLiveVoiceSwitch()
+                if prevPersona != nextCfg.identityId || prevLanguage != nextCfg.language {
+                    let instructions = buildLocalBrainInstructions(for: nextCfg.language)
+                    localBrain.resetSession(instructions: instructions)
+                }
+            }
+        }
+        let activeTTS = selectActiveTTSProvider()
+        if activeTTS.providerID == supertonicTTS.providerID {
+            updateComponentStatus(.tts, state: .ready, engineOrModel: "Supertonic-3 44.1kHz (\(selectedSupertonicPreset.rawValue))")
+        } else if activeTTS.providerID == kokoroTTS.providerID {
+            updateComponentStatus(.tts, state: .ready, engineOrModel: "Kokoro-82M Neural (\(effectiveKokoroPreset(for: nextCfg.language).rawValue))")
+        } else if activeTTS.providerID == appleTTS.providerID {
+            let vName = AppleNaturalPCMStreamingTTSProvider.selectBestNaturalVoice(for: nextCfg.language, preferredIdentifier: effectiveTTSVoicePreference())?.name ?? "Apple Natural"
+            updateComponentStatus(.tts, state: .ready, engineOrModel: "\(vName) (Apple Natural PCM)")
+        }
+    }
+
+    private func cancelPendingSpeechForLiveVoiceSwitch() {
+        _ = playbackGate.advanceEpoch()
+        queuedSpeechChunks.removeAll()
+        speechSegmenter.reset()
+        ttsQueueTask?.cancel()
+        ttsQueueTask = nil
+        kokoroTTS.cancelAll()
+        supertonicTTS.cancelAll()
+        sherpaPiperTTS.cancelAll()
+        mlxExpressiveTTS.cancelAll()
+        appleTTS.cancelAll()
+        _ = audioEngine.bargeInFlushPlayback()
+        audioEngine.flushAuxiliaryVocalizationOnly()
+        isTTSWorkerRunning = false
+        if isVoiceSessionActive && state == .assistantSpeaking {
+            transitionState(.listening, reason: "Troca de voz ao vivo concluída")
+        }
+    }
+
+    public func effectiveKokoroPreset(for language: VoiceLanguageVariant) -> KokoroVoicePreset {
+        if let exact = KokoroVoicePreset(rawValue: identityManager.config.speakerId.lowercased()),
+           exact.supportedLanguage == language,
+           exact.timbre == identityManager.config.vocalGender {
+            return exact
+        }
+        if selectedKokoroPreset.supportedLanguage == language && selectedKokoroPreset.timbre == identityManager.config.vocalGender {
+            return selectedKokoroPreset
+        }
+        return KokoroVoicePreset.defaultPreset(for: voiceIdentity.persona, language: language)
+            ?? (identityManager.config.vocalGender == .male ? .pmAlex : .pfDora)
+    }
+
+    public func refreshConfiguredTruthSnapshot() {
+        let active = selectActiveTTSProvider()
+        let lang = behavior.languageVariant
+        let cfg = identityManager.config
+        let resolvedEngine: VoiceTTSEngineKind = {
+            if active.providerID == supertonicTTS.providerID { return .supertonic3 }
+            if active.providerID == kokoroTTS.providerID { return .kokoro82M }
+            if active.providerID == sherpaPiperTTS.providerID { return .sherpaPiperVits }
+            if active.providerID == mlxExpressiveTTS.providerID { return cfg.engineId }
+            return .appleNaturalPCM
+        }()
+        let pref = effectiveTTSVoicePreference()
+        let sid = VoiceIdentityManager.resolvedNumericSID(
+            engine: resolvedEngine,
+            speakerId: pref,
+            persona: cfg.identityId,
+            language: lang
+        )
+        identityManager.recordConfiguredRuntime(
+            engineId: resolvedEngine,
+            modelId: VoiceIdentityManager.defaultModelID(for: resolvedEngine),
+            speakerId: pref,
+            numericSID: sid,
+            language: lang,
+            speechRate: Double(effectiveSpeechRate()),
+            flowSteps: cfg.design.flowMatchingSteps
+        )
+    }
+
     public func effectiveTTSVoicePreference() -> String {
         let activeProvider = selectActiveTTSProvider()
-        if activeProvider.providerID == kokoroTTS.providerID {
-            if hasExplicitKokoroPresetOverride && selectedKokoroPreset.supportedLanguage == behavior.languageVariant {
-                return selectedKokoroPreset.rawValue
+        let cfg = identityManager.config
+        if activeProvider.providerID == supertonicTTS.providerID {
+            let resolved = SupertonicVoicePreset.from(identifier: cfg.speakerId)
+            if let resolved, resolved.timbre == cfg.vocalGender {
+                return resolved.rawValue
             }
-            return "persona:\(voiceIdentity.persona.rawValue)"
+            return SupertonicVoicePreset.defaultPreset(for: cfg.identityId).rawValue
         }
-        if selectedVoiceIdentifier != "auto", !selectedVoiceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if activeProvider.providerID == kokoroTTS.providerID {
+            return effectiveKokoroPreset(for: behavior.languageVariant).rawValue
+        }
+        if selectedVoiceIdentifier != "auto",
+           !selectedVoiceIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return selectedVoiceIdentifier
         }
-        return "persona:\(voiceIdentity.persona.rawValue)"
+        return "persona:\(cfg.identityId.rawValue)"
     }
 
     public func effectiveSpeechRate() -> Float {
@@ -663,12 +832,58 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let ptVoices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.lowercased().hasPrefix("pt") }
         installedPTVoicesCount = ptVoices.count
         let activeTTS = selectActiveTTSProvider()
-        if activeTTS.providerID == kokoroTTS.providerID {
-            let kokoroDiag = kokoroTTS.currentDiagnostics()
+        if activeTTS.providerID == supertonicTTS.providerID {
+            let supDiag = supertonicTTS.currentDiagnostics()
             updateComponentStatus(
                 .tts,
                 state: .ready,
-                engineOrModel: "Kokoro-82M Neural (\(selectedKokoroPreset.rawValue))",
+                engineOrModel: "Supertonic-3 44.1kHz (\(selectedSupertonicPreset.rawValue))",
+                latencyMs: supDiag.loadLatencyMs,
+                lastError: supDiag.lastError
+            )
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let installedID = self.supertonicTTS.resolveInstalledPaths()?.modelID
+                if let installedID { self.modelAssetManager.setRuntimeActivity(modelID: installedID, state: .loading) }
+                do {
+                    let diag = try await self.supertonicTTS.preload()
+                    self.hasLocalTTSWarmedUp = true
+                    if let mid = diag.activeModelID {
+                        self.modelAssetManager.setRuntimeActivity(modelID: mid, state: .operational)
+                    }
+                    self.identityManager.recordLoadedRuntime(VoiceLoadedRuntimeSnapshot(
+                        engineId: self.supertonicTTS.providerID,
+                        modelId: diag.activeModelID ?? VoiceModelCatalog.supertonic3Int8ModelID,
+                        langCode: self.behavior.languageVariant.bcp47LanguagePrefix,
+                        loadedSpeakerCount: diag.numSpeakers,
+                        sampleRateHz: diag.sampleRateHz,
+                        isLoaded: true
+                    ))
+                    self.updateComponentStatus(
+                        .tts,
+                        state: .ready,
+                        engineOrModel: "Supertonic-3 44.1kHz (\(self.selectedSupertonicPreset.rawValue))",
+                        latencyMs: diag.loadLatencyMs
+                    )
+                } catch {
+                    if let installedID {
+                        self.modelAssetManager.setRuntimeActivity(modelID: installedID, state: .error, error: error.localizedDescription)
+                    }
+                    self.updateComponentStatus(
+                        .tts,
+                        state: .degraded,
+                        engineOrModel: "Supertonic falhou -> Fallback",
+                        lastError: error.localizedDescription
+                    )
+                }
+            }
+        } else if activeTTS.providerID == kokoroTTS.providerID {
+            let kokoroDiag = kokoroTTS.currentDiagnostics()
+            let kokPreset = effectiveKokoroPreset(for: behavior.languageVariant)
+            updateComponentStatus(
+                .tts,
+                state: .ready,
+                engineOrModel: "Kokoro-82M Neural (\(kokPreset.rawValue))",
                 latencyMs: kokoroDiag.loadLatencyMs,
                 lastError: kokoroDiag.lastError
             )
@@ -685,10 +900,18 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                     if let mid = diag.activeModelID {
                         self.modelAssetManager.setRuntimeActivity(modelID: mid, state: .operational)
                     }
+                    self.identityManager.recordLoadedRuntime(VoiceLoadedRuntimeSnapshot(
+                        engineId: self.kokoroTTS.providerID,
+                        modelId: diag.activeModelID ?? VoiceModelCatalog.kokoroInt8ModelID,
+                        langCode: diag.loadedLangCode ?? langNow.rawValue,
+                        loadedSpeakerCount: diag.numSpeakers,
+                        sampleRateHz: diag.sampleRateHz,
+                        isLoaded: true
+                    ))
                     self.updateComponentStatus(
                         .tts,
                         state: .ready,
-                        engineOrModel: "Kokoro-82M Neural (\(self.selectedKokoroPreset.rawValue))",
+                        engineOrModel: "Kokoro-82M Neural (\(self.effectiveKokoroPreset(for: langNow).rawValue))",
                         latencyMs: diag.loadLatencyMs
                     )
                 } catch {
@@ -1528,11 +1751,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 self.stopSession(clearUI: true)
             }
         case .switchLanguage(let targetLang):
-            behavior.languageVariant = targetLang
+            identityManager.selectLanguage(targetLang)
             let instructions = buildLocalBrainInstructions(for: targetLang)
             localBrain.resetSession(instructions: instructions)
             let confirm: String = {
                 switch targetLang {
+                case .englishGB: return "Very well, switching to British English now. How may I assist?"
                 case .englishUS: return "Sure, switching to English now. How can I help?"
                 case .spanishES: return "Claro, ahora hablamos en español. ¿En qué te ayudo?"
                 case .portuguesePT: return "Com certeza, passo a responder em português europeu. Em que posso ajudar?"
@@ -1571,9 +1795,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         )
         activeTurnBehaviorPlan = plan
         lastBehaviorPlan = plan
+        let activeTTSNow = selectActiveTTSProvider()
         activeTTSProsodyCapabilities = EngineProsodyCapabilities.forEngine(
             selectedTTSEngine,
-            isKokoroActive: selectActiveTTSProvider().providerID == kokoroTTS.providerID
+            isKokoroActive: activeTTSNow.providerID == kokoroTTS.providerID,
+            isSupertonicActive: activeTTSNow.providerID == supertonicTTS.providerID
         )
         telemetry.updateBehaviorTelemetry(
             planSummary: plan.prettyJSONSummary(),
@@ -1742,12 +1968,17 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         instructions += "\nResponda à pergunta atual sem inventar fatos, nomes de arquivos ou tarefas. O histórico anterior serve apenas como contexto."
         instructions += "\nVocê é o cérebro conversacional local (sem ferramentas diretas no disco). Se o usuário pedir análise real de arquivos do repositório ou informação técnica que ultrapasse seu contexto local e você precisar consultar um agente especialista em somente leitura, explique honestamente sua limitação em 1 frase curta e encerre com a tag oculta `[CONSULTAR_ESPECIALISTA: <pergunta objetiva em modo somente leitura>]`. Nunca finja ter lido arquivos nem executado comandos."
         instructions += "\nIdentidade vocal ativa: \(voiceIdentity.persona.displayName) (\(voiceIdentity.persona.subtitle))."
-        if language == .englishUS {
+        if voiceIdentity.persona == .jarvis {
+            instructions += " Adote a postura executiva do JARVIS: sereno, lúcido, articulado, estratégico e objetivo, com discrição refinada e zero clichês de chatbot."
+        }
+        if language == .englishGB {
+            instructions += " Keep replies articulate, calm, concise, and refined in British English (1 to 3 natural spoken sentences)."
+        } else if language == .englishUS {
             instructions += " Keep replies conversational, clear, and concise in English (1 to 3 natural spoken sentences)."
         } else if language == .spanishES {
             instructions += " Responde de forma conversacional, cálida y directa en español (1 a 3 frases)."
         } else {
-            instructions += " Responda como um parceiro humano natural em português brasileiro (1 a 3 frases objetivas, sem Markdown pesado)."
+            instructions += " Responda como um parceiro humano natural em português (1 a 3 frases objetivas, sem Markdown pesado)."
         }
         return instructions
     }
@@ -2008,7 +2239,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 )
                 let caps = EngineProsodyCapabilities.forEngine(
                     self.selectedTTSEngine,
-                    isKokoroActive: tts.providerID == self.kokoroTTS.providerID
+                    isKokoroActive: tts.providerID == self.kokoroTTS.providerID,
+                    isSupertonicActive: tts.providerID == self.supertonicTTS.providerID
                 )
                 let directive = VoiceProsodyPlanner.directive(
                     for: nextChunk.text,
@@ -2031,10 +2263,24 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                     _ = self.audioEngine.outputJitterBuffer.pushFloatSamples([Float](repeating: 0, count: silenceCount), transcriptText: nil)
                 }
 
+                final class TurnAudioProbeBox: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var samples: [Float] = []
+                    func append(_ xs: [Float]) {
+                        lock.withLock {
+                            if samples.count < 48_000 {
+                                samples.append(contentsOf: xs.prefix(max(0, 48_000 - samples.count)))
+                            }
+                        }
+                    }
+                    func snapshot() -> [Float] { lock.withLock { samples } }
+                }
+                let probeBox = TurnAudioProbeBox()
                 let deliverAudioChunk: @Sendable ([Float], String) -> Void = { [weak self] floats24k, spanLabel in
                     guard let self,
                           !Task.isCancelled,
                           gateRef.isCurrent(expectedPlayback) else { return }
+                    probeBox.append(floats24k)
                     let nowNs = DispatchTime.now().uptimeNanoseconds
                     if latencyGate.claim() {
                         let ttsFirstChunkMs = Double(nowNs &- ttsStartNs) / 1_000_000.0
@@ -2064,11 +2310,23 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 }
 
                 do {
-                    if let kokoro = tts as? KokoroNeuralTTSProvider {
+                    let voicePref = self.effectiveTTSVoicePreference()
+                    if let supertonic = tts as? SupertonicNeuralTTSProvider {
+                        try await supertonic.synthesizeChunk(
+                            nextChunk.text,
+                            language: self.behavior.languageVariant,
+                            voicePreference: voicePref,
+                            rate: directive.rateMultiplier,
+                            silenceScale: directive.silenceScale,
+                            flowSteps: self.identityManager.config.design.flowMatchingSteps,
+                            targetSampleRate: 24_000,
+                            onAudioFloats: deliverAudioChunk
+                        )
+                    } else if let kokoro = tts as? KokoroNeuralTTSProvider {
                         try await kokoro.synthesizeChunk(
                             nextChunk.text,
                             language: self.behavior.languageVariant,
-                            voicePreference: self.effectiveTTSVoicePreference(),
+                            voicePreference: voicePref,
                             rate: directive.rateMultiplier,
                             silenceScale: directive.silenceScale,
                             onAudioFloats24k: deliverAudioChunk
@@ -2077,7 +2335,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         try await piper.synthesizeChunk(
                             nextChunk.text,
                             language: self.behavior.languageVariant,
-                            voicePreference: self.effectiveTTSVoicePreference(),
+                            voicePreference: voicePref,
                             rate: directive.rateMultiplier,
                             silenceScale: directive.silenceScale,
                             onAudioFloats24k: deliverAudioChunk
@@ -2086,7 +2344,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         try await apple.synthesizeChunk(
                             nextChunk.text,
                             language: self.behavior.languageVariant,
-                            voicePreference: self.effectiveTTSVoicePreference(),
+                            voicePreference: voicePref,
                             rate: directive.rateMultiplier,
                             pitchMultiplier: directive.pitchMultiplier,
                             onAudioFloats24k: deliverAudioChunk
@@ -2095,7 +2353,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         try await tts.synthesizeChunk(
                             nextChunk.text,
                             language: self.behavior.languageVariant,
-                            voicePreference: self.effectiveTTSVoicePreference(),
+                            voicePreference: voicePref,
                             rate: directive.rateMultiplier,
                             onAudioFloats24k: deliverAudioChunk
                         )
@@ -2110,23 +2368,47 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                         self.telemetry.recordTTSTotalSynthesisLatency(ms: self.turnTTSTotalSynthAccumMs)
                         self.turnTTSTotalSynthAccumMs = 0
                     }
+                    let measuredF0 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: probeBox.snapshot(), sampleRate: 24_000)
+                    await MainActor.run {
+                        self.recordProviderExecutionTruth(
+                            provider: tts,
+                            voicePreference: voicePref,
+                            language: self.behavior.languageVariant,
+                            synthMs: fullClauseSynthMs,
+                            measuredF0Hz: measuredF0,
+                            fallbackOccurred: false
+                        )
+                    }
                 } catch {
                     let isOptionalFallback = tts.requiresPaidOptIn || (selectedTTSEngine == .autoLocal && tts.providerID != appleTTS.providerID)
                     await MainActor.run {
                         self.telemetry.log(category: "TTS", message: "Erro/Fallback TTS (\(tts.providerID)): \(error.localizedDescription)")
-                        if tts.providerID == self.kokoroTTS.providerID {
-                            self.updateComponentStatus(.tts, state: .degraded, engineOrModel: "Kokoro falhou -> Apple Natural", lastError: error.localizedDescription)
+                        if tts.providerID == self.kokoroTTS.providerID || tts.providerID == self.supertonicTTS.providerID {
+                            self.updateComponentStatus(.tts, state: .degraded, engineOrModel: "\(tts.providerID) falhou -> Apple Natural", lastError: error.localizedDescription)
                         }
                     }
                     if isOptionalFallback && gateRef.isCurrent(expectedPlayback) {
+                        let fallbackPref = self.effectiveTTSVoicePreference()
                         try? await self.appleTTS.synthesizeChunk(
                             nextChunk.text,
                             language: self.behavior.languageVariant,
-                            voicePreference: "persona:\(self.voiceIdentity.persona.rawValue)",
+                            voicePreference: fallbackPref,
                             rate: self.effectiveSpeechRate()
                         ) { [weak self] floats24k, spanLabel in
                             guard let self, !Task.isCancelled, gateRef.isCurrent(expectedPlayback) else { return }
                             _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(floats24k, transcriptText: spanLabel)
+                        }
+                        let fbSynthMs = Double(DispatchTime.now().uptimeNanoseconds &- ttsStartNs) / 1_000_000.0
+                        await MainActor.run {
+                            self.recordProviderExecutionTruth(
+                                provider: self.appleTTS,
+                                voicePreference: fallbackPref,
+                                language: self.behavior.languageVariant,
+                                synthMs: fbSynthMs,
+                                measuredF0Hz: nil,
+                                fallbackOccurred: true,
+                                overrideNote: "Fallback para Apple Natural após falha em \(tts.providerID): \(error.localizedDescription)"
+                            )
                         }
                     }
                 }
@@ -2162,7 +2444,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
-    private func selectActiveTTSProvider() -> StreamingTextToSpeechProvider {
+    public func selectActiveTTSProvider() -> StreamingTextToSpeechProvider {
         switch resolvedPipeline.effectiveProvider {
         case .hybridDeepgramElevenLabs:
             return elevenLabsTTS
@@ -2172,14 +2454,28 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             break
         }
         switch selectedTTSEngine {
+        case .supertonic3:
+            if supertonicTTS.isReadyOnDisk {
+                return supertonicTTS
+            }
+            if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
+                return kokoroTTS
+            }
+            return appleTTS
         case .kokoro82M:
             if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
                 return kokoroTTS
+            }
+            if behavior.languageVariant == .portuguesePT && supertonicTTS.isReadyOnDisk {
+                return supertonicTTS
             }
             return appleTTS
         case .sherpaPiperVits:
             if sherpaPiperTTS.isReadyOnDisk(for: behavior.languageVariant) {
                 return sherpaPiperTTS
+            }
+            if supertonicTTS.isReadyOnDisk {
+                return supertonicTTS
             }
             if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
                 return kokoroTTS
@@ -2189,13 +2485,22 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             if mlxExpressiveTTS.isServerReachable {
                 return mlxExpressiveTTS
             }
+            if supertonicTTS.isReadyOnDisk {
+                return supertonicTTS
+            }
             if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
                 return kokoroTTS
             }
             return appleTTS
         case .autoLocal:
+            if supertonicTTS.isReadyOnDisk && (identityManager.config.speakerId.hasPrefix("supertonic:") || behavior.languageVariant == .portuguesePT) {
+                return supertonicTTS
+            }
             if kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(behavior.languageVariant) {
                 return kokoroTTS
+            }
+            if supertonicTTS.isReadyOnDisk {
+                return supertonicTTS
             }
             if sherpaPiperTTS.isReadyOnDisk(for: behavior.languageVariant) {
                 return sherpaPiperTTS
@@ -2206,12 +2511,100 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
+    private func recordProviderExecutionTruth(
+        provider: StreamingTextToSpeechProvider,
+        voicePreference: String,
+        language: VoiceLanguageVariant,
+        synthMs: Double,
+        measuredF0Hz: Double?,
+        fallbackOccurred: Bool,
+        overrideNote: String? = nil
+    ) {
+        if provider.providerID == supertonicTTS.providerID, let info = supertonicTTS.lastExecutionInfo() {
+            identityManager.recordInferredSynthesis(VoiceInferredRuntimeSnapshot(
+                actualEngineId: VoiceTTSEngineKind.supertonic3.rawValue,
+                actualModelId: info.modelID,
+                actualSpeakerId: info.speakerID,
+                actualNumericSID: info.numericSID,
+                actualLanguage: info.langCode,
+                actualSampleRateHz: info.sampleRateHz,
+                estimatedF0Hz: measuredF0Hz,
+                synthLatencyMs: info.synthMs,
+                fallbackOccurred: fallbackOccurred,
+                note: overrideNote,
+                updatedAt: Date()
+            ))
+            return
+        }
+        if provider.providerID == kokoroTTS.providerID, let info = kokoroTTS.lastExecutionInfo() {
+            identityManager.recordInferredSynthesis(VoiceInferredRuntimeSnapshot(
+                actualEngineId: VoiceTTSEngineKind.kokoro82M.rawValue,
+                actualModelId: info.modelID,
+                actualSpeakerId: info.speakerID,
+                actualNumericSID: info.numericSID,
+                actualLanguage: info.langCode,
+                actualSampleRateHz: info.sampleRateHz,
+                estimatedF0Hz: measuredF0Hz,
+                synthLatencyMs: info.synthMs,
+                fallbackOccurred: fallbackOccurred,
+                note: overrideNote,
+                updatedAt: Date()
+            ))
+            return
+        }
+        if provider.providerID == appleTTS.providerID {
+            let resolved = appleTTS.lastResolvedVoiceSnapshot
+            let warn = appleTTS.lastSelectionWarning
+            identityManager.recordInferredSynthesis(VoiceInferredRuntimeSnapshot(
+                actualEngineId: VoiceTTSEngineKind.appleNaturalPCM.rawValue,
+                actualModelId: "apple-natural-pcm",
+                actualSpeakerId: resolved?.name ?? voicePreference,
+                actualNumericSID: nil,
+                actualLanguage: language.rawValue,
+                actualSampleRateHz: 24_000,
+                estimatedF0Hz: measuredF0Hz,
+                synthLatencyMs: synthMs,
+                fallbackOccurred: fallbackOccurred || (selectedTTSEngine != .appleNaturalPCM && selectedTTSEngine != .autoLocal),
+                note: overrideNote ?? warn,
+                updatedAt: Date()
+            ))
+            return
+        }
+        identityManager.recordInferredSynthesis(VoiceInferredRuntimeSnapshot(
+            actualEngineId: provider.providerID,
+            actualModelId: provider.providerID,
+            actualSpeakerId: voicePreference,
+            actualNumericSID: nil,
+            actualLanguage: language.rawValue,
+            actualSampleRateHz: 24_000,
+            estimatedF0Hz: measuredF0Hz,
+            synthLatencyMs: synthMs,
+            fallbackOccurred: fallbackOccurred,
+            note: overrideNote,
+            updatedAt: Date()
+        ))
+    }
+
     public func currentVocalizationContext() -> VocalizationIdentityContext {
         let activeTTS = selectActiveTTSProvider()
+        let cfg = identityManager.config
+        let resolvedEngine: VoiceTTSEngineKind = {
+            if activeTTS.providerID == supertonicTTS.providerID { return .supertonic3 }
+            if activeTTS.providerID == kokoroTTS.providerID { return .kokoro82M }
+            if activeTTS.providerID == sherpaPiperTTS.providerID { return .sherpaPiperVits }
+            return cfg.engineId
+        }()
+        let spk = effectiveTTSVoicePreference()
         return VocalizationIdentityContext(
             engineID: activeTTS.providerID,
-            voicePreference: effectiveTTSVoicePreference(),
-            language: behavior.languageVariant
+            modelID: VoiceIdentityManager.defaultModelID(for: resolvedEngine),
+            modelVersion: activeTTS.providerID == supertonicTTS.providerID ? "v3-int8-steps\(cfg.design.flowMatchingSteps)" : "v5",
+            identityID: cfg.identityId.rawValue,
+            speakerID: spk,
+            voicePreference: spk,
+            language: behavior.languageVariant,
+            speechRate: effectiveSpeechRate(),
+            prosodySignature: "\(behavior.expressivity.rawValue)-\(behavior.formality.rawValue)-p\(Int((behavior.pauseScale * 10).rounded()))"
         )
     }
 
@@ -2226,11 +2619,13 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     public func prewarmVocalizationCache() {
         let ctx = currentVocalizationContext()
         let activeTTS = selectActiveTTSProvider()
+        let supertonicRef = supertonicTTS
         let kokoroRef = kokoroTTS
         let piperRef = sherpaPiperTTS
         let appleRef = appleTTS
+        let flowSteps = identityManager.config.design.flowMatchingSteps
 
-        let generator: VocalizationPCMGenerator = { [activeTTS, kokoroRef, piperRef, appleRef] text, language, voicePref, rate, silenceScale in
+        let generator: VocalizationPCMGenerator = { [activeTTS, supertonicRef, kokoroRef, piperRef, appleRef, flowSteps] text, language, voicePref, rate, silenceScale in
             final class Box: @unchecked Sendable {
                 private let lock = NSLock()
                 private var pcm: [Float] = []
@@ -2238,7 +2633,19 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 func result() -> [Float] { lock.withLock { pcm } }
             }
             let box = Box()
-            if activeTTS.providerID == kokoroRef.providerID {
+            if activeTTS.providerID == supertonicRef.providerID {
+                try await supertonicRef.synthesizeChunk(
+                    text,
+                    language: language,
+                    voicePreference: voicePref,
+                    rate: rate,
+                    silenceScale: silenceScale,
+                    flowSteps: flowSteps,
+                    targetSampleRate: 24_000
+                ) { floats, _ in
+                    box.append(floats)
+                }
+            } else if activeTTS.providerID == kokoroRef.providerID {
                 try await kokoroRef.synthesizeChunk(
                     text,
                     language: language,
@@ -2382,6 +2789,38 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         return (res.ok, res.synthMs, false, "Cache miss -> sintetizado na identidade ativa (\(res.detail))")
     }
 
+    public func previewCurrentConfiguredVoice(
+        sampleText: String? = nil,
+        playAudio: Bool = true
+    ) async -> (ok: Bool, engineUsed: String, sampleRate: Int, synthMs: Double, wavData: Data?, detail: String) {
+        let lang = behavior.languageVariant
+        let text = sampleText ?? {
+            switch lang {
+            case .englishGB:
+                return "Very well. Checking the calibrated \(voiceIdentity.persona.shortName) vocal channel."
+            case .englishUS:
+                return "Ready when you are. Testing the \(voiceIdentity.persona.shortName) voice configuration."
+            case .spanishES:
+                return "Perfecto. Comprobando la voz configurada de \(voiceIdentity.persona.shortName)."
+            case .portuguesePT:
+                return "Com certeza. A testar a identidade vocal \(voiceIdentity.persona.shortName)."
+            case .portugueseBR:
+                return voiceIdentity.persona == .jarvis
+                    ? "Perfeitamente. Canal vocal JARVIS calibrado e pronto para conversação."
+                    : "Olá! Esta é a voz configurada agora para conversarmos no WisdAI."
+            }
+        }()
+        return await synthesizeAndPreviewVoiceSample(
+            text: text,
+            ttsEngine: selectedTTSEngine,
+            kokoroPreset: effectiveKokoroPreset(for: lang),
+            language: lang,
+            rate: effectiveSpeechRate(),
+            playAudio: playAudio,
+            applyBehaviorComposition: false
+        )
+    }
+
     public func synthesizeAndPreviewVoiceSample(
         text: String,
         ttsEngine: VoiceTTSEngineKind,
@@ -2390,17 +2829,69 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         rate: Float? = nil,
         playAudio: Bool = true,
         saveToURL: URL? = nil,
-        applyBehaviorComposition: Bool = true
+        applyBehaviorComposition: Bool = true,
+        supertonicPresetOverride: SupertonicVoicePreset? = nil
     ) async -> (ok: Bool, engineUsed: String, sampleRate: Int, synthMs: Double, wavData: Data?, detail: String) {
+        let shouldUseSupertonic = ttsEngine == .supertonic3 ||
+            (ttsEngine == .autoLocal && supertonicTTS.isReadyOnDisk && (identityManager.config.speakerId.hasPrefix("supertonic:") || language == .portuguesePT))
+        let shouldUseKokoro = !shouldUseSupertonic &&
+            (ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(language)))
+
         let caps = EngineProsodyCapabilities.forEngine(
             ttsEngine,
-            isKokoroActive: ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && language != .portuguesePT)
+            isKokoroActive: shouldUseKokoro,
+            isSupertonicActive: shouldUseSupertonic
         )
         let adapted: String = applyBehaviorComposition
             ? NaturalSpeechComposer.compose(text, plan: lastBehaviorPlan, profile: behavior, capabilities: caps, customDictionary: customPronunciation).spokenText
             : VoiceResponseAdapter.adaptForSpeech(text, profile: behavior, customDictionary: customPronunciation).spokenText
         let spokenText = adapted.isEmpty ? text : adapted
         let effectiveRate = rate ?? effectiveSpeechRate()
+        let flowSteps = identityManager.config.design.flowMatchingSteps
+
+        if shouldUseSupertonic {
+            guard supertonicTTS.isReadyOnDisk else {
+                return (false, "Supertonic-3", 44_100, 0, nil, "Pesos Supertonic-3 ainda não estão instalados. Baixe no Catálogo de Modelos primeiro.")
+            }
+            let supPreset = supertonicPresetOverride ?? SupertonicVoicePreset.from(identifier: effectiveTTSVoicePreference()) ?? selectedSupertonicPreset
+            do {
+                let res = try await supertonicTTS.synthesizeStandaloneSamples(
+                    text: spokenText,
+                    language: language,
+                    preset: supPreset,
+                    rate: effectiveRate,
+                    flowSteps: flowSteps,
+                    silenceScale: 0.20,
+                    targetSampleRate: 44_100
+                )
+                let f0 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: res.samples, sampleRate: Double(res.sampleRate))
+                recordProviderExecutionTruth(
+                    provider: supertonicTTS,
+                    voicePreference: supPreset.rawValue,
+                    language: language,
+                    synthMs: res.synthMs,
+                    measuredF0Hz: f0,
+                    fallbackOccurred: false
+                )
+                let wav = CodexVoiceAudioCues.makeWAVContainer(
+                    pcm16Mono: AudioPCMConverter.floatsToPCM16Data(res.samples),
+                    sampleRate: res.sampleRate,
+                    channels: 1
+                )
+                if let saveToURL {
+                    try previewPlayer.saveWAV(samples: res.samples, sampleRate: res.sampleRate, to: saveToURL)
+                }
+                if playAudio {
+                    previewPlayer.playWAVData(wav, label: "Supertonic-3 \(supPreset.rawValue)")
+                }
+                modelAssetManager.setRuntimeActivity(modelID: VoiceModelCatalog.supertonic3Int8ModelID, state: .operational)
+                let durSec = Double(res.samples.count) / Double(res.sampleRate)
+                let f0Note = f0.map { String(format: " · F0=%.0f Hz", $0) } ?? ""
+                return (true, "Supertonic-3 (\(supPreset.rawValue))", res.sampleRate, res.synthMs, wav, String(format: "%.2fs gerados em %.0f ms (@ 44.1kHz, steps=%d%@)", durSec, res.synthMs, flowSteps, f0Note))
+            } catch {
+                return (false, "Supertonic-3", 44_100, 0, nil, error.localizedDescription)
+            }
+        }
 
         if ttsEngine == .sherpaPiperVits {
             guard sherpaPiperTTS.isReadyOnDisk(for: language) else {
@@ -2459,19 +2950,31 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             }
         }
 
-        if ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && language != .portuguesePT) {
+        if ttsEngine == .kokoro82M || (ttsEngine == .autoLocal && kokoroTTS.isReadyOnDisk && VoiceTTSEngineKind.kokoro82M.supportsLanguage(language)) {
             if !VoiceTTSEngineKind.kokoro82M.supportsLanguage(language) {
-                return (false, "Kokoro-82M", 24_000, 0, nil, "Kokoro-82M suporta apenas PT-BR, EN-US e ES-ES (pt-PT não suportado nativamente).")
+                return (false, "Kokoro-82M", 24_000, 0, nil, "Kokoro-82M suporta apenas PT-BR, EN-GB, EN-US e ES-ES (pt-PT não suportado nativamente).")
             }
             guard kokoroTTS.isReadyOnDisk else {
                 return (false, "Kokoro-82M", 24_000, 0, nil, "Kokoro-82M ainda não está instalado. Autorize e baixe o modelo primeiro.")
             }
             do {
+                let effectivePreset = (kokoroPreset.supportedLanguage == language)
+                    ? kokoroPreset
+                    : effectiveKokoroPreset(for: language)
                 let res = try await kokoroTTS.synthesizeStandaloneSamples(
                     text: spokenText,
                     language: language,
-                    preset: kokoroPreset,
+                    preset: effectivePreset,
                     rate: effectiveRate
+                )
+                let f0 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: res.samples, sampleRate: Double(res.sampleRate))
+                recordProviderExecutionTruth(
+                    provider: kokoroTTS,
+                    voicePreference: effectivePreset.rawValue,
+                    language: language,
+                    synthMs: res.synthMs,
+                    measuredF0Hz: f0,
+                    fallbackOccurred: false
                 )
                 let wav = CodexVoiceAudioCues.makeWAVContainer(
                     pcm16Mono: AudioPCMConverter.floatsToPCM16Data(res.samples),
@@ -2482,11 +2985,12 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                     try previewPlayer.saveWAV(samples: res.samples, sampleRate: res.sampleRate, to: saveToURL)
                 }
                 if playAudio {
-                    previewPlayer.playWAVData(wav, label: "Kokoro \(kokoroPreset.rawValue)")
+                    previewPlayer.playWAVData(wav, label: "Kokoro \(effectivePreset.rawValue)")
                 }
                 modelAssetManager.setRuntimeActivity(modelID: kokoroTTS.currentDiagnostics().activeModelID ?? VoiceModelCatalog.kokoroInt8ModelID, state: .operational)
                 let durSec = Double(res.samples.count) / Double(res.sampleRate)
-                return (true, "Kokoro-82M (\(kokoroPreset.rawValue))", res.sampleRate, res.synthMs, wav, String(format: "%.2fs gerados em %.0f ms (%d amostras @ 24kHz)", durSec, res.synthMs, res.samples.count))
+                let f0Note = f0.map { String(format: " · F0=%.0f Hz", $0) } ?? ""
+                return (true, "Kokoro-82M (\(effectivePreset.rawValue))", res.sampleRate, res.synthMs, wav, String(format: "%.2fs gerados em %.0f ms (%d amostras @ 24kHz%@)", durSec, res.synthMs, res.samples.count, f0Note))
             } catch {
                 return (false, "Kokoro-82M", 24_000, 0, nil, error.localizedDescription)
             }
@@ -2502,10 +3006,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let samplesBox = PreviewSamplesBox()
         let t0 = DispatchTime.now().uptimeNanoseconds
         do {
+            let voicePref = effectiveTTSVoicePreference()
             try await appleTTS.synthesizeChunk(
                 spokenText,
                 language: language,
-                voicePreference: effectiveTTSVoicePreference(),
+                voicePreference: voicePref,
                 rate: effectiveRate
             ) { floats, _ in
                 samplesBox.append(floats)
@@ -2515,6 +3020,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             guard !all.isEmpty else {
                 return (false, "Apple Natural PCM", 24_000, elapsed, nil, "Nenhuma amostra gerada pela voz do macOS para \(language.displayName).")
             }
+            let f0 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: all, sampleRate: 24_000)
+            recordProviderExecutionTruth(
+                provider: appleTTS,
+                voicePreference: voicePref,
+                language: language,
+                synthMs: elapsed,
+                measuredF0Hz: f0,
+                fallbackOccurred: ttsEngine != .appleNaturalPCM && ttsEngine != .autoLocal
+            )
             let wav = CodexVoiceAudioCues.makeWAVContainer(
                 pcm16Mono: AudioPCMConverter.floatsToPCM16Data(all),
                 sampleRate: 24_000,
@@ -2544,6 +3058,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         queuedSpeechChunks.removeAll()
         speechSegmenter.reset()
         kokoroTTS.cancelAll()
+        supertonicTTS.cancelAll()
         sherpaPiperTTS.cancelAll()
         mlxExpressiveTTS.cancelAll()
         appleTTS.cancelAll()
@@ -2738,7 +3253,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                             res.cpuPercent, res.cpuCoreCount, res.gpuName, res.gpuMaxRecommendedMB, modelAssetManager.availableDiskGB))
         lines.append("Audio Route: In='\(engStats.inputDeviceName)' Out='\(engStats.outputDeviceName)' Processing=\(engStats.processingStatus.rawValue)")
         lines.append("Installed Speech Locales: \(installedSpeechLocales.isEmpty ? "(pending probe)" : installedSpeechLocales.joined(separator: ", "))")
-        lines.append("Installed PT Voices: \(installedPTVoicesCount) | Active Persona: \(voiceIdentity.persona.displayName) | Profile: \(behavior.profilePreset.displayName) | Kokoro Preset: \(selectedKokoroPreset.rawValue)")
+        lines.append("Installed PT Voices: \(installedPTVoicesCount) | Active Persona: \(voiceIdentity.persona.displayName) | Profile: \(behavior.profilePreset.displayName) | Engine: \(selectedTTSEngine.rawValue) | Kokoro: \(selectedKokoroPreset.rawValue) | Supertonic: \(selectedSupertonicPreset.rawValue)")
+        lines.append("VoiceIdentityManager Requested: \(identityManager.requestedSnapshot.summary)")
+        lines.append("VoiceIdentityManager Configured: \(identityManager.configuredSnapshot.summary)")
+        let inf = identityManager.inferredSnapshot
+        lines.append("VoiceIdentityManager Inferred: engine=\(inf.actualEngineId) model=\(inf.actualModelId) speaker=\(inf.actualSpeakerId) sid=\(inf.actualNumericSID.map { String($0) } ?? "-") F0=\(inf.estimatedF0Hz.map { String(format: "%.1fHz", $0) } ?? "-") fallback=\(inf.fallbackOccurred) alert=\(identityManager.divergenceAlert ?? "none")")
         lines.append(String(format: "Behavior Engine V3: ActiveListening=%@ (Emitted=%d Suppressed=%d) | Cache=%d clips (%.2f MB Hits=%d Misses=%d LatP50=%.1fms) | UserStyle=%@",
                             behavior.enableActiveListening ? "on" : "off",
                             telemetry.backchannelsEmittedCount,

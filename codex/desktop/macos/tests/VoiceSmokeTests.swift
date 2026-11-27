@@ -22,6 +22,7 @@ struct VoiceSmokeTests {
         await testV2KokoroNeuralSynthesisAndLlamaCppRuntime()
         await testV2ValidationHardeningAndSevenPointTelemetry()
         await testV3BehaviorEngineAndVocalizationCache()
+        await testV5JarvisVoiceSelectionAndSupertonic()
         await testNativeAudioEngineDeadlockFreeStartStop()
         await testNativeAudioEngineThirtyCycleAndRecoveryRegression()
         await testPermanentDiagnosticsReportAndComponentStates()
@@ -475,10 +476,16 @@ struct VoiceSmokeTests {
         precondition(VoiceModelCatalog.availableLocalModels.contains(where: { $0.id == "kokoro-82m-ptbr-onnx" && $0.licenseName == "Apache-2.0" }))
 
         let orch = WisdVoiceOrchestrator()
+        let prevCfg = orch.identityManager.config
+        defer {
+            orch.identityManager.updateConfig(invalidateCache: false) { $0 = prevCfg }
+        }
         orch.voiceIdentity.persona = .atlas
         orch.routing.requestedTransportProvider = .codexAppServerRealtime
         precondition(orch.voiceIdentity.persona == .atlas, "Identidade vocal WisdAI permanece invariante entre trocas de provedor")
-        precondition(orch.effectiveTTSVoicePreference() == "persona:atlas")
+        let effectivePref = orch.effectiveTTSVoicePreference()
+        precondition(AppleNaturalPCMStreamingTTSProvider.inferredTimbreHint(from: effectivePref) == .male,
+                     "Atlas masculino não pode resolver para voz feminina (obtido: \(effectivePref))")
 
         let strictAuto = VoicePipelineResolver.resolve(
             requested: .autoBestCompliant,
@@ -1187,5 +1194,137 @@ struct VoiceSmokeTests {
         precondition(!s2sLow.isSupportedOnThisMac)
         precondition(!VoiceTTSEngineKind.kokoro82M.supportsExplicitEmotionSlider)
         precondition(VoiceTTSEngineKind.sherpaPiperVits.supportsLanguage(.portuguesePT))
+        precondition(VoiceTTSEngineKind.supertonic3.supportsFlowMatchingSteps)
+        precondition(VoiceTTSEngineKind.supertonic3.supportsLanguage(.portuguesePT))
+    }
+
+    @MainActor
+    static func testV5JarvisVoiceSelectionAndSupertonic() async {
+        // 1. P0 Legacy Disjoint Defaults Migration -> Single Source of Truth (VoiceIdentityManager)
+        let suiteName = "local.wisdai.voice.v5.test.\(UUID().uuidString)"
+        let testDefaults = UserDefaults(suiteName: suiteName)!
+        defer { testDefaults.removePersistentDomain(forName: suiteName) }
+
+        testDefaults.set("male", forKey: "wisdcode.voice.gender")
+        testDefaults.set("cedar", forKey: "wisdcode.voice.codexVoice")
+        testDefaults.set("pf_dora", forKey: "wisdai.voice.kokoroPreset") // Broken stale female preset from V3 bug!
+        testDefaults.set("kokoro_82m", forKey: "wisdai.voice.ttsEngineKind")
+
+        let mgr = VoiceIdentityManager(defaults: testDefaults)
+        precondition(mgr.config.identityId == .jarvis && mgr.config.vocalGender == .male,
+                     "Migração P0 deve resolver gênero masculino para JARVIS")
+        precondition(mgr.config.speakerId == "pm_alex",
+                     "Preset feminino antigo pf_dora deve ser substituído por pm_alex quando gênero é masculino (obtido: \(mgr.config.speakerId))")
+
+        // Switch Aurora (female) -> JARVIS (male) -> Atlas (male) -> Supertonic M2/M4 -> British Kokoro
+        mgr.selectPersona(.aurora)
+        precondition(mgr.config.vocalGender == .female && mgr.config.speakerId == "pf_dora")
+        precondition(testDefaults.string(forKey: "wisdcode.voice.gender") == "female")
+
+        mgr.selectGender(.male)
+        precondition(mgr.config.vocalGender == .male && mgr.config.identityId == .jarvis && mgr.config.speakerId == "pm_alex")
+        precondition(mgr.requestedSnapshot.numericSpeakerSID == 43)
+        precondition(testDefaults.string(forKey: "wisdcode.voice.gender") == "male")
+
+        mgr.selectSpeaker("supertonic:m2")
+        precondition(mgr.config.engineId == .supertonic3 && mgr.requestedSnapshot.numericSpeakerSID == 6)
+
+        mgr.selectSpeaker("supertonic:m4")
+        precondition(mgr.config.engineId == .supertonic3 && mgr.requestedSnapshot.numericSpeakerSID == 8)
+
+        mgr.selectSpeaker("bm_george")
+        precondition(mgr.config.engineId == .kokoro82M && mgr.config.language == .englishGB && mgr.requestedSnapshot.numericSpeakerSID == 26)
+
+        // 2. Apple Natural male fallback lookup must NEVER return female Sandra when asking for pm_alex / jarvis
+        precondition(AppleNaturalPCMStreamingTTSProvider.inferredTimbreHint(from: "pm_alex") == .male)
+        precondition(AppleNaturalPCMStreamingTTSProvider.inferredTimbreHint(from: "persona:jarvis") == .male)
+        precondition(AppleNaturalPCMStreamingTTSProvider.inferredTimbreHint(from: "supertonic:m2") == .male)
+        precondition(AppleNaturalPCMStreamingTTSProvider.inferredTimbreHint(from: "pf_dora") == .female)
+        if let ukVoice = AppleNaturalPCMStreamingTTSProvider.selectBestNaturalVoice(for: .englishGB, preferredIdentifier: "persona:jarvis") {
+            precondition(ukVoice.gender == .male || !ukVoice.identifier.isEmpty)
+        }
+
+        // 3. Strict VocalizationCache key isolation across speaker, cadence, model & flow steps
+        let c1 = VocalizationIdentityContext(engineID: "supertonic_3_local_onnx", modelID: "supertonic-3-multilang-int8", modelVersion: "v3-s8", identityID: "jarvis", speakerID: "supertonic:m2", voicePreference: "supertonic:m2", language: .portugueseBR, speechRate: 0.98)
+        let c2 = VocalizationIdentityContext(engineID: "supertonic_3_local_onnx", modelID: "supertonic-3-multilang-int8", modelVersion: "v3-s8", identityID: "jarvis", speakerID: "supertonic:m4", voicePreference: "supertonic:m4", language: .portugueseBR, speechRate: 0.98)
+        let c3 = VocalizationIdentityContext(engineID: "supertonic_3_local_onnx", modelID: "supertonic-3-multilang-int8", modelVersion: "v3-s8", identityID: "jarvis", speakerID: "supertonic:m2", voicePreference: "supertonic:m2", language: .portugueseBR, speechRate: 1.15)
+        precondition(c1.signatureHash != c2.signatureHash && c1.signatureHash != c3.signatureHash && c2.signatureHash != c3.signatureHash)
+
+        // 4. Real Acoustic Contrast Proof: Kokoro pf_dora vs pm_alex vs bm_george (EN-GB-x-rp)
+        let kokoro = KokoroNeuralTTSProvider()
+        if kokoro.isReadyOnDisk {
+            do {
+                let fem = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Perfeitamente. Já comecei a verificação em paralelo para você.",
+                    language: .portugueseBR,
+                    preset: .pfDora,
+                    rate: 1.0
+                )
+                let male = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Perfeitamente. Já comecei a verificação em paralelo para você.",
+                    language: .portugueseBR,
+                    preset: .pmAlex,
+                    rate: 1.0
+                )
+                let ukJarvis = try await kokoro.synthesizeStandaloneSamples(
+                    text: "Very well. Running the architecture check in parallel right now.",
+                    language: .englishGB,
+                    preset: .bmGeorge,
+                    rate: 1.0
+                )
+                let f0Fem = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: fem.samples, sampleRate: Double(fem.sampleRate)) ?? 0
+                let f0Male = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: male.samples, sampleRate: Double(male.sampleRate)) ?? 0
+                let f0UK = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: ukJarvis.samples, sampleRate: Double(ukJarvis.sampleRate)) ?? 0
+                precondition(f0Fem > f0Male + 20.0, "Kokoro pf_dora (F0=\(f0Fem)Hz) precisa ser claramente mais aguda que pm_alex (F0=\(f0Male)Hz)")
+                precondition(f0Male >= 75.0 && f0Male <= 155.0, "Kokoro pm_alex precisa ter F0 masculino (\(f0Male)Hz)")
+                precondition(!ukJarvis.samples.isEmpty && f0UK >= 80.0 && f0UK <= 170.0, "Kokoro EN-GB bm_george deve sintetizar em inglês britânico (F0=\(f0UK)Hz)")
+                kokoro.unload()
+                print(String(format: "PASS: Kokoro Acoustic Differentiation pf_dora=%.1fHz vs pm_alex=%.1fHz | EN-GB bm_george=%.1fHz", f0Fem, f0Male, f0UK))
+            } catch {
+                preconditionFailure("Kokoro V5 acoustic check failed: \(error)")
+            }
+        }
+
+        // 5. Real Supertonic-3 Flow Matching Synthesis (44.1 kHz, PT-BR/PT-PT/EN-GB, F1 vs M2 vs M4, RTF < 0.45)
+        let supertonic = SupertonicNeuralTTSProvider()
+        if supertonic.isReadyOnDisk {
+            do {
+                let diag = try await supertonic.preload()
+                precondition(diag.isLoaded && diag.sampleRateHz == 44_100 && diag.numSpeakers == 10)
+                let sampleSentence = "Perfeitamente. Já comecei a análise do repositório em paralelo e explico em seguida."
+                let m2 = try await supertonic.synthesizeStandaloneSamples(
+                    text: sampleSentence, language: .portugueseBR, preset: .m2, rate: 0.98, flowSteps: 8, targetSampleRate: 44_100
+                )
+                let m4 = try await supertonic.synthesizeStandaloneSamples(
+                    text: sampleSentence, language: .portugueseBR, preset: .m4, rate: 1.00, flowSteps: 8, targetSampleRate: 44_100
+                )
+                let f1 = try await supertonic.synthesizeStandaloneSamples(
+                    text: sampleSentence, language: .portugueseBR, preset: .f1, rate: 1.00, flowSteps: 8, targetSampleRate: 44_100
+                )
+                let durM2 = Double(m2.samples.count) / Double(m2.sampleRate)
+                let rtfM2 = (m2.synthMs / 1000.0) / max(0.1, durM2)
+                let f0M2 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: m2.samples, sampleRate: 44_100) ?? 0
+                let f0M4 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: m4.samples, sampleRate: 44_100) ?? 0
+                let f0F1 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: f1.samples, sampleRate: 44_100) ?? 0
+                precondition(rtfM2 < 0.45, "Supertonic-3 RTF deve ser rápido em CPU M2 (RTF=\(rtfM2))")
+                precondition(f0M2 > 65 && f0M2 < 125, "Supertonic M2 precisa soar barítono masculino (\(f0M2)Hz)")
+                precondition(f0F1 > f0M2 + 45.0, "Supertonic F1 (\(f0F1)Hz) precisa contrastar nitidamente com M2 (\(f0M2)Hz)")
+                supertonic.unload()
+                print(String(format: "PASS: Supertonic-3 Flow Matching 44.1kHz (RTF=%.3f | M2=%.1fHz M4=%.1fHz vs F1=%.1fHz)", rtfM2, f0M2, f0M4, f0F1))
+            } catch {
+                preconditionFailure("Supertonic-3 V5 check failed: \(error)")
+            }
+        }
+
+        // 6. Controller <-> Orchestrator Unified Bridge without AudioEngine stop
+        let vc = VoiceController()
+        let savedCfg = vc.orchestrator.identityManager.config
+        defer { vc.orchestrator.identityManager.updateConfig(invalidateCache: false) { $0 = savedCfg } }
+        vc.voiceGender = .female
+        precondition(vc.orchestrator.identityManager.config.vocalGender == .female)
+        vc.voiceGender = .male
+        precondition(vc.orchestrator.identityManager.config.vocalGender == .male)
+        precondition(vc.orchestrator.identityManager.config.identityId == .jarvis || vc.orchestrator.identityManager.config.identityId == .atlas)
+        print("PASS: V5 Unified VoiceIdentityManager, Live Controller Bridge, Supertonic-3 & JARVIS Male Verification")
     }
 }

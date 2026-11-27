@@ -121,6 +121,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
 
     public let orchestrator = WisdVoiceOrchestrator()
     private var orchestratorCancellables: Set<AnyCancellable> = []
+    private var isSyncingFromIdentityManager = false
 
     @Published var voiceGender: AgentVoiceGender {
         didSet {
@@ -132,6 +133,9 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
             if selectedVoiceID != "auto" {
                 selectedVoiceID = "auto"
             }
+            if !isSyncingFromIdentityManager {
+                orchestrator.identityManager.selectGender(voiceGender == .male ? .male : .female)
+            }
         }
     }
 
@@ -141,16 +145,39 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
             if let preset = CodexVoicePreset.catalog.first(where: { $0.id == selectedCodexVoiceID }),
                preset.gender != voiceGender {
                 voiceGender = preset.gender
+            } else if !isSyncingFromIdentityManager,
+                      let preset = CodexVoicePreset.catalog.first(where: { $0.id == selectedCodexVoiceID }) {
+                orchestrator.identityManager.selectGender(preset.gender == .male ? .male : .female)
             }
         }
     }
 
     @Published var selectedVoiceID: String {
-        didSet { UserDefaults.standard.set(selectedVoiceID, forKey: "wisdcode.voice.identifier") }
+        didSet {
+            UserDefaults.standard.set(selectedVoiceID, forKey: "wisdcode.voice.identifier")
+            if !isSyncingFromIdentityManager {
+                if selectedVoiceID != "auto" {
+                    orchestrator.identityManager.updateConfig(invalidateCache: true) { cfg in
+                        cfg.speakerId = self.selectedVoiceID
+                    }
+                    orchestrator.selectedVoiceIdentifier = selectedVoiceID
+                } else {
+                    orchestrator.selectedVoiceIdentifier = "auto"
+                }
+            }
+        }
     }
 
     @Published var speechSpeed: Double {
-        didSet { UserDefaults.standard.set(speechSpeed, forKey: "wisdcode.voice.speed") }
+        didSet {
+            UserDefaults.standard.set(speechSpeed, forKey: "wisdcode.voice.speed")
+            if !isSyncingFromIdentityManager {
+                let targetSpeed = min(1.30, max(0.75, speechSpeed))
+                orchestrator.identityManager.updateConfig(invalidateCache: true) { cfg in
+                    cfg.speechRate = targetSpeed
+                }
+            }
+        }
     }
 
     @Published var preferCloudNeuralTTS: Bool {
@@ -232,19 +259,20 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
     var onStopRequested: (() -> Void)?
 
     override init() {
-        let savedGenderRaw = UserDefaults.standard.string(forKey: "wisdcode.voice.gender") ?? AgentVoiceGender.female.rawValue
-        let initialGender = AgentVoiceGender(rawValue: savedGenderRaw) ?? .female
+        let initialUnified = orchestrator.identityManager.config
+        let initialGender: AgentVoiceGender = (initialUnified.vocalGender == .male) ? .male : .female
         self.voiceGender = initialGender
         let savedCodexVoice = UserDefaults.standard.string(forKey: "wisdcode.voice.codexVoice")
         if let savedCodexVoice,
-           CodexVoicePreset.catalog.contains(where: { $0.id == savedCodexVoice }) {
+           let matchedPreset = CodexVoicePreset.catalog.first(where: { $0.id == savedCodexVoice }),
+           matchedPreset.gender == initialGender {
             self.selectedCodexVoiceID = savedCodexVoice
         } else {
             self.selectedCodexVoiceID = initialGender.defaultCodexVoiceID
         }
-        self.selectedVoiceID = UserDefaults.standard.string(forKey: "wisdcode.voice.identifier") ?? "auto"
-        let savedSpeed = UserDefaults.standard.object(forKey: "wisdcode.voice.speed") as? Double ?? 1.0
-        self.speechSpeed = min(1.25, max(0.80, savedSpeed))
+        let savedSysID = UserDefaults.standard.string(forKey: "wisdcode.voice.identifier") ?? "auto"
+        self.selectedVoiceID = savedSysID
+        self.speechSpeed = min(1.25, max(0.80, initialUnified.speechRate))
         self.preferCloudNeuralTTS = UserDefaults.standard.object(forKey: "wisdcode.voice.cloudNeural") as? Bool ?? true
         let savedPalette = UserDefaults.standard.string(forKey: "wisdcode.voice.orbPalette") ?? CodexOrbPalette.blue.rawValue
         self.orbPalette = CodexOrbPalette(rawValue: savedPalette) ?? .blue
@@ -339,6 +367,30 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
                 self.isOutputMuted = outMuted
             }
             .store(in: &orchestratorCancellables)
+
+        orchestrator.identityManager.$config
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] nextCfg in
+                guard let self, !self.isSyncingFromIdentityManager else { return }
+                self.isSyncingFromIdentityManager = true
+                defer { self.isSyncingFromIdentityManager = false }
+                let mappedGender: AgentVoiceGender = (nextCfg.vocalGender == .male) ? .male : .female
+                if self.voiceGender != mappedGender {
+                    self.voiceGender = mappedGender
+                }
+                if abs(self.speechSpeed - nextCfg.speechRate) > 0.01 {
+                    self.speechSpeed = min(1.25, max(0.80, nextCfg.speechRate))
+                }
+            }
+            .store(in: &orchestratorCancellables)
+
+        orchestrator.previewPlayer.$isPlaying
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] previewPlaying in
+                guard let self, !self.orchestrator.isVoiceSessionActive else { return }
+                self.isSpeaking = previewPlaying
+            }
+            .store(in: &orchestratorCancellables)
     }
 
     // MARK: - Catálogo de Vozes Codex e do Sistema
@@ -359,13 +411,14 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
     }
 
     var activeVoiceSummary: String {
+        let cfg = orchestrator.identityManager.configuredSnapshot
         if orchestrator.isVoiceSessionActive {
-            return "Motor Autônomo WisdAI · \(orchestrator.voiceIdentity.persona.displayName) · \(orchestrator.brainStatus.rawValue)"
+            return "Motor Autônomo · \(cfg.identityId.shortName) · \(cfg.engineId.shortName) (\(cfg.speakerId)) · \(orchestrator.brainStatus.rawValue)"
         }
         if isVoiceModeActive && isConnecting {
-            return "Inicializando Motor WisdAI · \(orchestrator.voiceIdentity.persona.displayName)"
+            return "Inicializando Motor WisdAI · \(cfg.identityId.shortName) · \(cfg.speakerId)"
         }
-        return "Voz WisdAI · \(orchestrator.voiceIdentity.persona.displayName)"
+        return "\(cfg.identityId.shortName) · \(cfg.engineId.shortName) · \(cfg.speakerId) (\(cfg.language.shortCode))"
     }
 
     static func discoverPortugueseVoices() -> [NaturalVoiceOption] {
@@ -622,8 +675,6 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         self.onSpeechFinalized = onSpeech
         CodexVoiceAudioCues.shared.play(.realtimeStart, enabled: voiceSoundsEnabled)
 
-        orchestrator.selectedVoiceIdentifier = (selectedVoiceID != "auto") ? selectedVoiceID : "auto"
-        speechSpeed = Double(orchestrator.behavior.speechRate)
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.orchestrator.startSessionWithContinuity(
@@ -799,10 +850,19 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
     }
 
     func previewVoice() {
-        let sample = voiceGender == .male
-            ? "Oi! Aqui é o assistente de voz do WisdAI no estilo Codex. Pode conversar comigo que eu respondo direto por aqui."
-            : "Oi! Aqui é a assistente de voz do WisdAI no estilo Codex. Pode conversar comigo que eu respondo direto por aqui."
-        speak(sample)
+        stopSpeaking()
+        voiceErrorMessage = nil
+        voiceFeedbackStatus = "Sintetizando prévia com \(orchestrator.identityManager.configuredSnapshot.speakerId)…"
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let res = await self.orchestrator.previewCurrentConfiguredVoice(playAudio: true)
+            if res.ok {
+                self.voiceFeedbackStatus = "Prévia: \(res.engineUsed) (\(res.detail))"
+            } else {
+                self.voiceErrorMessage = res.detail
+                self.voiceFeedbackStatus = "Prévia falhou"
+            }
+        }
     }
 
     func openPrivacySettings() {
@@ -1668,6 +1728,7 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         cloudTTSTask = nil
         audioPlayer?.stop()
         audioPlayer = nil
+        orchestrator.previewPlayer.stop()
         teardownPlaybackEngine()
         if synthesizer.isSpeaking {
             synthesizer.stopSpeaking(at: .immediate)
@@ -1691,6 +1752,33 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
 
     private func startLocalNaturalSpeech(sentences: [String], token: UUID) {
         guard speechToken == token else { return }
+        let fullText = sentences.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let activeProvider = orchestrator.selectActiveTTSProvider()
+        if !fullText.isEmpty && activeProvider.providerID != orchestrator.appleTTS.providerID {
+            Task { @MainActor [weak self] in
+                guard let self, self.speechToken == token else { return }
+                let cfg = self.orchestrator.identityManager.config
+                let res = await self.orchestrator.synthesizeAndPreviewVoiceSample(
+                    text: fullText,
+                    ttsEngine: cfg.engineId,
+                    kokoroPreset: self.orchestrator.effectiveKokoroPreset(for: cfg.language),
+                    language: cfg.language,
+                    rate: self.orchestrator.effectiveSpeechRate(),
+                    playAudio: true,
+                    applyBehaviorComposition: true
+                )
+                if !res.ok && self.speechToken == token {
+                    let resolution = Self.resolveBestVoice(for: self.voiceGender, explicitID: self.selectedVoiceID)
+                    self.activeNativeVoice = resolution.voice
+                    self.activeUseBaritoneShift = resolution.useBaritoneShift
+                    self.pendingSentences = sentences
+                    self.playNextLocalSentence(token: token)
+                } else {
+                    self.isSpeaking = res.ok && self.orchestrator.previewPlayer.isPlaying
+                }
+            }
+            return
+        }
         let resolution = Self.resolveBestVoice(for: voiceGender, explicitID: selectedVoiceID)
         self.activeNativeVoice = resolution.voice
         self.activeUseBaritoneShift = resolution.useBaritoneShift

@@ -25,16 +25,44 @@ public struct VocalizationVariantSpec: Equatable, Hashable, Codable, Sendable {
 
 public struct VocalizationIdentityContext: Equatable, Hashable, Sendable {
     public let engineID: String
+    public let modelID: String
+    public let modelVersion: String
+    public let identityID: String
+    public let speakerID: String
     public let voicePreference: String
     public let language: VoiceLanguageVariant
+    public let speechRateBucket: Int
+    public let prosodySignature: String
+
+    public init(
+        engineID: String,
+        modelID: String = "default",
+        modelVersion: String = "v5",
+        identityID: String = "default",
+        speakerID: String = "auto",
+        voicePreference: String,
+        language: VoiceLanguageVariant,
+        speechRate: Float = 1.0,
+        prosodySignature: String = "balanced"
+    ) {
+        self.engineID = engineID.lowercased()
+        self.modelID = modelID.lowercased()
+        self.modelVersion = modelVersion.lowercased()
+        self.identityID = identityID.lowercased()
+        self.speakerID = speakerID.lowercased()
+        self.voicePreference = voicePreference.lowercased()
+        self.language = language
+        self.speechRateBucket = Int((min(1.5, max(0.6, speechRate)) * 20.0).rounded()) // 0.05 rate granularity
+        self.prosodySignature = prosodySignature.lowercased()
+    }
 
     public var signature: String {
-        "\(engineID)|\(voicePreference.lowercased())|\(language.rawValue)"
+        "v5|\(engineID)|\(modelID)|\(modelVersion)|\(identityID)|\(speakerID)|\(voicePreference)|\(language.rawValue)|r\(speechRateBucket)|\(prosodySignature)"
     }
 
     public var signatureHash: String {
         let digest = SHA256.hash(data: Data(signature.utf8))
-        return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return "v5_" + digest.prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -101,7 +129,20 @@ public final class VocalizationCacheEngine: ObservableObject {
         } else {
             let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
                 ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-            self.diskRootDirectory = support.appendingPathComponent("WisdAI/Voice/VocalizationCache", isDirectory: true)
+            let root = support.appendingPathComponent("WisdAI/Voice/VocalizationCache", isDirectory: true)
+            self.diskRootDirectory = root
+            if !UserDefaults.standard.bool(forKey: "wisdai.voice.v5.cachePurgedLegacy") {
+                Self.purgeNonV5Directories(under: root)
+                UserDefaults.standard.set(true, forKey: "wisdai.voice.v5.cachePurgedLegacy")
+            }
+        }
+    }
+
+    public static func purgeNonV5Directories(under root: URL) {
+        let fm = FileManager.default
+        guard let children = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        for url in children where !url.lastPathComponent.hasPrefix("v5_") {
+            try? fm.removeItem(at: url)
         }
     }
 

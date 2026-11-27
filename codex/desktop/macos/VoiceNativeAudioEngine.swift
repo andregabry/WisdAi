@@ -810,6 +810,51 @@ public enum AudioPCMConverter {
         return output
     }
 
+    /// Anti-aliased CoreAudio AVAudioConverter resampler (preserves studio warmth when downsampling 44.1 kHz -> 24 kHz).
+    public static func resampleHighQuality(
+        samples: [Float],
+        fromSampleRate: Double,
+        toSampleRate: Double
+    ) -> [Float] {
+        guard !samples.isEmpty, fromSampleRate > 0, toSampleRate > 0 else { return [] }
+        if abs(fromSampleRate - toSampleRate) < 1.0 { return samples }
+        guard let inFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: fromSampleRate, channels: 1, interleaved: false),
+              let outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: toSampleRate, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: inFormat, to: outFormat),
+              let inBuffer = AVAudioPCMBuffer(pcmFormat: inFormat, frameCapacity: AVAudioFrameCount(samples.count)) else {
+            return resampleLinear(samples: samples, fromSampleRate: fromSampleRate, toSampleRate: toSampleRate)
+        }
+        inBuffer.frameLength = AVAudioFrameCount(samples.count)
+        if let ch = inBuffer.floatChannelData?[0] {
+            samples.withUnsafeBufferPointer { src in
+                if let base = src.baseAddress {
+                    ch.update(from: base, count: samples.count)
+                }
+            }
+        }
+        let ratio = toSampleRate / fromSampleRate
+        let outCap = max(64, AVAudioFrameCount((Double(samples.count) * ratio).rounded(.up) + 32))
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCap) else {
+            return resampleLinear(samples: samples, fromSampleRate: fromSampleRate, toSampleRate: toSampleRate)
+        }
+        final class FeedState: @unchecked Sendable { var fed = false }
+        let feedState = FeedState()
+        var convErr: NSError?
+        converter.convert(to: outBuffer, error: &convErr) { _, outStatus in
+            if feedState.fed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            feedState.fed = true
+            outStatus.pointee = .haveData
+            return inBuffer
+        }
+        if convErr == nil, outBuffer.frameLength > 0, let outPtr = outBuffer.floatChannelData?[0] {
+            return Array(UnsafeBufferPointer(start: outPtr, count: Int(outBuffer.frameLength)))
+        }
+        return resampleLinear(samples: samples, fromSampleRate: fromSampleRate, toSampleRate: toSampleRate)
+    }
+
     public static func mixToMono(buffer: AVAudioPCMBuffer) -> [Float] {
         let frameCount = Int(buffer.frameLength)
         guard frameCount > 0, let channelData = buffer.floatChannelData else { return [] }

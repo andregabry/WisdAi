@@ -8,6 +8,7 @@ import Speech
 public enum VoiceLanguageVariant: String, CaseIterable, Identifiable, Codable, Sendable {
     case portugueseBR = "pt-BR"
     case portuguesePT = "pt-PT"
+    case englishGB = "en-GB"
     case englishUS = "en-US"
     case spanishES = "es-ES"
 
@@ -17,6 +18,7 @@ public enum VoiceLanguageVariant: String, CaseIterable, Identifiable, Codable, S
         switch self {
         case .portugueseBR: return "Português (Brasil)"
         case .portuguesePT: return "Português (Portugal)"
+        case .englishGB: return "English (UK)"
         case .englishUS: return "English (US)"
         case .spanishES: return "Español"
         }
@@ -26,6 +28,7 @@ public enum VoiceLanguageVariant: String, CaseIterable, Identifiable, Codable, S
         switch self {
         case .portugueseBR: return "PT-BR"
         case .portuguesePT: return "PT-PT"
+        case .englishGB: return "EN-GB"
         case .englishUS: return "EN"
         case .spanishES: return "ES"
         }
@@ -36,7 +39,7 @@ public enum VoiceLanguageVariant: String, CaseIterable, Identifiable, Codable, S
     public var bcp47LanguagePrefix: String {
         switch self {
         case .portugueseBR, .portuguesePT: return "pt"
-        case .englishUS: return "en"
+        case .englishGB, .englishUS: return "en"
         case .spanishES: return "es"
         }
     }
@@ -1265,10 +1268,60 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
     private let lock = NSLock()
     private var cancelled = false
     private var activeCancelHook: (@Sendable () -> Void)?
+    private var _lastResolvedVoice: (id: String, name: String, gender: AVSpeechSynthesisVoiceGender, quality: AVSpeechSynthesisVoiceQuality)?
+    private var _lastSelectionWarning: String?
+
+    public var lastResolvedVoiceSnapshot: (id: String, name: String, gender: AVSpeechSynthesisVoiceGender, quality: AVSpeechSynthesisVoiceQuality)? {
+        lock.withLock { _lastResolvedVoice }
+    }
+
+    public var lastSelectionWarning: String? {
+        lock.withLock { _lastSelectionWarning }
+    }
 
     public override init() {
         super.init()
         synth.delegate = self
+    }
+
+    public static func inferredTimbreHint(from preferredIdentifier: String?) -> AVSpeechSynthesisVoiceGender? {
+        guard let raw = preferredIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !raw.isEmpty,
+              raw != "auto" else {
+            return nil
+        }
+        let exactMaleTokens: Set<String> = ["jarvis", "atlas", "male", "homem", "masculino", "masculina", "m1", "m2", "m3", "m4", "m5"]
+        let substringMaleTokens = [
+            "persona:jarvis", "persona:atlas", "supertonic:m",
+            "pm_alex", "pm_santa", "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+            "am_michael", "am_onyx", "am_fenrir", "am_adam", "am_echo", "am_eric", "am_liam", "am_puck", "am_santa",
+            "em_alex", "em_santa",
+            "cedar", "cove", "arbor", "spruce", "ember", "ash", "ballad", "echo", "verse",
+            "cadu", "faber", "jeff", "miro", "daniel", "arthur", "felipe", "tugao"
+        ]
+        if exactMaleTokens.contains(raw) || substringMaleTokens.contains(where: { raw.contains($0) }) || raw.hasPrefix("pm_") || raw.hasPrefix("bm_") || raw.hasPrefix("am_") || raw.hasPrefix("em_") {
+            return .male
+        }
+        let exactFemaleTokens: Set<String> = ["aurora", "aria", "female", "mulher", "feminino", "feminina", "f1", "f2", "f3", "f4", "f5"]
+        let substringFemaleTokens = [
+            "persona:aurora", "persona:aria", "supertonic:f",
+            "pf_dora", "af_heart", "af_bella", "af_nova", "bf_emma", "bf_alice", "ef_dora",
+            "marin", "coral", "juniper", "breeze", "maple", "vale", "sol", "shimmer", "sage",
+            "luciana", "joana", "sandra", "samantha"
+        ]
+        if exactFemaleTokens.contains(raw) || substringFemaleTokens.contains(where: { raw.contains($0) }) || raw.hasPrefix("pf_") || raw.hasPrefix("bf_") || raw.hasPrefix("af_") || raw.hasPrefix("ef_") {
+            return .female
+        }
+        return nil
+    }
+
+    public static func hasInstalledNonEloquenceMaleVoice(for language: VoiceLanguageVariant) -> Bool {
+        let exact = AVSpeechSynthesisVoice.speechVoices().filter {
+            $0.language.caseInsensitiveCompare(language.appleLocaleIdentifier) == .orderedSame
+        }
+        return exact.contains { v in
+            !v.identifier.lowercased().contains("eloquence") && v.gender == .male
+        }
     }
 
     public static func selectBestNaturalVoice(
@@ -1279,15 +1332,43 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
         if let preferredIdentifier,
            preferredIdentifier != "auto",
            !preferredIdentifier.hasPrefix("persona:"),
+           !preferredIdentifier.hasPrefix("supertonic:"),
            let exact = AVSpeechSynthesisVoice(identifier: preferredIdentifier) {
             return exact
         }
-        let wantsMale = preferredIdentifier == "persona:atlas"
-        let wantsFemale = preferredIdentifier == "persona:aurora" || preferredIdentifier == "persona:aria"
+        let inferredGender = inferredTimbreHint(from: preferredIdentifier)
+        let wantsMale = inferredGender == .male
+        let wantsFemale = inferredGender == .female
+
         if language.bcp47LanguagePrefix == "pt", !wantsMale {
             for siriID in ["com.apple.siri.natural.Sandra", "com.apple.siri.natural.pt-BR.female"] {
                 if let siriVoice = AVSpeechSynthesisVoice(identifier: siriID) {
                     return siriVoice
+                }
+            }
+        }
+        if language == .portugueseBR && wantsMale {
+            for maleID in [
+                "com.apple.siri.natural.pt-BR.male",
+                "com.apple.voice.premium.pt-BR.Felipe",
+                "com.apple.voice.enhanced.pt-BR.Felipe",
+                "com.apple.voice.compact.pt-BR.Felipe"
+            ] {
+                if let maleVoice = AVSpeechSynthesisVoice(identifier: maleID) {
+                    return maleVoice
+                }
+            }
+        }
+        if language == .englishGB && wantsMale {
+            for ukMaleID in [
+                "com.apple.siri.natural.en-GB.male",
+                "com.apple.voice.premium.en-GB.Daniel",
+                "com.apple.voice.enhanced.en-GB.Daniel",
+                "com.apple.voice.super-compact.en-GB.Daniel",
+                "com.apple.voice.compact.en-GB.Daniel"
+            ] {
+                if let maleVoice = AVSpeechSynthesisVoice(identifier: ukMaleID) {
+                    return maleVoice
                 }
             }
         }
@@ -1304,8 +1385,14 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
                 var s = v.quality.rawValue * 100
                 if idL.contains("siri") || idL.contains("natural") { s += 500 }
                 if idL.contains("eloquence") { s -= 1000 }
-                if wantsMale && v.gender == .male { s += 250 }
-                if wantsFemale && v.gender == .female { s += 250 }
+                if wantsMale {
+                    if v.gender == .male { s += 350 }
+                    if v.gender == .female { s -= 150 }
+                }
+                if wantsFemale {
+                    if v.gender == .female { s += 350 }
+                    if v.gender == .male { s -= 150 }
+                }
                 return s
             }
             return score(a) > score(b)
@@ -1344,7 +1431,22 @@ public final class AppleNaturalPCMStreamingTTSProvider: NSObject, StreamingTextT
         lock.withLock { cancelled = false }
 
         let utterance = AVSpeechUtterance(string: clean)
-        utterance.voice = Self.selectBestNaturalVoice(for: language, preferredIdentifier: voicePreference)
+        let resolvedVoice = Self.selectBestNaturalVoice(for: language, preferredIdentifier: voicePreference)
+        utterance.voice = resolvedVoice
+        let inferredDesired = Self.inferredTimbreHint(from: voicePreference)
+        lock.withLock {
+            if let resolvedVoice {
+                _lastResolvedVoice = (resolvedVoice.identifier, resolvedVoice.name, resolvedVoice.gender, resolvedVoice.quality)
+                if inferredDesired == .male && resolvedVoice.gender != .male {
+                    _lastSelectionWarning = "Apple Natural não possui voz masculina nativa instalada para \(language.displayName); reproduzindo \(resolvedVoice.name) (gênero macOS \(resolvedVoice.gender.rawValue)). Use Supertonic-3 ou Kokoro-82M para timbre masculino real."
+                } else {
+                    _lastSelectionWarning = nil
+                }
+            } else {
+                _lastResolvedVoice = nil
+                _lastSelectionWarning = "Nenhuma voz Apple instalada para \(language.displayName)."
+            }
+        }
         // Map friendly 0.75...1.35 scale around Apple's default rate smoothly.
         let clampedRate = min(max(rate, 0.75), 1.35)
         utterance.rate = min(AVSpeechUtteranceMaximumSpeechRate, max(AVSpeechUtteranceMinimumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * clampedRate))

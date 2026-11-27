@@ -702,7 +702,7 @@ struct VoiceSettingsSection: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Voz do agente")
+                        Text("Identidade e Voz do Agente")
                             .font(.system(size: 13, weight: .semibold))
                         Spacer()
                         Text(voice.activeVoiceSummary)
@@ -723,16 +723,15 @@ struct VoiceSettingsSection: View {
                         }
                     }
 
-                    // Perfis de voz Codex do gênero selecionado
+                    // Identidades vocais WisdAI (JARVIS, Atlas, Aurora, Aria) -> fonte única VoiceIdentityManager
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            ForEach(voice.availableCodexVoices.filter { $0.gender == voice.voiceGender }) { preset in
-                                let isCurrent = voice.selectedCodexVoiceID == preset.id
+                            ForEach(WisdVoicePersona.allCases) { persona in
+                                let isCurrent = voice.orchestrator.identityManager.config.identityId == persona
                                 Button {
-                                    voice.selectedVoiceID = "auto"
-                                    voice.selectedCodexVoiceID = preset.id
+                                    voice.orchestrator.identityManager.selectPersona(persona)
                                 } label: {
-                                    Text(preset.displayName)
+                                    Text(persona.shortName)
                                         .font(.system(size: 11.5, weight: .semibold))
                                         .foregroundStyle(isCurrent ? Color.white : WisdTheme.ink(colorScheme))
                                         .padding(.horizontal, 11)
@@ -742,11 +741,17 @@ struct VoiceSettingsSection: View {
                                         )
                                 }
                                 .buttonStyle(.plain)
-                                .help(preset.subtitle)
+                                .help(persona.subtitle)
                             }
                         }
                     }
                     .padding(.top, 2)
+
+                    if let alert = voice.orchestrator.identityManager.divergenceAlert {
+                        Label(alert, systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                    }
                 }
 
                 Rectangle()
@@ -1002,26 +1007,81 @@ struct VoiceSelectorPopoverView: View {
 
                 Rectangle().fill(WisdTheme.divider(colorScheme)).frame(height: 1)
 
-                WisdPopoverSection("Vozes do Assistente Codex") {
+                WisdPopoverSection("Identidades & Speakers Neurais") {
                     ScrollView {
                         VStack(spacing: 2) {
-                            ForEach(voice.availableCodexVoices) { preset in
+                            ForEach(WisdVoicePersona.allCases) { persona in
+                                let selected = voice.orchestrator.identityManager.config.identityId == persona && voice.selectedVoiceID == "auto"
                                 WisdSelectableRow(
-                                    icon: preset.gender.iconName,
+                                    icon: persona.recommendedTimbre == .male ? "person.wave.2" : "person.wave.2.fill",
                                     iconColor: WisdTheme.softAccentText,
-                                    title: preset.displayName,
-                                    subtitle: "\(preset.gender.displayName) · \(preset.subtitle)",
-                                    selected: voice.selectedVoiceID == "auto" && voice.selectedCodexVoiceID == preset.id,
-                                    badge: preset.gender.displayName,
+                                    title: persona.displayName,
+                                    subtitle: persona.subtitle,
+                                    selected: selected,
+                                    badge: persona.recommendedTimbre == .male ? "Masculina" : "Feminina",
                                     badgeColor: WisdTheme.accent
                                 ) {
                                     voice.selectedVoiceID = "auto"
-                                    voice.selectedCodexVoiceID = preset.id
+                                    voice.orchestrator.identityManager.selectPersona(persona)
+                                }
+                            }
+
+                            if voice.orchestrator.supertonicTTS.isReadyOnDisk {
+                                Text("Speakers Supertonic-3 (44.1 kHz)")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .foregroundStyle(WisdTheme.muted(colorScheme))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 10)
+                                    .padding(.top, 8)
+                                    .padding(.bottom, 2)
+
+                                ForEach(SupertonicVoicePreset.allCases) { st in
+                                    let cfg = voice.orchestrator.identityManager.config
+                                    let isSelected = cfg.engineId == .supertonic3 && cfg.speakerId == st.rawValue
+                                    WisdSelectableRow(
+                                        icon: st.timbre == .male ? "person.wave.2" : "person.wave.2.fill",
+                                        iconColor: WisdTheme.softAccentText,
+                                        title: st.displayName,
+                                        subtitle: "Supertonic-3 ONNX · Flow Matching 44.1kHz",
+                                        selected: isSelected,
+                                        badge: st.timbre == .male ? "Homem" : "Mulher",
+                                        badgeColor: WisdTheme.accent
+                                    ) {
+                                        voice.selectedVoiceID = "auto"
+                                        voice.orchestrator.identityManager.selectSpeaker(st.rawValue)
+                                    }
+                                }
+                            }
+
+                            if voice.orchestrator.kokoroTTS.isReadyOnDisk {
+                                Text("Speakers Kokoro-82M (24 kHz)")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                    .foregroundStyle(WisdTheme.muted(colorScheme))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 10)
+                                    .padding(.top, 8)
+                                    .padding(.bottom, 2)
+
+                                ForEach(KokoroVoicePreset.allCases) { kok in
+                                    let cfg = voice.orchestrator.identityManager.config
+                                    let isSelected = (cfg.engineId == .kokoro82M || cfg.engineId == .autoLocal) && cfg.speakerId == kok.rawValue
+                                    WisdSelectableRow(
+                                        icon: kok.timbre == .male ? "person.wave.2" : "person.wave.2.fill",
+                                        iconColor: WisdTheme.softAccentText,
+                                        title: kok.displayName,
+                                        subtitle: "Kokoro-82M ONNX · \(kok.supportedLanguage.shortCode)",
+                                        selected: isSelected,
+                                        badge: kok.timbre == .male ? "Homem" : "Mulher",
+                                        badgeColor: WisdTheme.accent
+                                    ) {
+                                        voice.selectedVoiceID = "auto"
+                                        voice.orchestrator.identityManager.selectSpeaker(kok.rawValue)
+                                    }
                                 }
                             }
 
                             if !voice.availablePortugueseVoices.isEmpty {
-                                Text("Vozes instaladas neste Mac")
+                                Text("Vozes Apple instaladas neste Mac")
                                     .font(.system(size: 10.5, weight: .semibold))
                                     .foregroundStyle(WisdTheme.muted(colorScheme))
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1047,7 +1107,7 @@ struct VoiceSelectorPopoverView: View {
                         }
                         .padding(.horizontal, 10)
                     }
-                    .frame(maxHeight: 205)
+                    .frame(maxHeight: 245)
                 }
 
                 Rectangle().fill(WisdTheme.divider(colorScheme)).frame(height: 1)

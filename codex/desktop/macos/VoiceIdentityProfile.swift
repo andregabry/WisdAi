@@ -11,6 +11,7 @@ public enum WisdVoiceTimbre: String, CaseIterable, Identifiable, Codable, Sendab
 }
 
 public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Sendable {
+    case jarvis   // WisdAI Executive Male Identity (Serene, Lucid, Refined)
     case aurora   // WisdAI Signature Female Natural
     case atlas    // WisdAI Structured Male
     case aria     // WisdAI Energetic Brainstorm
@@ -19,14 +20,25 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
 
     public var displayName: String {
         switch self {
+        case .jarvis: return "JARVIS · Executivo WisdAI"
         case .aurora: return "Aurora · WisdAI Padrão"
         case .atlas: return "Atlas · WisdAI Estruturada"
         case .aria: return "Aria · WisdAI Dinâmica"
         }
     }
 
+    public var shortName: String {
+        switch self {
+        case .jarvis: return "JARVIS"
+        case .aurora: return "Aurora"
+        case .atlas: return "Atlas"
+        case .aria: return "Aria"
+        }
+    }
+
     public var subtitle: String {
         switch self {
+        case .jarvis: return "Voz masculina refinada, articulada, calma e estratégica"
         case .aurora: return "Timbre natural, acolhedor e fluido"
         case .atlas: return "Tom firme, calmo e técnico"
         case .aria: return "Ritmo ágil e colaborativo para brainstorming"
@@ -35,24 +47,44 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
 
     public var recommendedTimbre: WisdVoiceTimbre {
         switch self {
+        case .jarvis, .atlas: return .male
         case .aurora, .aria: return .female
-        case .atlas: return .male
         }
     }
 
     public var kokoroStyleVectorID: String {
         switch self {
+        case .jarvis: return "pm_alex"
         case .aurora: return "pf_dora"
-        case .atlas: return "pm_alex"
+        case .atlas: return "pm_santa"
         case .aria: return "pf_dora"
+        }
+    }
+
+    public var defaultSupertonicPresetID: String {
+        switch self {
+        case .jarvis: return "supertonic:m2" // sid=6: deep calm baritone ~90Hz
+        case .atlas: return "supertonic:m5"  // sid=9: authoritative baritone ~92Hz
+        case .aurora: return "supertonic:f1" // sid=0: clean neutral female
+        case .aria: return "supertonic:f4"   // sid=3: expressive female
         }
     }
 
     public var baseCadenceRate: Float {
         switch self {
+        case .jarvis: return 0.98
         case .aurora: return 1.00
         case .atlas: return 0.96
         case .aria: return 1.07
+        }
+    }
+
+    public var recommendedPersonalityStyle: VoicePersonalityStyle {
+        switch self {
+        case .jarvis: return .jarvisExecutive
+        case .atlas: return .conciseExecutive
+        case .aurora: return .naturalPartner
+        case .aria: return .creativeBrainstorm
         }
     }
 }
@@ -67,6 +99,13 @@ public struct VoiceIdentityDescriptor: Equatable, Codable, Sendable {
         persona: .aurora,
         warmth: 0.80,
         clarityEmphasis: 0.75,
+        brandName: "WisdAI"
+    )
+
+    public static let jarvisDefault = VoiceIdentityDescriptor(
+        persona: .jarvis,
+        warmth: 0.72,
+        clarityEmphasis: 0.88,
         brandName: "WisdAI"
     )
 }
@@ -138,6 +177,7 @@ public enum VoiceExecutionArchitectureMode: String, CaseIterable, Identifiable, 
 
 public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sendable {
     case autoLocal = "auto_local"
+    case supertonic3 = "supertonic_3"
     case kokoro82M = "kokoro_82m"
     case sherpaPiperVits = "sherpa_piper_vits"
     case appleNaturalPCM = "apple_natural"
@@ -151,8 +191,9 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
 
     public var displayName: String {
         switch self {
-        case .autoLocal: return "Automático Local (Kokoro Neural se pronto, senão Apple Natural)"
-        case .kokoro82M: return "Kokoro-82M Neural (ONNX Local · PT-BR / EN / ES)"
+        case .autoLocal: return "Automático Local (Melhor Motor Neural Pronto)"
+        case .supertonic3: return "Supertonic-3 Flow Matching (ONNX 44.1 kHz · PT/EN/ES)"
+        case .kokoro82M: return "Kokoro-82M Neural (ONNX 24 kHz · PT-BR / EN-GB / EN-US / ES)"
         case .sherpaPiperVits: return "Piper VITS Neural (ONNX Local · PT-BR & PT-PT Nativo · PoC)"
         case .appleNaturalPCM: return "Apple Voz Natural (macOS Nativo · Sem Download)"
         case .cosyVoice2: return "CosyVoice2 / 3 (Servidor MLX/PyTorch Loopback)"
@@ -160,6 +201,21 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
         case .sesameCSM: return "Sesame CSM-1B (Servidor MLX/PyTorch · Inglês)"
         case .diaTTS: return "Nari Labs Dia-1.6B (Apache-2.0 · Inglês · 10+ GB RAM)"
         case .f5TTS: return "F5-TTS (Aviso: Licença CC-BY-NC-4.0 Não Comercial)"
+        }
+    }
+
+    public var shortName: String {
+        switch self {
+        case .autoLocal: return "Auto Neural"
+        case .supertonic3: return "Supertonic-3 (44.1kHz)"
+        case .kokoro82M: return "Kokoro-82M"
+        case .sherpaPiperVits: return "Piper VITS"
+        case .appleNaturalPCM: return "Apple Natural"
+        case .cosyVoice2: return "CosyVoice2/3"
+        case .chatterbox: return "Chatterbox MIT"
+        case .sesameCSM: return "Sesame CSM-1B"
+        case .diaTTS: return "Dia-1.6B"
+        case .f5TTS: return "F5-TTS"
         }
     }
 
@@ -172,7 +228,7 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
 
     public var supportsSpeedControl: Bool {
         switch self {
-        case .autoLocal, .kokoro82M, .sherpaPiperVits, .appleNaturalPCM, .chatterbox, .cosyVoice2:
+        case .autoLocal, .supertonic3, .kokoro82M, .sherpaPiperVits, .appleNaturalPCM, .chatterbox, .cosyVoice2:
             return true
         default:
             return false
@@ -188,7 +244,14 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
 
     public var supportsDynamicSilenceScale: Bool {
         switch self {
-        case .autoLocal, .kokoro82M, .sherpaPiperVits: return true
+        case .autoLocal, .supertonic3, .kokoro82M, .sherpaPiperVits: return true
+        default: return false
+        }
+    }
+
+    public var supportsFlowMatchingSteps: Bool {
+        switch self {
+        case .supertonic3: return true
         default: return false
         }
     }
@@ -197,8 +260,17 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
         return supportsSpeedControl
     }
 
+    public var supportsVoiceSelection: Bool {
+        switch self {
+        case .autoLocal, .supertonic3, .kokoro82M, .appleNaturalPCM, .chatterbox, .cosyVoice2: return true
+        default: return false
+        }
+    }
+
     public var licenseWarning: String? {
         switch self {
+        case .supertonic3:
+            return "Código Supertone MIT; pesos Supertonic-3 sob licença BigScience Open RAIL-M (uso local responsável permitido)."
         case .f5TTS:
             return "F5-TTS utiliza licença CC-BY-NC-4.0 (uso estritamente não comercial) e requer ambiente Python/PyTorch separado."
         case .cosyVoice2, .chatterbox, .sesameCSM, .diaTTS:
@@ -213,16 +285,98 @@ public enum VoiceTTSEngineKind: String, CaseIterable, Identifiable, Codable, Sen
     public func supportsLanguage(_ language: VoiceLanguageVariant) -> Bool {
         switch self {
         case .kokoro82M:
-            // Kokoro "p" lexicon targets Brazilian Portuguese specifically, NOT European Portuguese.
-            return language == .portugueseBR || language == .englishUS || language == .spanishES
-        case .sherpaPiperVits, .appleNaturalPCM, .autoLocal:
+            // Kokoro covers Brazilian Portuguese, UK English (en-GB-x-rp), US English, and Spanish — NOT European Portuguese.
+            return language == .portugueseBR || language == .englishGB || language == .englishUS || language == .spanishES
+        case .supertonic3, .sherpaPiperVits, .appleNaturalPCM, .autoLocal:
             return true
         case .sesameCSM, .diaTTS:
-            return language == .englishUS
+            return language == .englishUS || language == .englishGB
         case .cosyVoice2, .f5TTS:
-            return language == .englishUS || language == .spanishES
+            return language == .englishUS || language == .englishGB || language == .spanishES
         case .chatterbox:
             return true // Chatterbox Multilingual covers PT, EN, ES (with community PT-BR / PT-PT packs)
+        }
+    }
+}
+
+public enum SupertonicVoicePreset: String, CaseIterable, Identifiable, Codable, Sendable {
+    case m2 = "supertonic:m2" // sid=6: Serene Deep Baritone (~90 Hz PT / ~87 Hz EN) — JARVIS primary
+    case m4 = "supertonic:m4" // sid=8: Articulate Tenor-Baritone (~132 Hz PT / ~114 Hz EN)
+    case m5 = "supertonic:m5" // sid=9: Resonant Authoritative Baritone (~92 Hz PT / ~83 Hz EN)
+    case m1 = "supertonic:m1" // sid=5: Dynamic Clear Male (~132 Hz PT / ~115 Hz EN)
+    case m3 = "supertonic:m3" // sid=7: Firm Male (~103 Hz PT / ~101 Hz EN)
+    case f1 = "supertonic:f1" // sid=0: Clear Neutral Female (~185 Hz)
+    case f2 = "supertonic:f2" // sid=1: Warm Female (~217 Hz)
+    case f3 = "supertonic:f3" // sid=2: Balanced Female (~165 Hz)
+    case f4 = "supertonic:f4" // sid=3: Expressive Female (~207 Hz)
+    case f5 = "supertonic:f5" // sid=4: Soft Female (~162 Hz)
+
+    public var id: String { rawValue }
+
+    public var speakerID: Int32 {
+        switch self {
+        case .f1: return 0
+        case .f2: return 1
+        case .f3: return 2
+        case .f4: return 3
+        case .f5: return 4
+        case .m1: return 5
+        case .m2: return 6
+        case .m3: return 7
+        case .m4: return 8
+        case .m5: return 9
+        }
+    }
+
+    public var timbre: WisdVoiceTimbre {
+        switch self {
+        case .m1, .m2, .m3, .m4, .m5: return .male
+        case .f1, .f2, .f3, .f4, .f5: return .female
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .m2: return "Supertonic M2 · JARVIS Barítono Sereno (~90 Hz)"
+        case .m4: return "Supertonic M4 · JARVIS Articulado (~132 Hz)"
+        case .m5: return "Supertonic M5 · Barítono Executivo (~92 Hz)"
+        case .m1: return "Supertonic M1 · Masculina Dinâmica (~132 Hz)"
+        case .m3: return "Supertonic M3 · Masculina Firme (~103 Hz)"
+        case .f1: return "Supertonic F1 · Feminina Neutra (~185 Hz)"
+        case .f2: return "Supertonic F2 · Feminina Acolhedora (~217 Hz)"
+        case .f3: return "Supertonic F3 · Feminina Equilibrada (~165 Hz)"
+        case .f4: return "Supertonic F4 · Feminina Expressiva (~207 Hz)"
+        case .f5: return "Supertonic F5 · Feminina Suave (~162 Hz)"
+        }
+    }
+
+    public func supertonicLangCode(for language: VoiceLanguageVariant) -> String {
+        switch language {
+        case .portugueseBR, .portuguesePT: return "pt"
+        case .englishGB, .englishUS: return "en"
+        case .spanishES: return "es"
+        }
+    }
+
+    public static func from(identifier: String) -> SupertonicVoicePreset? {
+        let lower = identifier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let exact = SupertonicVoicePreset(rawValue: lower) { return exact }
+        if lower.hasPrefix("supertonic:") {
+            let short = String(lower.dropFirst("supertonic:".count))
+            return SupertonicVoicePreset(rawValue: "supertonic:\(short)")
+        }
+        if ["m1","m2","m3","m4","m5","f1","f2","f3","f4","f5"].contains(lower) {
+            return SupertonicVoicePreset(rawValue: "supertonic:\(lower)")
+        }
+        return nil
+    }
+
+    public static func defaultPreset(for persona: WisdVoicePersona) -> SupertonicVoicePreset {
+        switch persona {
+        case .jarvis: return .m2
+        case .atlas: return .m5
+        case .aurora: return .f1
+        case .aria: return .f4
         }
     }
 }
@@ -231,9 +385,14 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
     case pfDora = "pf_dora"
     case pmAlex = "pm_alex"
     case pmSanta = "pm_santa"
+    case bmGeorge = "bm_george"
+    case bmDaniel = "bm_daniel"
+    case bmLewis = "bm_lewis"
+    case bfEmma = "bf_emma"
     case afHeart = "af_heart"
     case afBella = "af_bella"
     case afNova = "af_nova"
+    case amOnyx = "am_onyx"
     case amFenrir = "am_fenrir"
     case amMichael = "am_michael"
     case efDora = "ef_dora"
@@ -250,6 +409,11 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
         case .afNova: return 7
         case .amFenrir: return 14
         case .amMichael: return 16
+        case .amOnyx: return 17
+        case .bfEmma: return 21
+        case .bmDaniel: return 24
+        case .bmGeorge: return 26
+        case .bmLewis: return 27
         case .efDora: return 28
         case .emAlex: return 29
         case .pfDora: return 42
@@ -259,11 +423,19 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
         }
     }
 
+    public var timbre: WisdVoiceTimbre {
+        switch self {
+        case .pfDora, .bfEmma, .afHeart, .afBella, .afNova, .efDora: return .female
+        case .pmAlex, .pmSanta, .bmGeorge, .bmDaniel, .bmLewis, .amOnyx, .amFenrir, .amMichael, .emAlex, .emSanta: return .male
+        }
+    }
+
     /// Upstream sherpa-onnx / espeak-ng voice identifiers for kokoro-multi-lang-v1_0
     public var kokoroLangCode: String {
         switch self {
         case .pfDora, .pmAlex, .pmSanta: return "pt-br"
-        case .afHeart, .afBella, .afNova, .amFenrir, .amMichael: return "en-us"
+        case .bmGeorge, .bmDaniel, .bmLewis, .bfEmma: return "en-GB-x-rp"
+        case .afHeart, .afBella, .afNova, .amOnyx, .amFenrir, .amMichael: return "en-us"
         case .efDora, .emAlex, .emSanta: return "es"
         }
     }
@@ -271,7 +443,8 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
     public var supportedLanguage: VoiceLanguageVariant {
         switch self {
         case .pfDora, .pmAlex, .pmSanta: return .portugueseBR
-        case .afHeart, .afBella, .afNova, .amFenrir, .amMichael: return .englishUS
+        case .bmGeorge, .bmDaniel, .bmLewis, .bfEmma: return .englishGB
+        case .afHeart, .afBella, .afNova, .amOnyx, .amFenrir, .amMichael: return .englishUS
         case .efDora, .emAlex, .emSanta: return .spanishES
         }
     }
@@ -279,11 +452,16 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
     public var displayName: String {
         switch self {
         case .pfDora: return "Aurora / Dora (pf_dora · PT-BR Feminina)"
-        case .pmAlex: return "Alex (pm_alex · PT-BR Masculina)"
+        case .pmAlex: return "Alex / JARVIS Clássico (pm_alex · PT-BR Masculina)"
         case .pmSanta: return "Atlas / Santa (pm_santa · PT-BR Masculina Grave)"
+        case .bmGeorge: return "George · JARVIS Britânico (bm_george · EN-GB Masculina)"
+        case .bmDaniel: return "Daniel Britânico (bm_daniel · EN-GB Masculina)"
+        case .bmLewis: return "Lewis Britânico Grave (bm_lewis · EN-GB Masculina)"
+        case .bfEmma: return "Emma Britânica (bf_emma · EN-GB Feminina)"
         case .afHeart: return "Heart (af_heart · EN-US Feminina)"
         case .afBella: return "Bella (af_bella · EN-US Feminina)"
         case .afNova: return "Nova (af_nova · EN-US Feminina)"
+        case .amOnyx: return "Onyx (am_onyx · EN-US Masculina)"
         case .amFenrir: return "Fenrir (am_fenrir · EN-US Masculina)"
         case .amMichael: return "Michael (am_michael · EN-US Masculina)"
         case .efDora: return "Dora ES (ef_dora · Español Feminina)"
@@ -295,11 +473,18 @@ public enum KokoroVoicePreset: String, CaseIterable, Identifiable, Codable, Send
     public static func defaultPreset(for persona: WisdVoicePersona, language: VoiceLanguageVariant) -> KokoroVoicePreset? {
         switch language {
         case .portugueseBR:
-            return persona.recommendedTimbre == .male ? .pmAlex : .pfDora
+            switch persona {
+            case .jarvis: return .pmAlex
+            case .atlas: return .pmSanta
+            case .aurora, .aria: return .pfDora
+            }
         case .portuguesePT:
             // Kokoro does NOT speak genuine European Portuguese; return nil rather than faking pt-PT.
             return nil
+        case .englishGB:
+            return persona.recommendedTimbre == .male ? (persona == .jarvis ? .bmGeorge : .bmDaniel) : .bfEmma
         case .englishUS:
+            if persona == .jarvis { return .amOnyx }
             return persona.recommendedTimbre == .male ? .amMichael : .afHeart
         case .spanishES:
             return persona.recommendedTimbre == .male ? .emAlex : .efDora
@@ -423,6 +608,7 @@ public struct ModelAssetTransferState: Equatable, Sendable {
 
 public enum VoiceModelCatalog {
     public static let sherpaRuntimeID = "sherpa-onnx-v1.13.8-arm64"
+    public static let supertonic3Int8ModelID = "supertonic-3-multilang-int8"
     public static let kokoroInt8ModelID = "kokoro-82m-ptbr-onnx"
     public static let kokoroFP32ModelID = "kokoro-82m-multilang-fp32"
     public static let llamaRuntimeID = "llama-cpp-b12809-metal"
@@ -491,7 +677,26 @@ public enum VoiceModelCatalog {
             expectedSHA256: "ae77050cdae565496059d96f5ab33d77b397a0864282a4e4a26e3b3b3effb948",
             archiveFormat: .tarBz2,
             relativeEntryPoint: "sherpa-onnx-v1.13.8-osx-arm64-shared-lib/lib/libsherpa-onnx-c-api.dylib",
-            description: "Bibliotecas dinâmicas ONNX + C API com G2P integrado (espeak-ng) para Kokoro-82M multilíngue no macOS arm64."
+            description: "Bibliotecas dinâmicas ONNX + C API com G2P integrado (espeak-ng) para Supertonic-3 e Kokoro-82M no macOS arm64."
+        ),
+        LocalVoiceModelDescriptor(
+            id: supertonic3Int8ModelID,
+            displayName: "Supertonic-3 Flow Matching INT8 (44.1 kHz · PT / EN / ES)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "MIT + OpenRAIL-M",
+            licenseWarning: "Código Supertone/sherpa MIT; pesos sob licença BigScience Open RAIL-M.",
+            sizeBytes: 128_774_318,
+            minimumRAMProfile: .low8GB,
+            minimumRAMGB: 8.0,
+            supportedLanguages: ["pt-BR", "pt-PT", "en-GB", "en-US", "es-ES"],
+            supportsEmotionControl: false,
+            downloadURLString: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2",
+            expectedSHA256: "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427",
+            archiveFormat: .tarBz2,
+            relativeEntryPoint: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vector_estimator.int8.onnx",
+            requiredRuntimeID: sherpaRuntimeID,
+            description: "Motor Flow-Matching nativo em 44.1 kHz via sherpa-onnx C ABI (RTF ~0.16–0.25 em CPU M2, 10 vozes M1–M5 / F1–F5, 31 idiomas incluindo PT e EN)."
         ),
         LocalVoiceModelDescriptor(
             id: kokoroInt8ModelID,
@@ -814,6 +1019,66 @@ public enum VoiceModelCatalog {
             supportedLanguages: ["en-US"],
             archiveFormat: .externalManual,
             description: "Modelo multimodal voz-para-voz para Macs Studio 32–64+ GB."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "qwen3-tts-0.6b-customvoice",
+            displayName: "Qwen3-TTS-12Hz-0.6B CustomVoice (MLX/PyTorch)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "Apache-2.0",
+            licenseWarning: "Requer runtime Python 3.10+ (`mlx-audio` ou `qwen-tts`) em servidor loopback 127.0.0.1.",
+            sizeBytes: 1_850_000_000,
+            minimumRAMProfile: .balanced16GB,
+            minimumRAMGB: 12.0,
+            supportedLanguages: ["pt-BR", "en-US", "es-ES"],
+            supportsEmotionControl: true,
+            archiveFormat: .externalManual,
+            description: "Catálogo técnico V5: primeira latência ~97 ms e suporte nativo a português em runtime Python/MLX."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "qwen3-tts-1.7b-voicedesign",
+            displayName: "Qwen3-TTS-12Hz-1.7B VoiceDesign (Apache-2.0)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "Apache-2.0",
+            licenseWarning: "Exige Python 3.10+ PyTorch/MLX e 16+ GB RAM para VoiceDesign por texto livre.",
+            sizeBytes: 4_300_000_000,
+            minimumRAMProfile: .balanced16GB,
+            minimumRAMGB: 16.0,
+            supportedLanguages: ["pt-BR", "en-US", "es-ES"],
+            supportsEmotionControl: true,
+            archiveFormat: .externalManual,
+            description: "Catálogo técnico V5: criação de voz por instrução textual em 10 idiomas com estilo natural."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "fish-speech-openaudio-s1",
+            displayName: "Fish Speech / OpenAudio S1 (MLX Loopback)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "Fish Audio Research / Apache-2.0 Código",
+            licenseWarning: "Verifique licença comercial dos pesos S1 e requer servidor Python/MLX separado (~16 GB RAM).",
+            sizeBytes: 4_100_000_000,
+            minimumRAMProfile: .balanced16GB,
+            minimumRAMGB: 16.0,
+            supportedLanguages: ["pt-BR", "en-US", "es-ES"],
+            supportsEmotionControl: true,
+            archiveFormat: .externalManual,
+            description: "Catálogo técnico V5: ótima expressividade multilíngue via loopback quando host dispõe de Python 3.10+ MLX."
+        ),
+        LocalVoiceModelDescriptor(
+            id: "indextts-2",
+            displayName: "IndexTTS-2 (Bilibili · PyTorch Zero-Shot)",
+            kind: "TTS",
+            category: .tts,
+            licenseName: "Apache-2.0 (Código) / Pesos sob revisão comercial",
+            licenseWarning: "Foco principal em EN/ZH/ES/JA e requer PyTorch/MPS externo (~16–24 GB RAM).",
+            sizeBytes: 5_200_000_000,
+            minimumRAMProfile: .balanced16GB,
+            minimumRAMGB: 16.0,
+            supportedLanguages: ["en-US", "es-ES"],
+            supportsEmotionControl: true,
+            archiveFormat: .externalManual,
+            description: "Catálogo técnico V5: controle explícito de duração e emoção via servidor PyTorch externo."
         )
     ]
 
@@ -1499,6 +1764,468 @@ public enum VoiceTTSWarmupCoordinator {
             ) { _, _ in
                 // Deliberately discard warmup PCM samples; goal is daemon initialization only.
             }
+        }
+    }
+}
+
+// MARK: - V5 Unified Single Source of Truth (VoiceIdentityManager & Honest Voice Design)
+
+public struct VoiceDesignConfig: Equatable, Codable, Sendable {
+    public var flowMatchingSteps: Int     // Real engine parameter on Supertonic-3 (4...12)
+    public var cadence: Double            // Real speaking rate (0.75...1.30)
+    public var pauseScale: Double         // Real silence_scale multiplier (0.65...1.60)
+    public var warmth: Double             // Conversational behavior warmth (0.0...1.0)
+    public var directness: Double         // Prompt/planner directness (0.0...1.0)
+    public var expressivity: VoiceExpressivityLevel
+    public var formality: VoiceFormalityLevel
+    public var detailLevel: VoiceDetailLevel
+
+    public static let jarvisBalanced = VoiceDesignConfig(
+        flowMatchingSteps: 10,
+        cadence: 0.98,
+        pauseScale: 1.04,
+        warmth: 0.72,
+        directness: 0.90,
+        expressivity: .balanced,
+        formality: .balanced,
+        detailLevel: .balanced
+    )
+
+    public static let naturalDefault = VoiceDesignConfig(
+        flowMatchingSteps: 8,
+        cadence: 1.00,
+        pauseScale: 1.00,
+        warmth: 0.76,
+        directness: 0.78,
+        expressivity: .balanced,
+        formality: .balanced,
+        detailLevel: .balanced
+    )
+}
+
+public struct VoiceSelectionSnapshot: Equatable, Sendable {
+    public var identityId: WisdVoicePersona
+    public var engineId: VoiceTTSEngineKind
+    public var modelId: String
+    public var speakerId: String
+    public var numericSpeakerSID: Int32?
+    public var language: VoiceLanguageVariant
+    public var vocalGender: WisdVoiceTimbre
+    public var speechRate: Double
+    public var flowMatchingSteps: Int
+
+    public var summary: String {
+        let sidLabel = numericSpeakerSID.map { " (sid=\($0))" } ?? ""
+        return "\(identityId.shortName) · \(vocalGender == .male ? "Masculina" : "Feminina") · \(engineId.shortName) · \(speakerId)\(sidLabel) · \(language.shortCode)"
+    }
+}
+
+public struct VoiceLoadedRuntimeSnapshot: Equatable, Sendable {
+    public var engineId: String
+    public var modelId: String
+    public var langCode: String
+    public var loadedSpeakerCount: Int
+    public var sampleRateHz: Int
+    public var isLoaded: Bool
+
+    public static let idle = VoiceLoadedRuntimeSnapshot(
+        engineId: "none",
+        modelId: "none",
+        langCode: "-",
+        loadedSpeakerCount: 0,
+        sampleRateHz: 0,
+        isLoaded: false
+    )
+}
+
+public struct VoiceInferredRuntimeSnapshot: Equatable, Sendable {
+    public var actualEngineId: String
+    public var actualModelId: String
+    public var actualSpeakerId: String
+    public var actualNumericSID: Int32?
+    public var actualLanguage: String
+    public var actualSampleRateHz: Int
+    public var estimatedF0Hz: Double?
+    public var synthLatencyMs: Double
+    public var fallbackOccurred: Bool
+    public var note: String?
+    public var updatedAt: Date
+
+    public static let none = VoiceInferredRuntimeSnapshot(
+        actualEngineId: "pending",
+        actualModelId: "pending",
+        actualSpeakerId: "pending",
+        actualNumericSID: nil,
+        actualLanguage: "-",
+        actualSampleRateHz: 0,
+        estimatedF0Hz: nil,
+        synthLatencyMs: 0,
+        fallbackOccurred: false,
+        note: "Aguardando primeira síntese nesta sessão",
+        updatedAt: Date()
+    )
+}
+
+public struct UnifiedVoiceConfig: Equatable, Codable, Sendable {
+    public var identityId: WisdVoicePersona
+    public var engineId: VoiceTTSEngineKind
+    public var modelId: String
+    public var speakerId: String
+    public var language: VoiceLanguageVariant
+    public var vocalGender: WisdVoiceTimbre
+    public var speechRate: Double
+    public var personalityId: VoicePersonalityStyle
+    public var design: VoiceDesignConfig
+
+    public static let defaultsKey = "wisdai.voice.unifiedConfig.v5"
+
+    public static func defaultConfig(
+        preferSupertonic: Bool = false,
+        preferMaleJarvis: Bool = true
+    ) -> UnifiedVoiceConfig {
+        let persona: WisdVoicePersona = preferMaleJarvis ? .jarvis : .aurora
+        let engine: VoiceTTSEngineKind = preferSupertonic ? .supertonic3 : .kokoro82M
+        let speaker: String = preferSupertonic ? persona.defaultSupertonicPresetID : persona.kokoroStyleVectorID
+        let model: String = preferSupertonic ? VoiceModelCatalog.supertonic3Int8ModelID : VoiceModelCatalog.kokoroInt8ModelID
+        return UnifiedVoiceConfig(
+            identityId: persona,
+            engineId: engine,
+            modelId: model,
+            speakerId: speaker,
+            language: .portugueseBR,
+            vocalGender: persona.recommendedTimbre,
+            speechRate: Double(persona.baseCadenceRate),
+            personalityId: persona.recommendedPersonalityStyle,
+            design: persona == .jarvis ? .jarvisBalanced : .naturalDefault
+        )
+    }
+
+    public static func loadMigrated(from defaults: UserDefaults = .standard) -> UnifiedVoiceConfig {
+        if let data = defaults.data(forKey: defaultsKey),
+           let decoded = try? JSONDecoder().decode(UnifiedVoiceConfig.self, from: data) {
+            return decoded
+        }
+
+        // One-time deterministic migration reconciling disjoint V2/V3 + legacy Codex Voice keys!
+        let legacyGenderRaw = (defaults.string(forKey: "wisdcode.voice.gender") ?? "").lowercased()
+        let legacyKokoroRaw = (defaults.string(forKey: "wisdai.voice.kokoroPreset") ?? "").lowercased()
+        let legacyEngineRaw = (defaults.string(forKey: "wisdai.voice.ttsEngineKind") ?? "").lowercased()
+
+        let decodedLegacyIdentity: VoiceIdentityDescriptor? = {
+            guard let data = defaults.data(forKey: "wisdai.voice.identity.v1") else { return nil }
+            return try? JSONDecoder().decode(VoiceIdentityDescriptor.self, from: data)
+        }()
+
+        let resolvedPersona: WisdVoicePersona = {
+            if legacyGenderRaw == "male" {
+                return decodedLegacyIdentity?.persona == .atlas ? .atlas : .jarvis
+            }
+            if let existing = decodedLegacyIdentity {
+                return existing.persona
+            }
+            if legacyKokoroRaw == "pm_alex" || legacyKokoroRaw == "pm_santa" || legacyKokoroRaw.hasPrefix("bm_") {
+                return .jarvis
+            }
+            return .jarvis
+        }()
+
+        let engine: VoiceTTSEngineKind = {
+            if let parsed = VoiceTTSEngineKind(rawValue: legacyEngineRaw) {
+                return parsed
+            }
+            return .kokoro82M
+        }()
+
+        let speaker: String = {
+            if engine == .supertonic3 {
+                return SupertonicVoicePreset.defaultPreset(for: resolvedPersona).rawValue
+            }
+            if resolvedPersona.recommendedTimbre == .male {
+                if let explicitKokoro = KokoroVoicePreset(rawValue: legacyKokoroRaw), explicitKokoro.timbre == .male {
+                    return explicitKokoro.rawValue
+                }
+                return KokoroVoicePreset.defaultPreset(for: resolvedPersona, language: .portugueseBR)?.rawValue ?? "pm_alex"
+            }
+            return KokoroVoicePreset.defaultPreset(for: resolvedPersona, language: .portugueseBR)?.rawValue ?? "pf_dora"
+        }()
+
+        let model: String = {
+            switch engine {
+            case .supertonic3: return VoiceModelCatalog.supertonic3Int8ModelID
+            case .kokoro82M: return VoiceModelCatalog.kokoroInt8ModelID
+            case .appleNaturalPCM: return "apple-natural-pcm"
+            default: return VoiceModelCatalog.kokoroInt8ModelID
+            }
+        }()
+
+        return UnifiedVoiceConfig(
+            identityId: resolvedPersona,
+            engineId: engine,
+            modelId: model,
+            speakerId: speaker,
+            language: .portugueseBR,
+            vocalGender: resolvedPersona.recommendedTimbre,
+            speechRate: Double(resolvedPersona.baseCadenceRate),
+            personalityId: resolvedPersona.recommendedPersonalityStyle,
+            design: resolvedPersona == .jarvis ? .jarvisBalanced : .naturalDefault
+        )
+    }
+
+    public func save(to defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(self) {
+            defaults.set(data, forKey: Self.defaultsKey)
+        }
+    }
+}
+
+@MainActor
+public final class VoiceIdentityManager: ObservableObject {
+    @Published public private(set) var config: UnifiedVoiceConfig
+    @Published public private(set) var requestedSnapshot: VoiceSelectionSnapshot
+    @Published public private(set) var configuredSnapshot: VoiceSelectionSnapshot
+    @Published public private(set) var loadedSnapshot: VoiceLoadedRuntimeSnapshot = .idle
+    @Published public private(set) var inferredSnapshot: VoiceInferredRuntimeSnapshot = .none
+    @Published public private(set) var divergenceAlert: String? = nil
+
+    public var onDidChangeConfiguration: ((UnifiedVoiceConfig, _ requiresCacheInvalidation: Bool) -> Void)?
+
+    private let defaults: UserDefaults
+    private var isMutatingInternally = false
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let initial = UnifiedVoiceConfig.loadMigrated(from: defaults)
+        self.config = initial
+        let req = Self.buildSelectionSnapshot(from: initial)
+        self.requestedSnapshot = req
+        self.configuredSnapshot = req
+        initial.save(to: defaults)
+        syncLegacyDefaults(for: initial)
+    }
+
+    public static func resolvedNumericSID(engine: VoiceTTSEngineKind, speakerId: String, persona: WisdVoicePersona, language: VoiceLanguageVariant) -> Int32? {
+        if engine == .supertonic3 {
+            let p = SupertonicVoicePreset.from(identifier: speakerId) ?? SupertonicVoicePreset.defaultPreset(for: persona)
+            return p.speakerID
+        }
+        if engine == .kokoro82M {
+            if let exact = KokoroVoicePreset(rawValue: speakerId.lowercased()) {
+                return exact.speakerID
+            }
+            return KokoroVoicePreset.defaultPreset(for: persona, language: language)?.speakerID
+        }
+        return nil
+    }
+
+    public static func buildSelectionSnapshot(from cfg: UnifiedVoiceConfig) -> VoiceSelectionSnapshot {
+        VoiceSelectionSnapshot(
+            identityId: cfg.identityId,
+            engineId: cfg.engineId,
+            modelId: cfg.modelId,
+            speakerId: cfg.speakerId,
+            numericSpeakerSID: resolvedNumericSID(engine: cfg.engineId, speakerId: cfg.speakerId, persona: cfg.identityId, language: cfg.language),
+            language: cfg.language,
+            vocalGender: cfg.vocalGender,
+            speechRate: cfg.speechRate,
+            flowMatchingSteps: cfg.design.flowMatchingSteps
+        )
+    }
+
+    public func updateConfig(
+        invalidateCache: Bool = true,
+        _ transform: (inout UnifiedVoiceConfig) -> Void
+    ) {
+        guard !isMutatingInternally else { return }
+        isMutatingInternally = true
+        defer { isMutatingInternally = false }
+
+        var next = config
+        transform(&next)
+        next.speechRate = min(1.30, max(0.75, next.speechRate))
+        next.design.cadence = next.speechRate
+        next.design.flowMatchingSteps = min(12, max(4, next.design.flowMatchingSteps))
+        next.modelId = Self.defaultModelID(for: next.engineId)
+
+        config = next
+        requestedSnapshot = Self.buildSelectionSnapshot(from: next)
+        next.save(to: defaults)
+        syncLegacyDefaults(for: next)
+        onDidChangeConfiguration?(next, invalidateCache)
+    }
+
+    public func selectPersona(_ persona: WisdVoicePersona) {
+        updateConfig(invalidateCache: true) { cfg in
+            cfg.identityId = persona
+            cfg.vocalGender = persona.recommendedTimbre
+            cfg.personalityId = persona.recommendedPersonalityStyle
+            cfg.speechRate = Double(persona.baseCadenceRate)
+            cfg.speakerId = Self.defaultSpeakerID(for: persona, engine: cfg.engineId, language: cfg.language)
+            if persona == .jarvis {
+                cfg.design.warmth = 0.72
+                cfg.design.directness = 0.90
+            }
+        }
+    }
+
+    public func selectGender(_ gender: WisdVoiceTimbre) {
+        updateConfig(invalidateCache: true) { cfg in
+            cfg.vocalGender = gender
+            let personaMatches = cfg.identityId.recommendedTimbre == gender
+            let targetPersona: WisdVoicePersona = personaMatches
+                ? cfg.identityId
+                : (gender == .male ? .jarvis : .aurora)
+            cfg.identityId = targetPersona
+            cfg.personalityId = targetPersona.recommendedPersonalityStyle
+            cfg.speakerId = Self.defaultSpeakerID(for: targetPersona, engine: cfg.engineId, language: cfg.language)
+        }
+    }
+
+    public func selectEngine(_ engine: VoiceTTSEngineKind, resolvedModelId: String? = nil) {
+        updateConfig(invalidateCache: true) { cfg in
+            cfg.engineId = engine
+            cfg.modelId = resolvedModelId ?? Self.defaultModelID(for: engine)
+            cfg.speakerId = Self.defaultSpeakerID(for: cfg.identityId, engine: engine, language: cfg.language)
+        }
+    }
+
+    public func selectSpeaker(_ speakerId: String) {
+        let clean = speakerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        updateConfig(invalidateCache: true) { cfg in
+            cfg.speakerId = clean
+            if let st = SupertonicVoicePreset.from(identifier: clean) {
+                cfg.vocalGender = st.timbre
+                if cfg.identityId.recommendedTimbre != st.timbre {
+                    cfg.identityId = st.timbre == .male ? .jarvis : .aurora
+                    cfg.personalityId = cfg.identityId.recommendedPersonalityStyle
+                }
+                if cfg.engineId != .supertonic3 {
+                    cfg.engineId = .supertonic3
+                }
+                return
+            }
+            if let kok = KokoroVoicePreset(rawValue: clean.lowercased()) {
+                cfg.vocalGender = kok.timbre
+                if cfg.identityId.recommendedTimbre != kok.timbre {
+                    cfg.identityId = kok.timbre == .male ? .jarvis : .aurora
+                    cfg.personalityId = cfg.identityId.recommendedPersonalityStyle
+                }
+                cfg.language = kok.supportedLanguage
+                if cfg.engineId != .kokoro82M {
+                    cfg.engineId = .kokoro82M
+                }
+                return
+            }
+        }
+    }
+
+    public func selectLanguage(_ language: VoiceLanguageVariant) {
+        updateConfig(invalidateCache: true) { cfg in
+            cfg.language = language
+            if cfg.engineId == .kokoro82M && language == .portuguesePT {
+                // Never fake pt-PT in Kokoro; switch cleanly or surface fallback in configuredSnapshot
+            } else {
+                cfg.speakerId = Self.defaultSpeakerID(for: cfg.identityId, engine: cfg.engineId, language: language)
+            }
+        }
+    }
+
+    public func recordConfiguredRuntime(
+        engineId: VoiceTTSEngineKind,
+        modelId: String,
+        speakerId: String,
+        numericSID: Int32?,
+        language: VoiceLanguageVariant,
+        speechRate: Double,
+        flowSteps: Int
+    ) {
+        configuredSnapshot = VoiceSelectionSnapshot(
+            identityId: config.identityId,
+            engineId: engineId,
+            modelId: modelId,
+            speakerId: speakerId,
+            numericSpeakerSID: numericSID,
+            language: language,
+            vocalGender: config.vocalGender,
+            speechRate: speechRate,
+            flowMatchingSteps: flowSteps
+        )
+        evaluateDivergence()
+    }
+
+    public func recordLoadedRuntime(_ loaded: VoiceLoadedRuntimeSnapshot) {
+        loadedSnapshot = loaded
+    }
+
+    public func recordInferredSynthesis(_ inferred: VoiceInferredRuntimeSnapshot) {
+        inferredSnapshot = inferred
+        evaluateDivergence()
+    }
+
+    private func evaluateDivergence() {
+        let req = requestedSnapshot
+        let inf = inferredSnapshot
+        guard inf.actualEngineId != "pending" else {
+            divergenceAlert = nil
+            return
+        }
+        var reasons: [String] = []
+        if inf.fallbackOccurred {
+            reasons.append(inf.note ?? "Motor principal indisponível; fallback para \(inf.actualEngineId) ativo.")
+        }
+        if let reqSid = req.numericSpeakerSID, let infSid = inf.actualNumericSID, reqSid != infSid, req.engineId.rawValue == inf.actualEngineId {
+            reasons.append("SID solicitado (\(reqSid)) diverge do SID inferido (\(infSid)).")
+        }
+        if req.vocalGender == .male, let f0 = inf.estimatedF0Hz, f0 > 168.0, inf.actualEngineId.contains("apple") {
+            reasons.append(String(format: "macOS sem voz masculina instalada para %@ (F0=%.0f Hz).", req.language.shortCode, f0))
+        }
+        divergenceAlert = reasons.isEmpty ? nil : reasons.joined(separator: " ")
+    }
+
+    public static func defaultSpeakerID(
+        for persona: WisdVoicePersona,
+        engine: VoiceTTSEngineKind,
+        language: VoiceLanguageVariant
+    ) -> String {
+        switch engine {
+        case .supertonic3:
+            return SupertonicVoicePreset.defaultPreset(for: persona).rawValue
+        case .kokoro82M, .autoLocal:
+            return KokoroVoicePreset.defaultPreset(for: persona, language: language)?.rawValue
+                ?? persona.kokoroStyleVectorID
+        case .appleNaturalPCM:
+            return "persona:\(persona.rawValue)"
+        default:
+            return persona.kokoroStyleVectorID
+        }
+    }
+
+    public static func defaultModelID(for engine: VoiceTTSEngineKind) -> String {
+        switch engine {
+        case .supertonic3: return VoiceModelCatalog.supertonic3Int8ModelID
+        case .kokoro82M: return VoiceModelCatalog.kokoroInt8ModelID
+        case .appleNaturalPCM: return "apple-natural-pcm"
+        case .sherpaPiperVits: return "vits-piper-local"
+        case .autoLocal: return "auto_local"
+        default: return engine.rawValue
+        }
+    }
+
+    private func syncLegacyDefaults(for cfg: UnifiedVoiceConfig) {
+        let genderRaw = (cfg.vocalGender == .male) ? "male" : "female"
+        defaults.set(genderRaw, forKey: "wisdcode.voice.gender")
+        defaults.set(cfg.vocalGender == .male ? "cedar" : "marin", forKey: "wisdcode.voice.codexVoice")
+        defaults.set(cfg.engineId.rawValue, forKey: "wisdai.voice.ttsEngineKind")
+        defaults.set(cfg.speakerId, forKey: "wisdai.voice.kokoroPreset")
+        defaults.set(cfg.speechRate, forKey: "wisdcode.voice.speed")
+        let legacyIdentity = VoiceIdentityDescriptor(
+            persona: cfg.identityId,
+            warmth: cfg.design.warmth,
+            clarityEmphasis: cfg.design.directness,
+            brandName: "WisdAI"
+        )
+        if let data = try? JSONEncoder().encode(legacyIdentity) {
+            defaults.set(data, forKey: "wisdai.voice.identity.v1")
         }
     }
 }
