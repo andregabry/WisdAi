@@ -132,7 +132,7 @@ public enum LocalQueryComplexityAnalyzer {
         let hasWorkspaceAction = workspaceActionPatterns.contains(where: { lower.contains($0) })
         let isHighRisk = destructivePatterns.contains(where: { lower.contains($0) })
 
-        if agentHint != nil || hasDirectDelegateVerb || hasWorkspaceAction || isHighRisk {
+        if hasDirectDelegateVerb || hasWorkspaceAction || isHighRisk {
             let risk: VoiceActionRiskTier = isHighRisk ? .high : (lower.contains("rode") || lower.contains("edite") || lower.contains("corrija") ? .medium : .low)
             let parallel = lower.contains("continua conversando") || lower.contains("enquanto") || lower.contains("continue talking") || agentHint != nil
             return .delegateToSpecialist(
@@ -174,7 +174,7 @@ public enum LocalQueryComplexityAnalyzer {
 
 public enum LocalBrainBackendStatus: String, Sendable {
     case appleFoundationModelsReady = "Apple FoundationModels (On-Device ANE)"
-    case compactHeuristicFallback = "Modo Conversacional Nativo Local"
+    case compactHeuristicFallback = "Modelo conversacional indisponível"
 }
 
 @MainActor
@@ -256,7 +256,7 @@ public final class LocalConversationalBrain: ObservableObject {
                 case .englishUS: return "[Respond naturally in English matching the user] "
                 case .spanishES: return "[Responde naturalmente en español] "
                 case .portuguesePT: return "[Responde em português europeu natural] "
-                case .portugueseBR: return ""
+                case .portugueseBR: return "[Responda naturalmente em português brasileiro] "
                 }
             }()
             let promptInput = languageCue + userText
@@ -265,7 +265,7 @@ public final class LocalConversationalBrain: ObservableObject {
             var fullReply = ""
             do {
                 for try await partial in activeSession.streamResponse(to: promptInput) {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled { return "" }
                     let current = partial.content
                     if current.count > emittedPrefixLen {
                         let startIdx = current.index(current.startIndex, offsetBy: emittedPrefixLen)
@@ -281,14 +281,16 @@ public final class LocalConversationalBrain: ObservableObject {
                     return finalClean
                 }
             } catch {
-                // Retry once cleanly with fresh compacted session if context exceeded
-                if "\(error)".lowercased().contains("context") {
-                    resetSession(instructions: systemInstructions)
-                }
+                if Task.isCancelled { return "" }
+                resetSession(instructions: systemInstructions)
+                // Do not append a fabricated fallback to a reply already streamed.
+                if !fullReply.isEmpty { return fullReply }
             }
         }
         #endif
 
+        guard !Task.isCancelled else { return "" }
+        backendStatus = .compactHeuristicFallback
         let fallback = deterministicNaturalFallback(for: userText, language: language)
         onDelta(fallback)
         return fallback
@@ -315,16 +317,15 @@ public final class LocalConversationalBrain: ObservableObject {
     }
 
     private func deterministicNaturalFallback(for input: String, language: VoiceLanguageVariant) -> String {
-        let lower = input.lowercased()
-        if language == .englishUS {
-            if lower.contains("hello") || lower.contains("hi") {
-                return "Hey! I'm right here with you. What would you like to explore or work on today?"
-            }
-            return "Got it. Tell me a bit more about what you have in mind so we can tackle it together, or let me know if you want me to dispatch an agent."
+        switch language {
+        case .englishUS:
+            return "The local conversation model is unavailable. Please try again or explicitly ask me to consult an agent."
+        case .spanishES:
+            return "El modelo de conversación local no está disponible. Inténtalo de nuevo o pide que consulte a un agente."
+        case .portuguesePT:
+            return "O modelo de conversação local está indisponível. Tenta novamente ou pede-me para consultar um agente."
+        case .portugueseBR:
+            return "O modelo de conversação local está indisponível. Tente novamente ou peça para eu consultar um agente."
         }
-        if lower.hasPrefix("oi") || lower.hasPrefix("olá") || lower.contains("tudo bem") {
-            return "Oi! Estou ouvindo você por aqui com motor local ativo. Sobre o que você quer conversar ou trabalhar agora?"
-        }
-        return "Entendi perfeitamente. Se quiser continuar trocando ideia sobre isso eu sigo com você, ou posso acionar um dos agentes no projeto se precisar de código."
     }
 }
