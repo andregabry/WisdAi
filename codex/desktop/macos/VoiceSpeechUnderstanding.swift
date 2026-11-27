@@ -441,8 +441,18 @@ public final class UnifiedLocalSTTCoordinator: StreamingSpeechToTextProvider, @u
 
     private let legacyAppleSTT = AppleSpeechStreamingSTTProvider()
     private var activeBackend: StreamingSpeechToTextProvider?
+    private let lock = NSLock()
+    private var contextualVocabulary: [String] = ContextualTranscriptNormalizer.defaultEcosystemVocabulary
 
     public init() {}
+
+    public func setContextualVocabulary(_ terms: [String]) {
+        let cleaned = Array(Set(terms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        lock.withLock {
+            self.contextualVocabulary = cleaned.isEmpty ? ContextualTranscriptNormalizer.defaultEcosystemVocabulary : cleaned
+        }
+        legacyAppleSTT.setContextualVocabulary(cleaned)
+    }
 
     public func start(
         language: VoiceLanguageVariant,

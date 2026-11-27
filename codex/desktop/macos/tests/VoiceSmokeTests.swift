@@ -27,6 +27,7 @@ struct VoiceSmokeTests {
         await testNativeAudioEngineThirtyCycleAndRecoveryRegression()
         await testPermanentDiagnosticsReportAndComponentStates()
         await testLocalNaturalSpeechBufferSynthesis()
+        await testV6AgenticVoicePipelineContracts()
         runPerformanceBenchmarks()
 
         print("VOICE_SMOKE_ALL_PASS")
@@ -1382,5 +1383,142 @@ struct VoiceSmokeTests {
         precondition(vc.orchestrator.identityManager.config.vocalGender == .male)
         precondition(vc.orchestrator.identityManager.config.identityId == .jarvis || vc.orchestrator.identityManager.config.identityId == .ultronBR || vc.orchestrator.identityManager.config.identityId == .atlas)
         print("PASS: V5.1 Unified VoiceIdentityManager, Per-Voice Prefs, JARVIS Fix, Ultron BR DSP & Live Controller Bridge")
+    }
+
+    @MainActor
+    static func testV6AgenticVoicePipelineContracts() async {
+        func checkV6(_ cond: Bool, _ label: String) {
+            if !cond {
+                print("FAIL_V6_CONTRACT: \(label)")
+                fflush(stdout)
+                preconditionFailure("FAIL_V6_CONTRACT: \(label)")
+            }
+        }
+
+        // 1. Contextual STT Normalization (WisdMeet / WisdAI / Agents) preserving non-matching phrases
+        let norm1 = ContextualTranscriptNormalizer.normalize("Analise todo o código do projeto Whit Meet", activeProjectName: "WisdMeet")
+        checkV6(norm1.normalizedTranscript.contains("WisdMeet") && norm1.wasModified, "norm1=\(norm1.normalizedTranscript)")
+        let norm2 = ContextualTranscriptNormalizer.normalize("Conectar com cloud code e anti gravity no wis day", activeProjectName: "WisdAI")
+        checkV6(norm2.normalizedTranscript.contains("Claude Code") && norm2.normalizedTranscript.contains("Antigravity") && norm2.normalizedTranscript.contains("WisdAI"), "norm2=\(norm2.normalizedTranscript)")
+        let norm3 = ContextualTranscriptNormalizer.normalize("Vou marcar uma reunião amanhã às dez horas", activeProjectName: "WisdMeet")
+        checkV6(!norm3.wasModified && norm3.normalizedTranscript == "Vou marcar uma reunião amanhã às dez horas", "norm3=\(norm3.normalizedTranscript)")
+
+        // 2. Project Context Resolver (real vs nonexistent directory — never silently fallback to $HOME)
+        let missingDir = "/tmp/wisdai-v6-missing-\(UUID().uuidString)"
+        let missingCheck = ProjectContextResolver.validateDirectorySync(path: missingDir)
+        checkV6(!missingCheck.exists && !missingCheck.accessible && missingCheck.error != nil, "missingCheck")
+        let missingCtx = ProjectContextResolver.resolve(projectID: nil, projectName: "MissingProj", directoryPath: missingDir, inspectGit: true)
+        checkV6(!missingCtx.directoryExists && missingCtx.directoryValidationError != nil, "missingCtx")
+
+        let sourceRepoURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // tests
+            .deletingLastPathComponent() // macos
+            .deletingLastPathComponent() // desktop
+            .deletingLastPathComponent() // codex
+            .deletingLastPathComponent() // WisdAI root
+        let repoRoot = FileManager.default.fileExists(atPath: sourceRepoURL.appendingPathComponent(".git").path)
+            ? sourceRepoURL.path
+            : FileManager.default.currentDirectoryPath
+        let realCtx = ProjectContextResolver.resolve(projectID: nil, projectName: "WisdAI", directoryPath: repoRoot, inspectGit: true)
+        checkV6(realCtx.directoryExists && realCtx.directoryAccessible && realCtx.isGitRepository,
+                "realCtx(\(repoRoot)): exists=\(realCtx.directoryExists) acc=\(realCtx.directoryAccessible) git=\(realCtx.isGitRepository)")
+
+        // 3. Autonomous Agentic Routing (PT-BR + Follow-ups + Live Status + Enqueue + Task Cancel vs Mic Mute)
+        let rAudit = LocalQueryComplexityAnalyzer.route(
+            utterance: "Analise o projeto e revise a arquitetura",
+            currentLanguage: .portugueseBR,
+            hasActiveProject: true,
+            activeProjectName: "WisdMeet"
+        )
+        if case .delegateToSpecialist(_, _, _, _) = rAudit {} else { checkV6(false, "rAudit=\(rAudit)") }
+
+        let rFollow = LocalQueryComplexityAnalyzer.route(
+            utterance: "Então verifique o código",
+            currentLanguage: .portugueseBR,
+            hasActiveProject: true,
+            activeProjectName: "WisdMeet",
+            priorTurnWasWorkspaceOrAgentic: true
+        )
+        if case .delegateToSpecialist(_, _, _, _) = rFollow {} else { checkV6(false, "rFollow=\(rFollow)") }
+
+        let rStatus = LocalQueryComplexityAnalyzer.route(
+            utterance: "O que está a acontecer agora e quais ficheiros está lendo?",
+            currentLanguage: .portugueseBR,
+            hasActiveProject: true,
+            isTaskRunning: true
+        )
+        if case .queryTaskStatus(_) = rStatus {} else { checkV6(false, "rStatus=\(rStatus)") }
+
+        let rEnqueue = LocalQueryComplexityAnalyzer.route(
+            utterance: "Pode verificar também os testes de integração?",
+            currentLanguage: .portugueseBR,
+            hasActiveProject: true,
+            isTaskRunning: true
+        )
+        if case .delegateToSpecialist(_, _, _, let parallel) = rEnqueue, parallel {} else { checkV6(false, "rEnqueue=\(rEnqueue)") }
+
+        let rCancel = LocalQueryComplexityAnalyzer.route(
+            utterance: "Pode parar esta tarefa agora",
+            currentLanguage: .portugueseBR,
+            hasActiveProject: true,
+            isTaskRunning: true
+        )
+        if case .voiceControl(.cancelActiveTask) = rCancel {} else { checkV6(false, "rCancel=\(rCancel)") }
+
+        let rGreeting = LocalQueryComplexityAnalyzer.route(
+            utterance: "Oi, tudo bem?",
+            currentLanguage: .portugueseBR,
+            hasActiveProject: true
+        )
+        if case .handleLocally(_, _) = rGreeting {} else { checkV6(false, "rGreeting=\(rGreeting)") }
+
+        // 4. Structured ExecutionEventBus & Grounded Progress Reporting
+        let bus = ExecutionEventBus()
+        let convID = "conv-v6-contract"
+        let meta = UnifiedMessageMetadata(
+            conversationID: convID,
+            projectName: "WisdMeet",
+            workingDirectory: repoRoot,
+            agentID: "gemini",
+            agentDisplayName: "Antigravity",
+            providerID: "gemini",
+            modelID: "gemini-4-hydrogen-high",
+            reasoningEffort: "4",
+            reasoningEffortTitle: "Ultra",
+            inputSource: .voice,
+            permissionsMode: 1,
+            sandboxPolicy: "workspace-write",
+            approvalPolicy: "on-request"
+        )
+        bus.registerTaskMetadata(meta, prompt: "Auditar arquitetura")
+        bus.publish(ExecutionEvent(conversationID: convID, agentName: "Antigravity", modelID: "gemini-4-hydrogen-high", kind: .taskStarted, title: "Conectado"))
+        bus.publish(ExecutionEvent(conversationID: convID, agentName: "Antigravity", modelID: "gemini-4-hydrogen-high", kind: .fileRead, title: "Lendo MeetSession.swift", filePath: "Sources/MeetSession.swift"))
+        let statusAnswer = bus.formatGroundedProgressAnswer(for: "Que ficheiros está a analisar?", conversationID: convID, projectName: "WisdMeet", language: .portugueseBR)
+        checkV6(statusAnswer.contains("Antigravity") && statusAnswer.contains("MeetSession.swift"), "statusAnswer=\(statusAnswer)")
+
+        // 5. Voice Presentation Engine: keep speech clean (no code blocks, tables, raw JSON, or 'Hmm' crutches)
+        let mdReport = """
+        ### Auditoria Concluída
+        Encontrei dois gargalos reais no módulo de sessão.
+        ```swift
+        let x = 42
+        ```
+        {"status": "ok", "files": ["a.swift", "b.swift", "c.swift"], "latency": 12.4}
+        | Arquivo | Linha |
+        |---|---|
+        | MeetSession.swift | 44 |
+        Recomendo ajustar o timeout de reconexão e validar o lock no arquivo /Users/andregabry/Project/WisdMeet/Sources/MeetSession.swift.
+        """
+        let spoken = VoicePresentationEngine.composeSpokenSummary(
+            fullMarkdownText: mdReport,
+            snapshot: bus.snapshot(for: convID),
+            profile: .default,
+            hadWaitNotice: false
+        )
+        checkV6(!spoken.contains("```") && !spoken.contains("let x = 42") && !spoken.contains("{\"status\"") && !spoken.contains("|---|"), "5a spoken=\(spoken)")
+        checkV6(!spoken.contains("/Users/andregabry/Project/WisdMeet/"), "5b spoken=\(spoken)")
+        let strippedOpener = VoicePresentationEngine.stripRepetitiveOpeners("Hmm… Encontrei o arquivo.")
+        checkV6(strippedOpener == "Encontrei o arquivo.", "5c strippedOpener='\(strippedOpener)'")
+        print("PASS: V6 Agentic Voice Pipeline Contracts (Normalizer, ProjectResolver, Router, EventBus, VoicePresentation)")
     }
 }

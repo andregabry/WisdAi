@@ -421,7 +421,7 @@ public struct VoiceBehaviorProfile: Equatable, Codable, Sendable {
         \(personalityInstr)
         Profile: \(profilePreset.displayName). Formality: \(formality.rawValue). Expressivity: \(expressivity.rawValue). Technical depth: \(technicalDepth.rawValue).
         \(detailInstr)
-        Write as natural spoken language: avoid robotic intros ("Certamente!", "Claro! Aqui está:"), avoid numbered bullet lists unless requested, avoid generic closing formulas, and never read markdown syntax, JSON metadata, or raw URLs aloud. Subtle self-corrections or reflective pauses ("Hmm…", "Olha,") are welcome only occasionally when genuinely natural—never force interjections into every reply. Never invent user emotions or psychological states.
+        Write as natural spoken language: start directly and naturally without repetitive fillers (never begin replies with "Hmm", "Ah", "Entendi", "Certamente!" or "Claro!"), avoid numbered bullet lists unless requested, avoid generic closing formulas, and never read markdown syntax, JSON metadata, or raw URLs aloud. Never fabricate files, code architectures, or test results, and never invent user emotions or psychological states.
         \(projInstr)
         """
     }
@@ -435,6 +435,8 @@ public struct TechnicalPronunciationDictionary: Equatable, Codable, Sendable {
         case .portugueseBR, .portuguesePT:
             return TechnicalPronunciationDictionary(entries: [
                 "WisdAI": "Uísdêi-ái",
+                "WisdMeet": "Uísd Mít",
+                "README": "rídmi",
                 "API": "A P I",
                 "APIs": "A P Is",
                 "CLI": "C L I",
@@ -650,7 +652,7 @@ public final class IncrementalSpeechSegmenter: @unchecked Sendable {
     private func extractReadySegmentsLocked(flushRemainder: Bool) -> [String] {
         var ready: [String] = []
         let minFirstClauseChars = 28
-        let minSubsequentChars = 42
+        let minSubsequentChars = 84
 
         while true {
             let minLen = hasEmittedFirstSegment ? minSubsequentChars : minFirstClauseChars
@@ -814,12 +816,13 @@ public enum HybridTurnTakingAnalyzer {
     ]
 
     private static let incompleteTrailingWords: Set<String> = [
-        // Portuguese connectors / prepositions / articles / open clauses
+        // Portuguese connectors / prepositions / articles / open clauses / incomplete inspection targets
         "de", "do", "da", "dos", "das", "para", "pra", "pro", "por", "com", "sem", "em", "no", "na",
         "nos", "nas", "que", "porque", "porquê", "pois", "como", "quando", "onde", "se", "mas", "porém",
         "todavia", "entretanto", "contudo", "ou", "e", "nem", "um", "uma", "o", "a", "os", "as",
         "sobre", "entre", "até", "após", "antes", "durante", "quero", "queria", "preciso", "poderia",
-        "desenvolver", "criar", "fazer", "aplicação",
+        "desenvolver", "criar", "fazer", "implementar", "analisar", "verificar", "auditar", "investigar",
+        "corrigir", "compilar", "executar", "aplicação", "sistema", "neu",
         // English connectors
         "to", "for", "of", "in", "on", "at", "with", "without", "that", "which", "who", "because",
         "and", "or", "but", "if", "when", "where", "how", "the", "a", "an", "about", "want", "need",

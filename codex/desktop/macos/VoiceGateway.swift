@@ -903,12 +903,20 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
     private var currentSegmentText: String = ""
     private var segmentEpoch: UInt64 = 0
     private var isStopped: Bool = true
+    private var contextualVocabulary: [String] = ContextualTranscriptNormalizer.defaultEcosystemVocabulary
 
     private var onPartialCB: (@Sendable (String) -> Void)?
     private var onFinalCB: (@Sendable (String) -> Void)?
     private var onErrorCB: (@Sendable (String) -> Void)?
 
     public init() {}
+
+    public func setContextualVocabulary(_ terms: [String]) {
+        let cleaned = Array(Set(terms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        lock.withLock {
+            self.contextualVocabulary = cleaned.isEmpty ? ContextualTranscriptNormalizer.defaultEcosystemVocabulary : cleaned
+        }
+    }
 
     public static func authorizationAuthorized() -> Bool {
         SFSpeechRecognizer.authorizationStatus() == .authorized
@@ -1024,9 +1032,9 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
     }
 
     private func startRecognitionSegment() {
-        let snapshot = lock.withLock { () -> (SFSpeechRecognizer?, VoicePolicyPreferences, Bool, UInt64) in
+        let snapshot = lock.withLock { () -> (SFSpeechRecognizer?, VoicePolicyPreferences, Bool, UInt64, [String]) in
             segmentEpoch &+= 1
-            return (recognizer, activePolicy, isStopped, segmentEpoch)
+            return (recognizer, activePolicy, isStopped, segmentEpoch, contextualVocabulary)
         }
         guard !snapshot.2, let rec = snapshot.0 else { return }
         let taskEpoch = snapshot.3
@@ -1034,6 +1042,9 @@ public final class AppleSpeechStreamingSTTProvider: StreamingSpeechToTextProvide
         let newReq = SFSpeechAudioBufferRecognitionRequest()
         newReq.shouldReportPartialResults = true
         newReq.addsPunctuation = true
+        if #available(macOS 10.15, *), !snapshot.4.isEmpty {
+            newReq.contextualStrings = Array(snapshot.4.prefix(100))
+        }
         if snapshot.1.preferOnDeviceSpeechOnly && rec.supportsOnDeviceRecognition {
             newReq.requiresOnDeviceRecognition = true
         }

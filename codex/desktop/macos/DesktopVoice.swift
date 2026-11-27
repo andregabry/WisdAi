@@ -652,6 +652,10 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
         activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])? = nil,
         onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> VoiceDelegationDispatchResult)? = nil,
         onRecordLocalExchangeToChat: ((String, String) -> Void)? = nil,
+        executionEventBus: ExecutionEventBus? = nil,
+        conversationIDProvider: (() -> String?)? = nil,
+        onSubmitUnifiedMessage: ((String, MessageInputSource, VoiceSpecialistAgentHint, VoiceActionRiskTier, Bool) -> UnifiedSubmissionOutcome)? = nil,
+        onCancelActiveTask: (() -> Bool)? = nil,
         greeting: String? = nil,
         onSpeech: @escaping (String) -> Void
     ) {
@@ -685,7 +689,11 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
                 activeTasksProvider: activeTasksProvider,
                 onDelegateTaskToAgent: onDelegateTaskToAgent,
                 onRecordLocalExchangeToChat: onRecordLocalExchangeToChat,
-                onCommitUserUtterance: onSpeech
+                onCommitUserUtterance: onSpeech,
+                executionEventBus: executionEventBus,
+                conversationIDProvider: conversationIDProvider,
+                onSubmitUnifiedMessage: onSubmitUnifiedMessage,
+                onCancelActiveTask: onCancelActiveTask
             )
             self.voicePhase = self.orchestrator.isVoiceSessionActive ? .active : .inactive
             self.isConnecting = false
@@ -2079,9 +2087,14 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
 
         var sentences: [String] = []
         var current = ""
-        for char in trimmed {
+        for idx in trimmed.indices {
+            let char = trimmed[idx]
             current.append(char)
-            if (char == "." || char == "!" || char == "?" || char == "\n"), current.count >= 22 {
+            let nextIdx = trimmed.index(after: idx)
+            let nextChar: Character? = nextIdx < trimmed.endIndex ? trimmed[nextIdx] : nil
+            let isRealDotBoundary = (char == ".") && (nextChar == nil || nextChar!.isWhitespace || nextChar!.isNewline)
+            let isStrongPunctBoundary = (char == "!" || char == "?" || char == "\n")
+            if (isRealDotBoundary || isStrongPunctBoundary), current.count >= 22 {
                 let candidate = current.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !candidate.isEmpty {
                     sentences.append(candidate)

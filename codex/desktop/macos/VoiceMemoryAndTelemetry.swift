@@ -71,10 +71,48 @@ public struct VoiceTurnRecord: Identifiable, Codable, Equatable, Sendable {
 
 public struct VoiceWorkspaceContextSnapshot: Equatable, Codable, Sendable {
     public var projectName: String?
-    public var workspaceDirectoryDisplay: String? // Redacted relative/tilde path
+    public var workspaceDirectoryDisplay: String? // Redacted relative/tilde path for UI
     public var securityModeName: String
     public var activeExecutionAgent: String
     public var activeTasksCount: Int
+    public var projectID: UUID?
+    public var workspaceID: String?
+    public var absoluteDirectoryPath: String?
+    public var resolvedProject: ResolvedProjectContext?
+    public var selectedProviderID: String?
+    public var selectedModelID: String?
+    public var selectedEffortTitle: String?
+    public var activeSessionID: String?
+
+    public init(
+        projectName: String?,
+        workspaceDirectoryDisplay: String?,
+        securityModeName: String,
+        activeExecutionAgent: String,
+        activeTasksCount: Int,
+        projectID: UUID? = nil,
+        workspaceID: String? = nil,
+        absoluteDirectoryPath: String? = nil,
+        resolvedProject: ResolvedProjectContext? = nil,
+        selectedProviderID: String? = nil,
+        selectedModelID: String? = nil,
+        selectedEffortTitle: String? = nil,
+        activeSessionID: String? = nil
+    ) {
+        self.projectName = projectName
+        self.workspaceDirectoryDisplay = workspaceDirectoryDisplay
+        self.securityModeName = securityModeName
+        self.activeExecutionAgent = activeExecutionAgent
+        self.activeTasksCount = activeTasksCount
+        self.projectID = projectID
+        self.workspaceID = workspaceID
+        self.absoluteDirectoryPath = absoluteDirectoryPath
+        self.resolvedProject = resolvedProject
+        self.selectedProviderID = selectedProviderID
+        self.selectedModelID = selectedModelID
+        self.selectedEffortTitle = selectedEffortTitle
+        self.activeSessionID = activeSessionID
+    }
 
     public static let empty = VoiceWorkspaceContextSnapshot(
         projectName: nil,
@@ -83,6 +121,36 @@ public struct VoiceWorkspaceContextSnapshot: Equatable, Codable, Sendable {
         activeExecutionAgent: "WisdAI",
         activeTasksCount: 0
     )
+
+    public func renderDetailedContextBlock() -> String {
+        var lines: [String] = []
+        if let project = projectName, !project.isEmpty {
+            let dirNote = resolvedProject?.directoryValidationError
+                ?? absoluteDirectoryPath
+                ?? workspaceDirectoryDisplay
+                ?? "(não especificado)"
+            lines.append("Projeto ativo: \(project) | Diretório: \(dirNote)")
+        } else if let dirErr = resolvedProject?.directoryValidationError {
+            lines.append("Diretório associado inacessível: \(dirErr)")
+        } else if let abs = absoluteDirectoryPath, !abs.isEmpty {
+            lines.append("Diretório ativo: \(abs)")
+        }
+        if let rp = resolvedProject {
+            if let branch = rp.gitBranch, !branch.isEmpty {
+                let status = rp.gitWorkingTreeStatus ?? "desconhecido"
+                let repo = rp.gitRepositoryName ?? rp.projectName ?? "git"
+                lines.append("Git: \(repo) · branch \(branch) · working tree: \(status)")
+            }
+            if !rp.projectConfigHighlights.isEmpty {
+                lines.append("Arquivos de configuração raiz: \(rp.projectConfigHighlights.joined(separator: ", "))")
+            }
+        }
+        let modelNote = selectedModelID.map { " | Modelo: \($0)" } ?? ""
+        let effortNote = selectedEffortTitle.map { " | Esforço: \($0)" } ?? ""
+        let providerNote = selectedProviderID.map { " (\($0))" } ?? ""
+        lines.append("Agente selecionado: \(activeExecutionAgent)\(providerNote)\(modelNote)\(effortNote) | Permissões: \(securityModeName) | Tarefas ativas: \(activeTasksCount)")
+        return lines.joined(separator: "\n")
+    }
 }
 
 public struct PersistentVoicePreferencesMemory: Equatable, Codable, Sendable {
@@ -108,8 +176,9 @@ public struct PortableVoiceContextSnapshot: Equatable, Codable, Sendable {
 
     public func renderPortableSystemContext() -> String {
         var sections: [String] = []
-        if let project = workspaceContext.projectName, !project.isEmpty {
-            sections.append("Workspace project: \(project) (mode: \(workspaceContext.securityModeName), agent: \(workspaceContext.activeExecutionAgent)).")
+        let detailBlock = workspaceContext.renderDetailedContextBlock()
+        if !detailBlock.isEmpty {
+            sections.append(detailBlock)
         }
         if !compactedSummary.isEmpty {
             sections.append("Compacted prior conversation summary:\n\(compactedSummary)")
@@ -154,13 +223,9 @@ public final class VoiceMemoryStore: ObservableObject {
     }
 
     public func updateWorkspaceContext(_ context: VoiceWorkspaceContextSnapshot) {
-        workspaceContext = VoiceWorkspaceContextSnapshot(
-            projectName: context.projectName,
-            workspaceDirectoryDisplay: context.workspaceDirectoryDisplay.map { VoiceLogRedactor.redact($0) },
-            securityModeName: context.securityModeName,
-            activeExecutionAgent: context.activeExecutionAgent,
-            activeTasksCount: context.activeTasksCount
-        )
+        var copy = context
+        copy.workspaceDirectoryDisplay = context.workspaceDirectoryDisplay.map { VoiceLogRedactor.redact($0) }
+        workspaceContext = copy
     }
 
     public func seedFromHistoryItems(_ items: [CodexContinuityItem], providerID: String) {

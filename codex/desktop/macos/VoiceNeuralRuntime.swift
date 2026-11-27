@@ -202,10 +202,10 @@ private enum SherpaDynamicBridge {
         let libs = (try? fm.contentsOfDirectory(at: runtimeDir, includingPropertiesForKeys: nil)) ?? []
         var ortHandle: UnsafeMutableRawPointer? = nil
         if let ortURL = libs.first(where: { $0.lastPathComponent.hasPrefix("libonnxruntime") && $0.pathExtension == "dylib" }) {
-            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL)
+            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE)
         }
         let sherpaURL = runtimeDir.appendingPathComponent("libsherpa-onnx-c-api.dylib")
-        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL) else {
+        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE) else {
             let err = dlerror().map { String(cString: $0) } ?? "dlopen falhou"
             throw VoiceGatewayError.protocolError("Falha ao carregar libsherpa-onnx-c-api.dylib: \(err)")
         }
@@ -499,6 +499,12 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
     public func unload() {
         synthQueue.async { [weak self] in
             self?.unloadSync()
+        }
+    }
+
+    public func unloadSynchronously() {
+        synthQueue.sync {
+            self.unloadSync()
         }
     }
 
@@ -909,6 +915,10 @@ public final class SupertonicNeuralTTSProvider: StreamingTextToSpeechProvider, @
 
     public func unload() {
         synthQueue.async { [weak self] in self?.unloadSync() }
+    }
+
+    public func unloadSynchronously() {
+        synthQueue.sync { self.unloadSync() }
     }
 
     private func unloadSync() {
@@ -1785,10 +1795,10 @@ public final class SherpaVitsPiperTTSProvider: StreamingTextToSpeechProvider, @u
         let libs = (try? fm.contentsOfDirectory(at: paths.runtimeDir, includingPropertiesForKeys: nil)) ?? []
         var ortHandle: UnsafeMutableRawPointer? = nil
         if let ortURL = libs.first(where: { $0.lastPathComponent.hasPrefix("libonnxruntime") && $0.pathExtension == "dylib" }) {
-            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL)
+            ortHandle = dlopen(ortURL.path, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE)
         }
         let sherpaURL = paths.runtimeDir.appendingPathComponent("libsherpa-onnx-c-api.dylib")
-        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL) else {
+        guard let sherpaHandle = dlopen(sherpaURL.path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE) else {
             throw VoiceGatewayError.protocolError("Falha ao abrir libsherpa-onnx-c-api.dylib para Piper VITS.")
         }
         func sym<T>(_ name: String) throws -> T {

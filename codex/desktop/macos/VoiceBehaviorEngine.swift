@@ -688,8 +688,8 @@ public final class ConversationalBehaviorPlanner: @unchecked Sendable {
 
             let candidate: VocalizationKind? = {
                 switch intent {
-                case .reflection where complexityScore >= 0.68 || hasUncertaintyOrDilemma:
-                    return lower.contains("?") ? .boaPergunta : .hmm
+                case .reflection where complexityScore >= 0.72 || hasUncertaintyOrDilemma:
+                    return lower.contains("?") ? .boaPergunta : nil
                 case .enthusiasm:
                     return .interessante
                 case .technicalExplanation where profile.profilePreset == .casual || profile.profilePreset == .expressive:
@@ -1159,6 +1159,8 @@ public enum NaturalSpeechComposer {
                 spoken = spoken.replacingOccurrences(of: "!", with: "! ")
             }
         }
+
+        spoken = VoicePresentationEngine.stripRepetitiveOpeners(spoken)
 
         return AdaptedSpeechOutput(
             spokenText: spoken.trimmingCharacters(in: .whitespacesAndNewlines),

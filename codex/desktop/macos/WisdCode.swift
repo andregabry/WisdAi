@@ -565,7 +565,17 @@ struct Approval: Identifiable {
 final class Workspace: ObservableObject {
     @Published var conversations: [Conversation] = []
     @Published var messages: [Message] = []
-    @Published var project: URL?
+    @Published var project: URL? {
+        didSet {
+            if project?.path != oldValue?.path {
+                refreshResolvedProjectContext(inspectGit: true)
+            }
+        }
+    }
+    @Published var resolvedProjectContext: ResolvedProjectContext = .empty
+    let executionEventBus = ExecutionEventBus()
+    private var activeTurnMetadataByThread: [String: UnifiedMessageMetadata] = [:]
+    private var queuedFollowUpInstructionsByThread: [String: [(task: String, source: MessageInputSource, agentHint: VoiceSpecialistAgentHint)]] = [:]
     @Published var selected: String?
     @Published var prompt = ""
     @Published var temporaryChat = false
@@ -585,14 +595,23 @@ final class Workspace: ObservableObject {
     @Published private(set) var scheduledBusy = false
     @Published var apiKeyInput = ""
     @Published var mode: Int = UserDefaults.standard.integer(forKey: "wisdcode.mode") {
-        didSet { UserDefaults.standard.set(mode, forKey: "wisdcode.mode") }
+        didSet {
+            UserDefaults.standard.set(mode, forKey: "wisdcode.mode")
+            syncVoiceWorkspaceSnapshotToOrchestrator()
+        }
     }
     @Published var models: [ModelChoice] = []
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "wisdcode.model") ?? "auto" {
-        didSet { UserDefaults.standard.set(selectedModel, forKey: "wisdcode.model") }
+        didSet {
+            UserDefaults.standard.set(selectedModel, forKey: "wisdcode.model")
+            syncVoiceWorkspaceSnapshotToOrchestrator()
+        }
     }
     @Published var selectedEffort: String = UserDefaults.standard.string(forKey: "wisdcode.effort") ?? "default" {
-        didSet { UserDefaults.standard.set(selectedEffort, forKey: "wisdcode.effort") }
+        didSet {
+            UserDefaults.standard.set(selectedEffort, forKey: "wisdcode.effort")
+            syncVoiceWorkspaceSnapshotToOrchestrator()
+        }
     }
     @Published var activeTasks: [String: ActiveThreadTask] = [:]
     @Published var unseenCompletedThreads: Set<String> = []
@@ -743,6 +762,8 @@ final class Workspace: ObservableObject {
             self.messages = ChatStorage.shared.loadMessages(for: conv.id)
             UserDefaults.standard.set(conv.id, forKey: "wisdcode.desktop.lastSelectedThread")
         }
+        self.voice.orchestrator.executionEventBus = self.executionEventBus
+        self.refreshResolvedProjectContext(inspectGit: false)
         self.quotaCancellable = quotaStore.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -862,6 +883,7 @@ final class Workspace: ObservableObject {
         request("initialize", ["clientInfo": ["name": "wisdcode-desktop", "version": appVersion], "capabilities": ["experimentalApi": true]]) { [weak self] result in
             guard let self, self.accept(result) != nil else { return }
             self.write(["method": "initialized"])
+            self.error = nil
             self.ready = true
             self.recovery.restore()
             self.refresh()
@@ -1273,9 +1295,11 @@ final class Workspace: ObservableObject {
         modelsLoading = true
         modelsNotice = nil
         request("model/list", [:]) { [weak self] response in
-            guard let self, !self.recovery.transitioning, self.modelRequestID == requestID,
-                  self.accountChoices.first(where: \.active)?.id == session,
-                  self.accountChoices.first(where: \.active)?.workspaceID == routing else { return }
+            guard let self, !self.recovery.transitioning, self.modelRequestID == requestID else { return }
+            if let session {
+                guard self.accountChoices.first(where: \.active)?.id == session,
+                      self.accountChoices.first(where: \.active)?.workspaceID == routing else { return }
+            }
             self.modelsLoading = false
             guard let result = response["result"] as? JSON else {
                 self.models = []
@@ -1283,16 +1307,24 @@ final class Workspace: ObservableObject {
                 return
             }
             let choices = Self.parseModels(result)
+            let realIds = choices.map(\.id)
+            let activeSessionId = session ?? self.accountChoices.first(where: \.active)?.id
+            if let account = (self.selectedAccount?.provider == .openai ? self.selectedAccount : nil)
+                ?? self.localDataRef?.aiAccounts.first(where: { $0.provider == .openai && ($0.sessionID == activeSessionId || $0.isActive) }) {
+                self.localDataRef?.syncModels(accountID: account.id, models: realIds, source: "Codex model/list")
+                if self.selectedAccount?.id == account.id || self.selectedAccount?.provider == .openai {
+                    self.selectedAccount = self.localDataRef?.aiAccounts.first { $0.id == account.id }
+                }
+            }
+
+            // Only replace active workspace model choices if OpenAI is currently active (avoid clobbering Gemini/Claude list mid-switch).
+            let currentProvider = (self.selectedAccount ?? self.localDataRef?.activeAccount)?.provider ?? .openai
+            guard currentProvider == .openai else { return }
+
             self.models = choices
             if choices.isEmpty { self.modelsNotice = "O motor não informou modelos para esta sessão." }
 
-            let realIds = choices.map(\.id)
-            if let account = self.selectedAccount, account.sessionID == session, session != nil {
-                self.localDataRef?.syncModels(accountID: account.id, models: realIds, source: "Codex model/list")
-                self.selectedAccount = self.localDataRef?.aiAccounts.first { $0.id == account.id }
-            }
-
-            if self.selectedModel != "auto", !choices.contains(where: { $0.id == self.selectedModel }) {
+            if self.selectedModel == "auto" || !choices.contains(where: { $0.id == self.selectedModel }) {
                 self.selectedModel = choices.first(where: \.isDefault)?.id ?? choices.first?.id ?? "auto"
             }
             if self.selectedEffort != "default",
@@ -1360,6 +1392,13 @@ final class Workspace: ObservableObject {
                                 command: parameters["command"] as? String,
                                 reason: parameters["reason"] as? String)
         pendingApprovals.append(approval)
+        publishExecutionEvent(
+            threadId: selected ?? activeTasks.keys.first ?? "approval",
+            turnId: turnID ?? "",
+            kind: .approvalRequired,
+            title: approval.isFileChange ? "Aprovação de edição necessária" : "Aprovação de comando necessária",
+            detail: approval.command ?? approval.reason ?? "Confirme na tela para prosseguir"
+        )
         if voice.orchestrator.isVoiceSessionActive || voice.isVoiceModeActive {
             voice.orchestrator.speakSystemNoticeNaturally(
                 "Preciso da sua aprovação na tela antes de executar esta operação."
@@ -1894,6 +1933,19 @@ final class Workspace: ObservableObject {
         let hadWaitNotice = didSpeakVoiceWaitNoticeForTurn
         didSpeakVoiceWaitNoticeForTurn = false
 
+        if let reply = messages.last(where: { ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text }),
+           reply.id != voiceTurnBaselineMessageID,
+           reply.id != lastSpokenVoiceReplyMessageID {
+            let previewSummary = VoicePresentationEngine.composeSpokenSummary(
+                fullMarkdownText: reply.text,
+                snapshot: executionEventBus.snapshot(for: selected),
+                profile: voice.orchestrator.behavior,
+                hadWaitNotice: hadWaitNotice,
+                customDictionary: voice.orchestrator.customPronunciation
+            )
+            voice.orchestrator.recordPresentedSpokenTextForTelemetry(previewSummary)
+        }
+
         guard !voice.realtimeSessionActive && (voice.isVoiceModeActive || speakReplies) else {
             voice.isProcessing = false
             return
@@ -1919,27 +1971,42 @@ final class Workspace: ObservableObject {
                 lastSpokenVoiceReplyMessageID = reply.id
                 voice.isProcessing = false
                 if voice.orchestrator.isVoiceSessionActive {
-                    let adapted = VoiceResponseAdapter.adaptForSpeech(
-                        reply.text,
+                    let activeSnap = executionEventBus.snapshot(for: selected)
+                    let spokenSummary = VoicePresentationEngine.composeSpokenSummary(
+                        fullMarkdownText: reply.text,
+                        snapshot: activeSnap,
                         profile: voice.orchestrator.behavior,
+                        hadWaitNotice: hadWaitNotice,
                         customDictionary: voice.orchestrator.customPronunciation
                     )
                     if voice.orchestrator.state == .processing {
-                        let finalText = Self.formatCompletedReplyForSpeech(reply.text, hadWaitNotice: hadWaitNotice)
-                        voice.orchestrator.finishAssistantResponse(fullMarkdownText: finalText)
+                        voice.orchestrator.finishAssistantResponse(fullMarkdownText: spokenSummary)
                     } else {
                         let taskTitle = activeVoiceDelegatedTaskTitle ?? currentActivityNote ?? "a consulta solicitada"
                         activeVoiceDelegatedTaskTitle = nil
+                        let spokenNoticeSummary = VoicePresentationEngine.composeSpokenSummary(
+                            fullMarkdownText: reply.text,
+                            snapshot: activeSnap,
+                            profile: voice.orchestrator.behavior,
+                            hadWaitNotice: false,
+                            customDictionary: voice.orchestrator.customPronunciation
+                        )
                         voice.orchestrator.notifySpecialistTaskFinished(
                             agentName: selectedAccount?.name ?? "Agente",
                             title: taskTitle,
                             succeeded: failureText == nil,
-                            summary: adapted.spokenText
+                            summary: spokenNoticeSummary
                         )
                     }
                 } else {
-                    let finalText = Self.formatCompletedReplyForSpeech(reply.text, hadWaitNotice: hadWaitNotice)
-                    speak(finalText, preserveProcessingState: false, queueIfSpeakingIntermediate: hadWaitNotice)
+                    let spokenSummary = VoicePresentationEngine.composeSpokenSummary(
+                        fullMarkdownText: reply.text,
+                        snapshot: executionEventBus.snapshot(for: selected),
+                        profile: voice.orchestrator.behavior,
+                        hadWaitNotice: hadWaitNotice,
+                        customDictionary: voice.orchestrator.customPronunciation
+                    )
+                    speak(spokenSummary, preserveProcessingState: false, queueIfSpeakingIntermediate: hadWaitNotice)
                 }
                 return
             }
@@ -2226,25 +2293,181 @@ final class Workspace: ObservableObject {
         return chosenModel
     }
 
+    func refreshResolvedProjectContext(inspectGit: Bool = true) {
+        let dirPath = project?.path ?? conversations.first(where: { $0.id == selected })?.cwd
+        let matchedItem = localDataRef?.projects.first(where: {
+            guard let dirPath, !dirPath.isEmpty else { return false }
+            return $0.matchesPath(dirPath)
+        })
+        let resolved = ProjectContextResolver.resolve(
+            projectID: matchedItem?.id,
+            projectName: matchedItem?.name ?? project?.lastPathComponent,
+            directoryPath: dirPath,
+            additionalPaths: matchedItem?.additionalPaths ?? [],
+            configuredProjects: localDataRef?.projects ?? [],
+            inspectGit: inspectGit
+        )
+        self.resolvedProjectContext = resolved
+        syncVoiceWorkspaceSnapshotToOrchestrator()
+    }
+
+    func buildVoiceWorkspaceSnapshot() -> VoiceWorkspaceContextSnapshot {
+        let activeAcc = selectedAccount ?? localDataRef?.activeAccount
+        let modelDisplay = (selectedModel != "auto" ? selectedModel : models.first(where: \.isDefault)?.id ?? models.first?.id) ?? activeAcc?.currentModel ?? "auto"
+        let activeSession = conversations.first(where: { $0.id == selected })?.agyConversationId ?? activeAcc?.sessionID
+        let rp = resolvedProjectContext
+        return VoiceWorkspaceContextSnapshot(
+            projectName: rp.projectName ?? project?.lastPathComponent,
+            workspaceDirectoryDisplay: rp.absoluteDirectoryPath ?? project?.path,
+            securityModeName: modeName(),
+            activeExecutionAgent: activeAcc?.name ?? "WisdAI",
+            activeTasksCount: activeTasks.count,
+            projectID: rp.projectID,
+            workspaceID: activeAcc?.workspaceID,
+            absoluteDirectoryPath: rp.absoluteDirectoryPath ?? project?.path,
+            resolvedProject: rp,
+            selectedProviderID: activeAcc?.provider.rawValue,
+            selectedModelID: modelDisplay,
+            selectedEffortTitle: reasoningLevel.title,
+            activeSessionID: activeSession
+        )
+    }
+
+    private func syncVoiceWorkspaceSnapshotToOrchestrator() {
+        let snap = buildVoiceWorkspaceSnapshot()
+        voice.orchestrator.updateWorkspaceContext(snap)
+    }
+
+    @discardableResult
+    func cancelActiveTaskFromVoice() -> Bool {
+        let hasActive = busy || !activeTasks.isEmpty || activeCLIProcess != nil
+        guard hasActive else { return false }
+        if let tid = selected {
+            queuedFollowUpInstructionsByThread.removeValue(forKey: tid)
+        }
+        interrupt(preserveVoiceSession: true)
+        return true
+    }
+
+    private func collectActiveVoiceTaskSnapshots() -> [VoiceTaskSummarySnapshot] {
+        var list = activeTasks.values.map { task in
+            VoiceTaskSummarySnapshot(
+                id: task.threadId,
+                title: String(task.prompt.prefix(64)),
+                agentName: task.accountName,
+                modelName: task.modelName,
+                status: task.status,
+                progressNote: task.progressNote
+            )
+        }
+        if list.isEmpty && busy {
+            list.append(VoiceTaskSummarySnapshot(
+                id: selected ?? "active-turn",
+                title: currentActivityNote ?? "Tarefa em execução",
+                agentName: selectedAccount?.name ?? "WisdAI",
+                modelName: selectedModel,
+                status: "executando",
+                progressNote: currentActivityDetail ?? currentActivityNote ?? "Em andamento"
+            ))
+        }
+        return list
+    }
+
+    private func bridgeVoiceDelegateTask(
+        agentHint: VoiceSpecialistAgentHint,
+        instruction: String,
+        riskTier: VoiceActionRiskTier
+    ) -> VoiceDelegationDispatchResult {
+        let outcome = submitUnifiedMessage(
+            instruction,
+            source: .voice,
+            agentHint: agentHint,
+            riskTier: riskTier,
+            forceReadOnly: false,
+            enqueueIfBusy: false
+        )
+        switch outcome {
+        case .started(let meta):
+            return .dispatched(agentDisplayName: meta.agentDisplayName)
+        case .queued(let meta, _):
+            return .dispatched(agentDisplayName: meta.agentDisplayName)
+        case .awaitingUserApproval(let reason, _):
+            return .awaitingUserApproval(reason: reason)
+        case .blockedDirectory(let err, _):
+            return .unavailable(reason: err)
+        case .unavailable(let reason):
+            return .unavailable(reason: reason)
+        }
+    }
+
+    private func recordLocalVoiceExchangeToChat(userText: String, assistantText: String) {
+        let u = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let a = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty || !a.isEmpty else { return }
+        if let tid = selected ?? voice.realtimeThreadId {
+            ensureConversationRegistered(id: tid, title: u.isEmpty ? "Conversa por voz" : String(u.prefix(48)), cwd: project?.path ?? "")
+            if voice.voiceContinuityEnabled {
+                if !u.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(u) {
+                    CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: u)
+                }
+                if !a.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(a) {
+                    CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "assistant", text: a)
+                }
+            }
+        }
+        if !u.isEmpty {
+            messages.append(Message(author: "Você", text: u, kind: .text))
+        }
+        if !a.isEmpty {
+            let msg = Message(author: "WisdAI", text: a, kind: .text)
+            lastSpokenVoiceReplyMessageID = msg.id
+            messages.append(msg)
+        }
+        persistCurrentMessages()
+    }
+
+    /// Binds Workspace and WisdVoiceOrchestrator to the unified pipeline without starting microphone hardware capture.
+    func configureHeadlessAgenticVoiceBridge() {
+        refreshResolvedProjectContext(inspectGit: true)
+        voice.orchestrator.configureAgenticBridgeForSession(
+            workspaceContext: buildVoiceWorkspaceSnapshot(),
+            executionEventBus: executionEventBus,
+            conversationIDProvider: { [weak self] in self?.selected },
+            activeTasksProvider: { [weak self] in self?.collectActiveVoiceTaskSnapshots() ?? [] },
+            onSubmitUnifiedMessage: { [weak self] instruction, source, agentHint, riskTier, enqueueIfBusy in
+                guard let self else { return .unavailable(reason: "Workspace encerrado.") }
+                return self.submitUnifiedMessage(
+                    instruction,
+                    source: source,
+                    agentHint: agentHint,
+                    riskTier: riskTier,
+                    forceReadOnly: false,
+                    enqueueIfBusy: enqueueIfBusy
+                )
+            },
+            onCancelActiveTask: { [weak self] in
+                self?.cancelActiveTaskFromVoice() ?? false
+            },
+            onRecordLocalExchangeToChat: { [weak self] u, a in
+                self?.recordLocalVoiceExchangeToChat(userText: u, assistantText: a)
+            }
+        )
+    }
+
     private func startChatConversationalVoice() {
         realtimeStartupToken = UUID()
         realtimeSessionStartedAt = nil
+        refreshResolvedProjectContext(inspectGit: true)
         let userName = selectedAccount?.emailOrIdentity.contains("@") == true ? NSFullUserName() : (selectedAccount?.name ?? NSFullUserName())
         let greeting: String? = voice.autoGreetingEnabled
             ? Self.buildVoiceActivationGreeting(
                 userFullName: userName,
                 hasExistingMessages: !messages.isEmpty,
-                projectName: project?.lastPathComponent
+                projectName: resolvedProjectContext.projectName ?? project?.lastPathComponent
             )
             : nil
 
-        let ctxSnapshot = VoiceWorkspaceContextSnapshot(
-            projectName: project?.lastPathComponent,
-            workspaceDirectoryDisplay: project?.path,
-            securityModeName: modeName(),
-            activeExecutionAgent: selectedAccount?.name ?? "WisdAI",
-            activeTasksCount: activeTasks.count
-        )
+        let ctxSnapshot = buildVoiceWorkspaceSnapshot()
 
         voice.startConversationalChatMode(
             workspaceContext: ctxSnapshot,
@@ -2254,135 +2477,44 @@ final class Workspace: ObservableObject {
             },
             hasCodexAppServer: ready,
             activeTasksProvider: { [weak self] in
-                guard let self else { return [] }
-                var list = self.activeTasks.values.map { task in
-                    VoiceTaskSummarySnapshot(
-                        id: task.threadId,
-                        title: String(task.prompt.prefix(64)),
-                        agentName: task.accountName,
-                        modelName: task.modelName,
-                        status: task.status,
-                        progressNote: task.progressNote
-                    )
-                }
-                if list.isEmpty && self.busy {
-                    list.append(VoiceTaskSummarySnapshot(
-                        id: self.selected ?? "active-turn",
-                        title: self.currentActivityNote ?? "Tarefa em execução",
-                        agentName: self.selectedAccount?.name ?? "WisdAI",
-                        modelName: self.selectedModel,
-                        status: "executando",
-                        progressNote: self.currentActivityDetail ?? self.currentActivityNote ?? "Em andamento"
-                    ))
-                }
-                return list
+                self?.collectActiveVoiceTaskSnapshots() ?? []
             },
             onDelegateTaskToAgent: { [weak self] agentHint, instruction, riskTier in
                 guard let self else { return .unavailable(reason: "Workspace encerrado.") }
-                let clean = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !clean.isEmpty else { return .unavailable(reason: "Instrução vazia.") }
-
-                // Roteamento explícito de especialista mantendo a voz/identidade WisdAI inalterada
-                var resolvedAgentLabel = self.selectedAccount?.name ?? "o agente ativo"
-                if agentHint != .autoActive, let local = self.localDataRef {
-                    let targetProvider: AIProvider? = {
-                        switch agentHint {
-                        case .codex: return .openai
-                        case .antigravity: return .gemini
-                        case .claude: return .claude
-                        case .autoActive: return nil
-                        }
-                    }()
-                    if let targetProvider {
-                        if let matched = local.aiAccounts.first(where: { $0.provider == targetProvider && $0.supportsExecution }) {
-                            local.setActiveAccount(id: matched.id)
-                            self.selectedAccount = matched
-                            resolvedAgentLabel = matched.name
-                        } else {
-                            return .unavailable(reason: "Nenhuma conta \(agentHint.rawValue.capitalized) autenticada e ativa está disponível no momento.")
-                        }
-                    }
-                }
-
-                // Ação de alto risco nunca executa automaticamente pela voz sem aprovação explícita
-                if riskTier == .high {
-                    self.prompt = clean
-                    self.messages.append(Message(
-                        author: "Sistema",
-                        text: "🛡️ Segurança por Voz: comando de risco alto colocado no campo de envio para sua confirmação manual antes de executar."
-                    ))
-                    self.persistCurrentMessages()
-                    return .awaitingUserApproval(reason: "A instrução foi colocada no campo de envio para revisão manual.")
-                }
-
-                if self.voice.voiceContinuityEnabled, let tid = self.selected {
-                    CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: clean)
-                }
-                self.voiceTurnBaselineMessageID = self.messages.last(where: { ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text })?.id
-                self.activeVoiceDelegatedTaskTitle = String(clean.prefix(64))
-                let prevError = self.error
-                self.error = nil
-                self.prompt = clean
-                self.send(forceReadOnly: riskTier == .low)
-
-                if let sendErr = self.error, !sendErr.isEmpty, sendErr != prevError {
-                    self.activeVoiceDelegatedTaskTitle = nil
-                    return .unavailable(reason: sendErr)
-                }
-                let confirmed = self.busy || !self.activeTasks.isEmpty
-                guard confirmed else {
-                    self.activeVoiceDelegatedTaskTitle = nil
-                    return .unavailable(reason: self.error ?? "A execução não foi iniciada pelo orquestrador.")
-                }
-                return .dispatched(agentDisplayName: resolvedAgentLabel)
+                return self.bridgeVoiceDelegateTask(agentHint: agentHint, instruction: instruction, riskTier: riskTier)
             },
             onRecordLocalExchangeToChat: { [weak self] userText, assistantText in
-                guard let self else { return }
-                let u = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-                let a = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !u.isEmpty || !a.isEmpty else { return }
-                if let tid = self.selected ?? self.voice.realtimeThreadId {
-                    self.ensureConversationRegistered(id: tid, title: u.isEmpty ? "Conversa por voz" : String(u.prefix(48)), cwd: self.project?.path ?? "")
-                    if self.voice.voiceContinuityEnabled {
-                        if !u.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(u) {
-                            CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: u)
-                        }
-                        if !a.isEmpty && !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(a) {
-                            CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "assistant", text: a)
-                        }
-                    }
-                }
-                if !u.isEmpty {
-                    self.messages.append(Message(author: "Você", text: u, kind: .text))
-                }
-                if !a.isEmpty {
-                    let msg = Message(author: "WisdAI", text: a, kind: .text)
-                    self.lastSpokenVoiceReplyMessageID = msg.id
-                    self.messages.append(msg)
-                }
-                self.persistCurrentMessages()
+                self?.recordLocalVoiceExchangeToChat(userText: userText, assistantText: assistantText)
+            },
+            executionEventBus: executionEventBus,
+            conversationIDProvider: { [weak self] in self?.selected },
+            onSubmitUnifiedMessage: { [weak self] instruction, source, agentHint, riskTier, enqueueIfBusy in
+                guard let self else { return .unavailable(reason: "Workspace encerrado.") }
+                return self.submitUnifiedMessage(
+                    instruction,
+                    source: source,
+                    agentHint: agentHint,
+                    riskTier: riskTier,
+                    forceReadOnly: false,
+                    enqueueIfBusy: enqueueIfBusy
+                )
+            },
+            onCancelActiveTask: { [weak self] in
+                self?.cancelActiveTaskFromVoice() ?? false
             },
             greeting: greeting
         ) { [weak self] spokenText in
             guard let self else { return }
             let trimmed = spokenText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
-            if self.busy {
-                let words = trimmed.split(whereSeparator: { $0.isWhitespace })
-                let lower = trimmed.lowercased()
-                let isExplicitStop = lower.contains("pare") || lower.contains("para") || lower.contains("cancela") || lower.contains("interromp")
-                if words.count <= 1 && !isExplicitStop {
-                    return
-                }
-            }
-            if self.voice.voiceContinuityEnabled, let tid = self.selected {
-                CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: trimmed)
-            }
-            self.voice.orchestrator.beginAssistantTurnResponseTracking()
-            self.voice.isProcessing = true
-            self.voice.voiceActivity = .thinking
-            self.prompt = trimmed
-            self.send()
+            _ = self.submitUnifiedMessage(
+                trimmed,
+                source: .voice,
+                agentHint: .autoActive,
+                riskTier: .medium,
+                forceReadOnly: false,
+                enqueueIfBusy: false
+            )
         }
     }
 
@@ -2524,7 +2656,11 @@ final class Workspace: ObservableObject {
         selected = id
         ChatStorage.shared.setLastSelectedThreadId(id)
         UserDefaults.standard.set(id, forKey: "wisdcode.desktop.lastSelectedThread")
+        let prevPath = project?.path
         project = cwd.isEmpty ? nil : URL(fileURLWithPath: cwd)
+        if prevPath == project?.path {
+            refreshResolvedProjectContext(inspectGit: true)
+        }
         let cached = ChatStorage.shared.loadMessages(for: id)
         if !cached.isEmpty {
             messages = cached
@@ -2792,9 +2928,7 @@ final class Workspace: ObservableObject {
         }
         persistCurrentMessages()
 
-        let baseInstruction = (voice.isVoiceModeActive && !voice.realtimeSessionActive)
-            ? Self.wrapConversationalVoiceInstruction(trimmed, projectName: project?.lastPathComponent)
-            : trimmed
+        let baseInstruction = trimmed
         let provider = currentAccount?.provider ?? .openai
 
         // Para provedores CLI (Gemini/Claude), executeCLITurn injeta automaticamente ctx.priorTextMessages (pois agyConversationId foi limpo).
@@ -2869,6 +3003,78 @@ final class Workspace: ObservableObject {
         }
     }
 
+    func publishExecutionEvent(
+        threadId: String,
+        turnId: String = "",
+        kind: ExecutionEventKind,
+        title: String,
+        detail: String? = nil,
+        filePath: String? = nil,
+        lineRange: String? = nil,
+        commandLine: String? = nil,
+        exitCode: Int? = nil,
+        durationSeconds: Double? = nil,
+        succeeded: Bool? = nil
+    ) {
+        let meta = activeTurnMetadataByThread[threadId]
+        let agentName = meta?.agentDisplayName ?? activeTasks[threadId]?.accountName ?? selectedAccount?.name ?? "WisdAI"
+        let modelID = meta?.modelID ?? activeTasks[threadId]?.modelName ?? selectedModel
+        let projName = meta?.projectName ?? resolvedProjectContext.projectName ?? project?.lastPathComponent
+        let dir = meta?.workingDirectory ?? resolvedProjectContext.absoluteDirectoryPath ?? project?.path
+        let ev = ExecutionEvent(
+            conversationID: threadId,
+            turnID: turnId,
+            projectID: meta?.projectID ?? resolvedProjectContext.projectID,
+            projectName: projName,
+            workingDirectory: dir,
+            agentName: agentName,
+            modelID: modelID,
+            kind: kind,
+            title: title,
+            detail: detail,
+            filePath: filePath,
+            lineRange: lineRange,
+            commandLine: commandLine,
+            exitCode: exitCode,
+            durationSeconds: durationSeconds,
+            succeeded: succeeded
+        )
+        executionEventBus.publish(ev)
+    }
+
+    private static func commandLooksLikeTestRun(_ command: String) -> Bool {
+        let lower = command.lowercased()
+        return lower.contains("test")
+            || lower.contains("pytest")
+            || lower.contains("vitest")
+            || lower.contains("jest")
+            || lower.contains("run-voice-smoke")
+            || lower.contains("run-state-smoke")
+            || lower.contains("run-recovery-smoke")
+    }
+
+    private func drainQueuedFollowUpIfAny(for threadId: String) {
+        guard var queue = queuedFollowUpInstructionsByThread[threadId], !queue.isEmpty else { return }
+        let next = queue.removeFirst()
+        if queue.isEmpty {
+            queuedFollowUpInstructionsByThread.removeValue(forKey: threadId)
+        } else {
+            queuedFollowUpInstructionsByThread[threadId] = queue
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            _ = self.submitUnifiedMessage(
+                next.task,
+                source: next.source,
+                agentHint: next.agentHint,
+                riskTier: .medium,
+                forceReadOnly: false,
+                enqueueIfBusy: false,
+                skipAddingUserMessage: true
+            )
+        }
+    }
+
     func send(forceReadOnly: Bool = false) {
         let task = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !accountBusy, !recording, (!task.isEmpty || !attachments.isEmpty) else { return }
@@ -2884,14 +3090,89 @@ final class Workspace: ObservableObject {
             return
         }
 
-        // Se uma tarefa já estiver em execução nesta conversa, trata como intervenção em tempo real!
-        if busy || (selected != nil && activeTasks[selected!] != nil) {
-            sendIntervention(task)
-            return
+        _ = submitUnifiedMessage(
+            task,
+            source: .text,
+            agentHint: .autoActive,
+            riskTier: .medium,
+            forceReadOnly: forceReadOnly,
+            enqueueIfBusy: false
+        )
+    }
+
+    @discardableResult
+    func submitUnifiedMessage(
+        _ rawTask: String,
+        source: MessageInputSource,
+        agentHint: VoiceSpecialistAgentHint = .autoActive,
+        riskTier: VoiceActionRiskTier = .medium,
+        forceReadOnly: Bool = false,
+        enqueueIfBusy: Bool = false,
+        skipAddingUserMessage: Bool = false
+    ) -> UnifiedSubmissionOutcome {
+        let task = rawTask.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !accountBusy, !recording, (!task.isEmpty || !attachments.isEmpty) else {
+            return .unavailable(reason: "Workspace ocupado no momento ou instrução vazia.")
         }
-        if activeTasks.count >= 5 {
-            error = "Limite de 5 tarefas simultâneas atingido. Aguarde a conclusão de uma tarefa."
-            return
+
+        // Valida imediatamente diretório de projeto associado (nunca dissimular nem usar $HOME quando o diretório não existe!)
+        let associatedPath = project?.path ?? conversations.first(where: { $0.id == selected })?.cwd ?? ""
+        if !associatedPath.isEmpty {
+            let dirCheck = ProjectContextResolver.validateDirectorySync(path: associatedPath)
+            if !(dirCheck.exists && dirCheck.accessible) {
+                let errText = dirCheck.error ?? "O diretório associado '\(associatedPath)' não existe ou está inacessível."
+                error = errText
+                messages.append(Message(author: "Sistema", text: "⚠️ \(errText)"))
+                persistCurrentMessages()
+                publishExecutionEvent(
+                    threadId: selected ?? "blocked",
+                    kind: .taskBlocked,
+                    title: "Diretório do projeto inacessível",
+                    detail: errText,
+                    filePath: associatedPath,
+                    succeeded: false
+                )
+                return .blockedDirectory(error: errText, directoryPath: associatedPath)
+            }
+        }
+        refreshResolvedProjectContext(inspectGit: false)
+
+        // Roteamento explícito para especialista nomeado pelo utilizador (Codex / Antigravity / Claude)
+        if agentHint != .autoActive, let local = localDataRef {
+            let targetProvider: AIProvider? = {
+                switch agentHint {
+                case .codex: return .openai
+                case .antigravity: return .gemini
+                case .claude: return .claude
+                case .autoActive: return nil
+                }
+            }()
+            if let targetProvider {
+                if let matched = local.aiAccounts.first(where: { $0.provider == targetProvider && $0.supportsExecution }) {
+                    if selectedAccount?.id != matched.id {
+                        local.setActiveAccount(id: matched.id)
+                        selectedAccount = matched
+                        if targetProvider == .openai {
+                            let validOpenAIModels = matched.models.filter { UsageQuotaStore.isModelCompatible($0, with: matched) }
+                            self.models = validOpenAIModels.enumerated().map { idx, mid in
+                                ModelChoice(id: mid, name: AIProvider.modelDisplayName(for: mid), efforts: ["low", "medium", "high", "xhigh", "ultra"], defaultEffort: "medium", isDefault: idx == 0)
+                            }
+                            if self.models.isEmpty { self.loadModels() }
+                        } else {
+                            self.models = matched.models.enumerated().map { idx, mid in
+                                ModelChoice(id: mid, name: AIProvider.modelDisplayName(for: mid), efforts: ["default"], defaultEffort: "default", isDefault: idx == 0)
+                            }
+                        }
+                        let chosenValid = UsageQuotaStore.isModelCompatible(matched.currentModel, with: matched)
+                            ? matched.currentModel
+                            : (matched.models.first ?? targetProvider.defaultModels.first ?? "auto")
+                        selectedModel = chosenValid
+                    }
+                } else {
+                    let msg = "Nenhuma conta \(agentHint.rawValue.capitalized) autenticada e ativa está disponível no momento."
+                    return .unavailable(reason: msg)
+                }
+            }
         }
 
         // Reconcilia imediatamente limites expirados / renovados antes de decidir para onde rotear
@@ -2933,36 +3214,162 @@ final class Workspace: ObservableObject {
                 error = msg
                 messages.append(Message(author: "Sistema", text: msg))
                 persistCurrentMessages()
-                return
+                return .unavailable(reason: msg)
             } else {
                 let msg = "Nenhuma conta com CLI ou sessão autenticada está disponível neste Mac. Conecte uma sessão OpenAI ou CLI Antigravity/Claude em Configurações."
                 error = msg
                 messages.append(Message(author: "Sistema", text: msg))
                 persistCurrentMessages()
-                return
+                return .unavailable(reason: msg)
             }
         }
 
-        let baseTurnInstruction = (voice.isVoiceModeActive && !voice.realtimeSessionActive)
-            ? Self.wrapConversationalVoiceInstruction(task, projectName: project?.lastPathComponent)
-            : task
-        let effectiveTurnInstruction = forceReadOnly
-            ? "[MODO CONSULTA SOMENTE LEITURA: Apenas leia/analise informações; NÃO edite, crie, remova nem modifique arquivos no workspace.]\n\n\(baseTurnInstruction)"
-            : baseTurnInstruction
-        let effectiveVoiceModel = (voice.isVoiceModeActive && !voice.realtimeSessionActive)
-            ? Self.resolveFastVoiceModelIfConversational(chosenModel: chosenModel, task: task, account: currentAccount)
-            : chosenModel
+        let targetThreadId = selected ?? UUID().uuidString
+        let sandbox = ["read-only", "workspace-write", "danger-full-access"][min(max(forceReadOnly ? 0 : mode, 0), 2)]
+        let approvalPol = (forceReadOnly ? 0 : mode) == 2 ? "never" : "on-request"
+        let effectiveCwd = resolvedProjectContext.absoluteDirectoryPath ?? (associatedPath.isEmpty ? FileManager.default.homeDirectoryForCurrentUser.path : associatedPath)
+        let convAgyId = conversations.first(where: { $0.id == targetThreadId })?.agyConversationId
 
+        let metadata = UnifiedMessageMetadata(
+            conversationID: targetThreadId,
+            projectID: resolvedProjectContext.projectID,
+            projectName: resolvedProjectContext.projectName ?? project?.lastPathComponent,
+            workspaceID: currentAccount?.workspaceID,
+            workingDirectory: effectiveCwd,
+            additionalDirectories: resolvedProjectContext.additionalPaths,
+            agentID: currentAccount?.id.uuidString ?? "local",
+            agentDisplayName: currentAccount?.name ?? "WisdAI",
+            providerID: currentAccount?.provider.rawValue ?? "openai",
+            accountID: currentAccount?.id,
+            modelID: chosenModel,
+            reasoningEffort: reasoningLevel.effortValue,
+            reasoningEffortTitle: reasoningLevel.title,
+            sessionID: convAgyId ?? currentAccount?.sessionID,
+            inputSource: source,
+            permissionsMode: forceReadOnly ? 0 : mode,
+            sandboxPolicy: sandbox,
+            approvalPolicy: approvalPol,
+            attachments: attachments.map(\.name),
+            conversationHistoryCount: messages.count
+        )
+
+        // Ação destrutiva de alto risco por voz nunca executa sem aprovação manual na tela
+        if (source == .voice || source == .voiceIntervention) && riskTier == .high {
+            prompt = task
+            messages.append(Message(
+                author: "Sistema",
+                text: "🛡️ Segurança por Voz: comando de risco alto colocado no campo de envio para sua confirmação manual antes de executar."
+            ))
+            persistCurrentMessages()
+            publishExecutionEvent(
+                threadId: targetThreadId,
+                kind: .approvalRequired,
+                title: "Aprovação manual necessária",
+                detail: task
+            )
+            return .awaitingUserApproval(reason: "A instrução foi colocada no campo de envio para revisão manual.", metadata: metadata)
+        }
+
+        // Durante tarefa ativa: ou enfileira instrução complementar sem derrubar a atual, ou aplica intervenção
+        if busy || (selected != nil && activeTasks[selected!] != nil) {
+            if enqueueIfBusy {
+                var q = queuedFollowUpInstructionsByThread[targetThreadId] ?? []
+                q.append((task: task, source: source, agentHint: agentHint))
+                queuedFollowUpInstructionsByThread[targetThreadId] = q
+                messages.append(Message(author: "Você", text: task))
+                persistCurrentMessages()
+                executionEventBus.registerTaskMetadata(metadata, prompt: task, queuePosition: q.count)
+                publishExecutionEvent(
+                    threadId: targetThreadId,
+                    kind: .taskQueued,
+                    title: "Instrução enfileirada (#\(q.count))",
+                    detail: task
+                )
+                return .queued(metadata: metadata, position: q.count)
+            }
+            sendIntervention(task)
+            return .started(metadata: metadata)
+        }
+
+        if activeTasks.count >= 5 {
+            let limitErr = "Limite de 5 tarefas simultâneas atingido. Aguarde a conclusão de uma tarefa."
+            error = limitErr
+            return .unavailable(reason: limitErr)
+        }
+
+        if source == .voice || source == .voiceIntervention {
+            if voice.voiceContinuityEnabled, let tid = selected {
+                CodexRealtimeContinuityStore.shared.recordItem(threadId: tid, role: "user", text: task)
+            }
+            voiceTurnBaselineMessageID = messages.last(where: { ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text })?.id
+            activeVoiceDelegatedTaskTitle = String(task.prefix(64))
+        }
+
+        // Nunca degradar o modelo escolhido nem mutilar a saída técnica no chat; apenas anexar contexto real do projeto
+        var fullInstruction = task
+        if forceReadOnly {
+            fullInstruction = "[MODO CONSULTA SOMENTE LEITURA: Apenas leia/analise informações; NÃO edite, crie, remova nem modifique arquivos no workspace.]\n\n\(fullInstruction)"
+        }
+        if resolvedProjectContext.hasValidWorkspaceDirectory {
+            let rp = resolvedProjectContext
+            let gitSummary = rp.isGitRepository
+                ? "Git: \(rp.gitRepositoryName ?? rp.projectName ?? "repo") · branch=\(rp.gitBranch ?? "?") · tree=\(rp.gitWorkingTreeStatus ?? "?")"
+                : "Git: não inicializado"
+            let cfgSummary = rp.projectConfigHighlights.isEmpty ? "nenhum manifesto padrão detectado na raiz" : rp.projectConfigHighlights.joined(separator: ", ")
+            let groundingRule = """
+            [Contexto Verificado do Projeto Ativo | Origem: \(source.displayName) | Agente: \(metadata.agentDisplayName) | Modelo: \(chosenModel) | Esforço: \(metadata.reasoningEffortTitle)]
+            • Projeto: \(rp.projectName ?? project?.lastPathComponent ?? "Workspace")
+            • Diretório absoluto validado: \(rp.absoluteDirectoryPath ?? effectiveCwd)
+            • \(gitSummary)
+            • Configurações na raiz: \(cfgSummary)
+            • Regra de evidência: não peça ao utilizador para colar/compartilhar o repositório; inspecione os ficheiros reais neste diretório usando suas ferramentas e cite apenas caminhos, símbolos, comandos e resultados efetivamente observados.
+
+            Solicitação do utilizador:
+            \(fullInstruction)
+            """
+            fullInstruction = groundingRule
+        }
+
+        let initialThreadSelection = selected
+        activeTurnMetadataByThread[targetThreadId] = metadata
+        executionEventBus.registerTaskMetadata(metadata, prompt: task)
+        publishExecutionEvent(
+            threadId: targetThreadId,
+            kind: .taskReceived,
+            title: "Solicitação recebida via \(source.displayName)",
+            detail: task
+        )
+
+        error = nil
         dispatchTurnOnRoute(
-            existingThreadId: selected,
+            existingThreadId: initialThreadSelection,
             task: task,
-            instruction: effectiveTurnInstruction,
+            instruction: fullInstruction,
             account: currentAccount,
-            model: effectiveVoiceModel,
-            skipAddingUserMessage: false,
+            model: chosenModel,
+            skipAddingUserMessage: skipAddingUserMessage,
             retryDepth: 0,
             forceReadOnly: forceReadOnly
         )
+
+        if let actualThreadId = selected, actualThreadId != targetThreadId {
+            activeTurnMetadataByThread[actualThreadId] = metadata
+            executionEventBus.registerTaskMetadata(metadata, prompt: task)
+            publishExecutionEvent(
+                threadId: actualThreadId,
+                kind: .taskReceived,
+                title: "Solicitação iniciada via \(source.displayName)",
+                detail: task
+            )
+        }
+
+        if let dispatchErr = error, !dispatchErr.isEmpty, !(busy || !activeTasks.isEmpty) {
+            if source == .voice || source == .voiceIntervention {
+                activeVoiceDelegatedTaskTitle = nil
+            }
+            return .unavailable(reason: dispatchErr)
+        }
+        return .started(metadata: metadata)
     }
 
     private func dispatchTurnOnRoute(
@@ -3053,16 +3460,26 @@ final class Workspace: ObservableObject {
         }
 
         // Garante que somente modelos compatíveis com OpenAI/Codex cheguem ao codex app-server
+        let openAIAccountRef = account ?? AIAccount(name: "Codex", provider: .openai)
+        let compatibleModels = models.filter { UsageQuotaStore.isModelCompatible($0.id, with: openAIAccountRef) }
+        let fallbackOpenAIModel = compatibleModels.first(where: \.isDefault)?.id
+            ?? compatibleModels.first?.id
+            ?? openAIAccountRef.models.first(where: { UsageQuotaStore.isModelCompatible($0, with: openAIAccountRef) })
+            ?? AIProvider.openai.defaultModels.first
+            ?? "gpt-6-astra"
         let sanitizedModel: String = {
-            if let account, !UsageQuotaStore.isModelCompatible(model, with: account) {
-                return models.first(where: \.isDefault)?.id ?? models.first?.id ?? (account.models.first ?? "auto")
+            if model == "auto" {
+                return fallbackOpenAIModel
+            }
+            if !UsageQuotaStore.isModelCompatible(model, with: openAIAccountRef) {
+                return fallbackOpenAIModel
             }
             let lower = model.lowercased()
             if lower.contains("claude") || lower.contains("gemini") || lower.contains("deepseek") || lower.contains("grok") || lower.contains("kimi") {
-                return models.first(where: \.isDefault)?.id ?? models.first?.id ?? "auto"
+                return fallbackOpenAIModel
             }
-            if !models.isEmpty && model != "auto" && !models.contains(where: { $0.id == model }) {
-                return models.first(where: \.isDefault)?.id ?? models.first?.id ?? "auto"
+            if !compatibleModels.isEmpty && !compatibleModels.contains(where: { $0.id == model }) {
+                return fallbackOpenAIModel
             }
             return model
         }()
@@ -3094,20 +3511,47 @@ final class Workspace: ObservableObject {
             if let existingThreadId { parameters["threadId"] = existingThreadId }
             self.request(existingThreadId == nil ? "thread/start" : "thread/resume", parameters) { [weak self] response in
                 guard let self else { return }
-                guard let thread = self.accept(response)?["thread"] as? JSON, let id = thread["id"] as? String else {
-                    self.busy = false
+                let handleThreadReady: (JSON) -> Void = { thread in
+                    guard let id = thread["id"] as? String else {
+                        self.busy = false
+                        return
+                    }
+                    self.error = nil
+                    self.selected = id
+                    self.resumed = id
+                    self.loadedHistories.insert(id)
+                    self.knownLastTurns[id] = (thread["turns"] as? [JSON])?.last?["id"] as? String
+                    if !self.conversations.contains(where: { $0.id == id }) {
+                        let convTitle = String(task.prefix(32))
+                        let newConv = Conversation(id: id, title: convTitle.isEmpty ? "Nova conversa" : convTitle, cwd: activeCwd)
+                        self.conversations.insert(newConv, at: 0)
+                    }
+                    let priorMsgs = self.messages.filter { $0.kind == .text }
+                    let fallbackInstruction: String? = (existingThreadId != nil && priorMsgs.count > 1)
+                        ? Self.buildPriorConversationContextPrompt(priorMessages: Array(priorMsgs.dropLast()), currentTask: instruction)
+                        : instruction
+                    self.startTurn(id, task, instructionOverride: fallbackInstruction, modelOverride: sanitizedModel, cwdOverride: activeCwd, skipAddingUserMessage: skipAddingUserMessage, forceReadOnly: forceReadOnly)
+                }
+                if let thread = (response["result"] as? JSON)?["thread"] as? JSON {
+                    handleThreadReady(thread)
                     return
                 }
-                self.selected = id
-                self.resumed = id
-                self.loadedHistories.insert(id)
-                self.knownLastTurns[id] = (thread["turns"] as? [JSON])?.last?["id"] as? String
-                if !self.conversations.contains(where: { $0.id == id }) {
-                    let convTitle = String(task.prefix(32))
-                    let newConv = Conversation(id: id, title: convTitle.isEmpty ? "Nova conversa" : convTitle, cwd: activeCwd)
-                    self.conversations.insert(newConv, at: 0)
+                // Fallback: if threadId was created locally or under another CLI provider (e.g. Antigravity), start a fresh Codex thread carrying prior context.
+                if existingThreadId != nil {
+                    var startParams = safety
+                    startParams["ephemeral"] = self.temporaryChat
+                    self.request("thread/start", startParams) { [weak self] startResp in
+                        guard let self else { return }
+                        guard let newThread = self.accept(startResp)?["thread"] as? JSON else {
+                            self.busy = false
+                            return
+                        }
+                        handleThreadReady(newThread)
+                    }
+                    return
                 }
-                self.startTurn(id, task, instructionOverride: instruction, modelOverride: sanitizedModel, cwdOverride: activeCwd, skipAddingUserMessage: skipAddingUserMessage, forceReadOnly: forceReadOnly)
+                _ = self.accept(response)
+                self.busy = false
             }
         }
 
@@ -3306,13 +3750,29 @@ final class Workspace: ObservableObject {
         }
     }
 
-    func interrupt() {
-        voice.stopSpeaking()
-        voice.stopListening()
+    func interrupt(preserveVoiceSession: Bool = false) {
+        if !preserveVoiceSession {
+            voice.stopSpeaking()
+            voice.stopListening()
+        }
         voice.isProcessing = false
+        let tid = selected ?? activeTasks.keys.first
+        if let tid {
+            queuedFollowUpInstructionsByThread.removeValue(forKey: tid)
+            publishExecutionEvent(
+                threadId: tid,
+                turnId: turnID ?? "",
+                kind: .taskCancelled,
+                title: "Tarefa cancelada",
+                detail: "Interrompida pelo utilizador"
+            )
+        }
         if let proc = activeCLIProcess {
             proc.terminate()
             activeCLIProcess = nil
+            if let tid {
+                activeTasks.removeValue(forKey: tid)
+            }
             busy = false
             resetActivityState()
             return
@@ -3503,10 +3963,181 @@ final class Workspace: ObservableObject {
         return ""
     }
 
+    private func publishCLIToolExecutionEvent(
+        threadId: String,
+        turnId: String,
+        toolName: String,
+        params: JSON,
+        msg: Message,
+        isDone: Bool,
+        duration: Double?,
+        toolOutput: String?
+    ) {
+        let lower = toolName.lowercased()
+        let pathParam = (params["Path"] as? String)
+            ?? (params["path"] as? String)
+            ?? (params["AbsolutePath"] as? String)
+            ?? (params["TargetFile"] as? String)
+            ?? (params["DirectoryPath"] as? String)
+        var lineRange: String? = nil
+        if let s = params["StartLine"] as? Int, let e = params["EndLine"] as? Int {
+            lineRange = "#L\(s)-\(e)"
+        } else if let s = params["StartLine"] as? Int {
+            lineRange = "#L\(s)"
+        }
+
+        if lower == "run_command" || lower == "command_status" || lower == "send_command_input" {
+            let cmd = (params["CommandLine"] as? String)
+                ?? (params["command"] as? String)
+                ?? (params["Input"] as? String)
+                ?? msg.detail
+                ?? toolName
+            let isTestCmd = Self.commandLooksLikeTestRun(cmd)
+            publishExecutionEvent(
+                threadId: threadId,
+                turnId: turnId,
+                kind: isDone ? .commandCompleted : .commandStarted,
+                title: isDone ? "Comando concluído: \(msg.target ?? cmd)" : "Executando comando: \(msg.target ?? cmd)",
+                detail: cmd,
+                commandLine: cmd,
+                durationSeconds: duration,
+                succeeded: isDone ? !(toolOutput?.lowercased().contains("exit code") ?? false && toolOutput?.lowercased().contains("exited with code 0") == false) : nil
+            )
+            if isTestCmd {
+                let testPassed: Bool? = isDone
+                    ? !((toolOutput?.lowercased().contains("fail") ?? false) || (toolOutput?.lowercased().contains("error:") ?? false))
+                    : nil
+                publishExecutionEvent(
+                    threadId: threadId,
+                    turnId: turnId,
+                    kind: isDone ? .testCompleted : .testStarted,
+                    title: isDone ? "Testes finalizados" : "Executando testes",
+                    detail: cmd,
+                    commandLine: cmd,
+                    durationSeconds: duration,
+                    succeeded: testPassed
+                )
+            }
+            return
+        }
+
+        if lower == "read_file" || lower == "view_file" || lower == "view_file_outline" || lower == "view_code_item" || lower == "list_dir" || lower == "find_by_name" || lower == "grep_search" {
+            if isDone && !(pathParam ?? "").isEmpty {
+                publishExecutionEvent(
+                    threadId: threadId,
+                    turnId: turnId,
+                    kind: .fileRead,
+                    title: "Lido: \(msg.target ?? pathParam!)",
+                    detail: msg.detail,
+                    filePath: pathParam,
+                    lineRange: lineRange,
+                    durationSeconds: duration,
+                    succeeded: true
+                )
+            } else {
+                publishExecutionEvent(
+                    threadId: threadId,
+                    turnId: turnId,
+                    kind: isDone ? .toolCompleted : .toolStarted,
+                    title: "\(msg.text) \(msg.target ?? toolName)",
+                    detail: msg.detail,
+                    filePath: pathParam,
+                    lineRange: lineRange,
+                    durationSeconds: duration,
+                    succeeded: isDone ? true : nil
+                )
+            }
+            return
+        }
+
+        if lower.contains("write") || lower.contains("edit") || lower.contains("replace") || lower == "sed_file" {
+            if isDone {
+                publishExecutionEvent(
+                    threadId: threadId,
+                    turnId: turnId,
+                    kind: .fileModified,
+                    title: "Modificado: \(msg.target ?? (pathParam ?? toolName))",
+                    detail: msg.detail,
+                    filePath: pathParam,
+                    durationSeconds: duration,
+                    succeeded: true
+                )
+            } else {
+                publishExecutionEvent(
+                    threadId: threadId,
+                    turnId: turnId,
+                    kind: .toolStarted,
+                    title: "Editando \(msg.target ?? toolName)",
+                    detail: msg.detail,
+                    filePath: pathParam
+                )
+            }
+            return
+        }
+
+        publishExecutionEvent(
+            threadId: threadId,
+            turnId: turnId,
+            kind: isDone ? .toolCompleted : .toolStarted,
+            title: "\(msg.text) \(msg.target ?? toolName)",
+            detail: msg.detail,
+            filePath: pathParam,
+            durationSeconds: duration,
+            succeeded: isDone ? true : nil
+        )
+    }
+
     func handleCLILine(_ line: String, threadId: String, turnId: String) {
         guard self.turnID == turnId || self.activeTasks[threadId]?.turnId == turnId else { return }
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        // Compatibilidade com CLI Claude (--output-format stream-json --verbose)
+        if trimmed.hasPrefix("{"),
+           let data = trimmed.data(using: .utf8),
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? JSON,
+           json["event"] == nil,
+           let claudeType = json["type"] as? String {
+            switch claudeType {
+            case "system":
+                publishExecutionEvent(threadId: threadId, turnId: turnId, kind: .agentConnected, title: "Claude Code CLI conectado")
+                recordActivity(threadId: threadId, note: "Claude Code conectado ao workspace…", detail: project?.lastPathComponent, kind: .thinking)
+            case "assistant":
+                if let msgObj = json["message"] as? JSON,
+                   let blocks = msgObj["content"] as? [JSON] {
+                    for (idx, block) in blocks.enumerated() {
+                        let bType = block["type"] as? String ?? ""
+                        if bType == "text", let txt = block["text"] as? String, !txt.isEmpty {
+                            appendDelta("\(turnId)-claude-\(idx)", txt, author: "WisdAI", kind: .text, turnId: turnId)
+                            recordActivity(threadId: threadId, note: "Escrevendo resposta…", kind: .response)
+                        } else if bType == "tool_use" {
+                            let tName = block["name"] as? String ?? "tool"
+                            let tInput = block["input"] as? JSON ?? [:]
+                            let msg = cliToolMessage(toolName: tName, params: tInput, toolOutput: nil, duration: nil, isDone: false, turnId: turnId)
+                            apply("\(turnId)-ctool-\(idx)", msg)
+                            publishCLIToolExecutionEvent(threadId: threadId, turnId: turnId, toolName: tName, params: tInput, msg: msg, isDone: false, duration: nil, toolOutput: nil)
+                        }
+                    }
+                    persistCurrentMessages()
+                }
+            case "result":
+                let isErr = json["is_error"] as? Bool == true
+                if let resText = json["result"] as? String, !resText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if isErr {
+                        self.cliExecutionError = resText
+                        recordCLILimitIfMatched(resText, threadId: threadId)
+                    } else if !messages.contains(where: { $0.turnId == turnId && $0.kind == .text && !$0.text.isEmpty }) {
+                        messages.append(Message(author: "WisdAI", text: resText, kind: .text, turnId: turnId))
+                        persistCurrentMessages()
+                    }
+                }
+                completeActivityStep(threadId: threadId)
+                resetActivityState()
+            default:
+                break
+            }
+            return
+        }
 
         if trimmed.hasPrefix("{"),
            let data = trimmed.data(using: .utf8),
@@ -3521,6 +4152,13 @@ final class Workspace: ObservableObject {
                         ChatStorage.shared.upsertConversation(self.conversations[idx])
                     }
                 }
+                publishExecutionEvent(
+                    threadId: threadId,
+                    turnId: turnId,
+                    kind: .agentConnected,
+                    title: "Agente conectado",
+                    detail: project?.path
+                )
                 recordActivity(threadId: threadId, note: "Lendo contexto e planejando ações…", detail: project?.lastPathComponent, kind: .thinking)
 
             case "step_update":
@@ -3598,6 +4236,16 @@ final class Workspace: ObservableObject {
                     )
                     apply(stepKey, msg)
                     persistCurrentMessages()
+                    publishCLIToolExecutionEvent(
+                        threadId: threadId,
+                        turnId: turnId,
+                        toolName: toolName,
+                        params: params,
+                        msg: msg,
+                        isDone: isDone,
+                        duration: duration,
+                        toolOutput: toolOutput
+                    )
 
                     if !isDone {
                         let liveNote = [msg.text, msg.target].compactMap { $0 }.joined(separator: " ")
@@ -3866,12 +4514,46 @@ final class Workspace: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cliPath)
         var args: [String] = []
-        if forceReadOnly {
+        if let dirPath = projectURL?.path, !dirPath.isEmpty {
+            let check = ProjectContextResolver.validateDirectorySync(path: dirPath)
+            if !(check.exists && check.accessible) {
+                let errText = check.error ?? "Diretório associado '\(dirPath)' inacessível."
+                self.error = errText
+                self.busy = false
+                self.voice.isProcessing = false
+                self.messages.append(Message(author: "Sistema", text: "⚠️ \(errText)"))
+                self.persistCurrentMessages()
+                self.publishExecutionEvent(
+                    threadId: id,
+                    turnId: turnId,
+                    kind: .taskBlocked,
+                    title: "Diretório inacessível",
+                    detail: errText,
+                    filePath: dirPath,
+                    succeeded: false
+                )
+                return
+            }
+        }
+        let isClaudeCLI = cliPath.hasSuffix("claude") || cliPath.contains("/claude")
+        if forceReadOnly || mode == 0 {
             if isAgy {
                 args.append(contentsOf: ["--mode", "plan", "--sandbox"])
+            } else if isClaudeCLI {
+                args.append(contentsOf: ["--permission-mode", "plan"])
+            }
+        } else if mode == 1 {
+            if isAgy {
+                args.append(contentsOf: ["--mode", "accept-edits"])
+            } else if isClaudeCLI {
+                args.append(contentsOf: ["--permission-mode", "acceptEdits"])
             }
         } else {
-            args.append("--dangerously-skip-permissions")
+            if isAgy {
+                args.append(contentsOf: ["--mode", "auto", "--dangerously-skip-permissions"])
+            } else {
+                args.append("--dangerously-skip-permissions")
+            }
         }
         var effectiveInstruction = instruction
         if !attachedPaths.isEmpty {
@@ -3882,11 +4564,19 @@ final class Workspace: ObservableObject {
 
         if isAgy {
             args.append(contentsOf: ["--output-format", "stream-json"])
+            for extraDir in resolvedProjectContext.additionalPaths where !extraDir.isEmpty && FileManager.default.fileExists(atPath: extraDir) {
+                args.append(contentsOf: ["--add-dir", extraDir])
+            }
             if let effortArg = resolvedAgy.effortArg {
                 args.append(contentsOf: ["--effort", effortArg])
             }
             if let existingAgyId, !existingAgyId.isEmpty {
                 args.append(contentsOf: ["--conversation", existingAgyId])
+            }
+        } else if isClaudeCLI {
+            args.append(contentsOf: ["--output-format", "stream-json", "--verbose"])
+            if reasoningLevel != .medio {
+                effectiveInstruction = "[Esforço de raciocínio: \(reasoningLevel.title) (\(reasoningLevel.effortValue))]\n" + effectiveInstruction
             }
         } else if reasoningLevel != .medio {
             effectiveInstruction = "[Esforço de raciocínio: \(reasoningLevel.title) (\(reasoningLevel.effortValue))]\n" + effectiveInstruction
@@ -3934,6 +4624,13 @@ final class Workspace: ObservableObject {
             currentActivityKind = .thinking
             currentActivitySteps = [initialStep]
         }
+        publishExecutionEvent(
+            threadId: id,
+            turnId: turnId,
+            kind: .taskStarted,
+            title: "Executando com \(modelDisplay)",
+            detail: projectURL?.path
+        )
 
         Task.detached { [weak self] in
             do {
@@ -3999,6 +4696,28 @@ final class Workspace: ObservableObject {
                     if self.selected != id {
                         self.unseenCompletedThreads.insert(id)
                     }
+                    let finalReplyText = self.messages.last(where: {
+                        $0.turnId == turnId && ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text
+                    })?.text
+                    if let activeErr = self.error, !activeErr.isEmpty {
+                        self.publishExecutionEvent(
+                            threadId: id,
+                            turnId: turnId,
+                            kind: .taskFailed,
+                            title: "Falha na execução",
+                            detail: activeErr,
+                            succeeded: false
+                        )
+                    } else {
+                        self.publishExecutionEvent(
+                            threadId: id,
+                            turnId: turnId,
+                            kind: .taskCompleted,
+                            title: "Execução concluída",
+                            detail: finalReplyText,
+                            succeeded: true
+                        )
+                    }
                     if self.selected == id {
                         self.busy = false
                         self.deliverCompletedChatVoiceReply(failureText: self.error)
@@ -4012,6 +4731,7 @@ final class Workspace: ObservableObject {
                         self.conversations.insert(conv, at: 0)
                     }
                     self.persistCurrentMessages()
+                    self.drainQueuedFollowUpIfAny(for: id)
                 }
             } catch {
                 await MainActor.run { [weak self] in
@@ -4022,6 +4742,14 @@ final class Workspace: ObservableObject {
                     self.resetActivityState()
                     self.voice.isProcessing = false
                     self.error = "Falha ao executar o agente CLI: \(error.localizedDescription)"
+                    self.publishExecutionEvent(
+                        threadId: id,
+                        turnId: turnId,
+                        kind: .taskFailed,
+                        title: "Falha ao executar CLI",
+                        detail: error.localizedDescription,
+                        succeeded: false
+                    )
                     if self.selected == id { self.busy = false }
                 }
             }
@@ -4057,7 +4785,7 @@ final class Workspace: ObservableObject {
             "sandboxPolicy": ["type": sandboxType],
             "approvalPolicy": effectiveMode == 2 ? "never" : "on-request",
         ]
-        if let modelToUse { turnParameters["model"] = modelToUse }
+        if let modelToUse, modelToUse != "auto" { turnParameters["model"] = modelToUse }
         if selectedEffort != "default" {
             turnParameters["effort"] = selectedEffort == "ultra" ? "xhigh" : selectedEffort
         }
@@ -4152,6 +4880,7 @@ final class Workspace: ObservableObject {
         } else {
             loadModels()
         }
+        syncVoiceWorkspaceSnapshotToOrchestrator()
     }
 
     func continueWithAccount(_ account: AIAccount, for threadId: String?) {
@@ -4426,9 +5155,13 @@ final class Workspace: ObservableObject {
             return
         }
         let eventThreadId = parameters["threadId"] as? String
+        let busThreadId = eventThreadId ?? selected ?? ""
         switch method {
         case "turn/started":
             recordActivity(threadId: eventThreadId, note: "Pensando…", detail: nil, kind: .thinking)
+            if !busThreadId.isEmpty {
+                publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .agentConnected, title: "Agente conectado")
+            }
         case "item/started":
             if let item = parameters["item"] as? JSON, (eventThreadId == nil || eventThreadId == selected) {
                 upsert(item)
@@ -4437,15 +5170,28 @@ final class Workspace: ObservableObject {
                 case "commandExecution":
                     let cmd = item["command"] as? String
                     recordActivity(threadId: eventThreadId, note: "Executando comando…", detail: cmd, kind: .command)
+                    if !busThreadId.isEmpty {
+                        publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .commandStarted, title: "Executando comando", detail: cmd, commandLine: cmd)
+                        if let cmd, Self.commandLooksLikeTestRun(cmd) {
+                            publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .testStarted, title: "Executando testes", detail: cmd, commandLine: cmd)
+                        }
+                    }
                 case "fileChange":
                     let changes = item["changes"] as? [JSON] ?? []
+                    let firstPath = changes.first?["path"] as? String
                     let paths = changes.compactMap { ($0["path"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent } }.joined(separator: ", ")
                     recordActivity(threadId: eventThreadId, note: paths.isEmpty ? "Editando arquivos…" : "Editando \(paths)…", detail: paths.isEmpty ? nil : paths, kind: .fileChange)
+                    if !busThreadId.isEmpty {
+                        publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .toolStarted, title: "Editando \(paths.isEmpty ? "arquivos" : paths)", detail: paths, filePath: firstPath)
+                    }
                 case "mcpToolCall":
                     let tool = item["tool"] as? String ?? "ferramenta"
                     let server = item["server"] as? String
                     let desc = server != nil ? "\(server!) · \(tool)" : tool
                     recordActivity(threadId: eventThreadId, note: "Executando \(desc)…", detail: desc, kind: .tool)
+                    if !busThreadId.isEmpty {
+                        publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .toolStarted, title: desc, detail: desc)
+                    }
                 case "webSearch":
                     let query = item["query"] as? String
                     recordActivity(threadId: eventThreadId, note: "Pesquisando na web…", detail: query, kind: .search)
@@ -4464,6 +5210,31 @@ final class Workspace: ObservableObject {
                 upsert(item)
                 completeActivityStep(threadId: eventThreadId)
                 persistCurrentMessages()
+                if !busThreadId.isEmpty {
+                    let itemType = item["type"] as? String ?? ""
+                    let exitCode = item["exitCode"] as? Int
+                    let ok = (item["status"] as? String) != "failed" && (exitCode == nil || exitCode == 0)
+                    switch itemType {
+                    case "commandExecution":
+                        let cmd = item["command"] as? String
+                        publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .commandCompleted, title: "Comando concluído", detail: cmd, commandLine: cmd, exitCode: exitCode, succeeded: ok)
+                        if let cmd, Self.commandLooksLikeTestRun(cmd) {
+                            publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .testCompleted, title: "Testes concluídos", detail: cmd, commandLine: cmd, exitCode: exitCode, succeeded: ok)
+                        }
+                    case "fileChange":
+                        let changes = item["changes"] as? [JSON] ?? []
+                        for ch in changes {
+                            if let p = ch["path"] as? String {
+                                publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .fileModified, title: "Arquivo modificado: \(URL(fileURLWithPath: p).lastPathComponent)", filePath: p, succeeded: ok)
+                            }
+                        }
+                    case "mcpToolCall":
+                        let tool = item["tool"] as? String ?? "ferramenta"
+                        publishExecutionEvent(threadId: busThreadId, turnId: turnID ?? "", kind: .toolCompleted, title: "Ferramenta concluída: \(tool)", succeeded: ok)
+                    default:
+                        break
+                    }
+                }
             }
         case "item/agentMessage/delta":
             guard let item = parameters["itemId"] as? String, let delta = parameters["delta"] as? String else { return }
@@ -4568,13 +5339,27 @@ final class Workspace: ObservableObject {
                 sentAttachments.forEach(removeRecording)
                 sentAttachments = []
                 busy = false
+                let completedTurnID = turnID
                 turnID = nil
                 if let failureMessage {
                     error = failureMessage
                 }
+                if !busThreadId.isEmpty {
+                    let finalReply = messages.last(where: {
+                        ($0.turnId == completedTurnID || completedTurnID == nil) && ($0.author == "WisdAI" || $0.author == "WisdCode") && $0.kind == .text
+                    })?.text
+                    if let fail = failureMessage ?? error, !fail.isEmpty {
+                        publishExecutionEvent(threadId: busThreadId, turnId: completedTurnID ?? "", kind: .taskFailed, title: "Falha na execução", detail: fail, succeeded: false)
+                    } else {
+                        publishExecutionEvent(threadId: busThreadId, turnId: completedTurnID ?? "", kind: .taskCompleted, title: "Execução concluída", detail: finalReply, succeeded: true)
+                    }
+                }
                 deliverCompletedChatVoiceReply(failureText: failureMessage ?? error)
                 if ready { refreshQuota() }
                 refresh()
+                if !busThreadId.isEmpty {
+                    drainQueuedFollowUpIfAny(for: busThreadId)
+                }
             }
         default:
             break

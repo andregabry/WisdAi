@@ -17,6 +17,7 @@ public enum VoiceControlAction: Equatable, Sendable {
     case unmuteMicrophone
     case stopVoiceSession
     case interruptSpeech
+    case cancelActiveTask
     case switchLanguage(VoiceLanguageVariant)
 }
 
@@ -69,7 +70,12 @@ public enum LocalQueryComplexityAnalyzer {
     private static let statusPatterns = [
         "como está o desenvolvimento", "como estao as tarefas", "como estão as tarefas",
         "status do projeto", "status das tarefas", "o que está rodando", "o que esta rodando",
-        "o agente terminou", "alguma tarefa em andamento", "progress of", "running tasks"
+        "o agente terminou", "alguma tarefa em andamento", "progress of", "running tasks",
+        "o que está a acontecer", "o que esta a acontecer", "o que está acontecendo", "o que esta acontecendo",
+        "já encontrou o problema", "ja encontrou o problema", "encontrou algum problema", "encontrou o problema?",
+        "quanto falta", "quanto tempo falta", "que ficheiros está", "quais ficheiros está",
+        "que arquivos está", "quais arquivos está", "por que razão está a demorar", "por que está demorando",
+        "porque está demorando", "what is happening", "what files are you", "how much longer", "why is it taking"
     ]
 
     private static let directDelegatePhrases = [
@@ -81,21 +87,36 @@ public enum LocalQueryComplexityAnalyzer {
         "ask claude", "ask codex", "ask antigravity", "tell codex", "tell claude"
     ]
 
-    private static let workspaceActionPatterns = [
-        "edite ", "edita ", "editar ", "altere ", "altera ", "alterar ", "refatore ", "refatora ",
-        "corrija ", "corrige ", "corrigir ", "implemente ", "implementa ", "crie um arquivo",
-        "rode os testes", "execute o", "executa o", "rode o", "compile o", "build ",
-        "analise o código", "analise o repositório", "analisar o projeto", "analisar a autenticação",
-        "verifique o arquivo", "pesquise no código", "revise o código", "check the code",
-        "edit the file", "run tests", "fix the bug"
+    private static let workspaceActionVerbStems = [
+        "analis", "audit", "verifi", "inspec", "investig", "revis", "vasculh", "mape", "examin",
+        "execut", "rod", "compil", "build", "corrij", "corrig", "consert", "edit", "alter", "modif",
+        "refator", "implement", "crie ", "criar ", "leia ", "ler ", "checar", "cheque", "confira", "confer",
+        "continua", "continue", "retom", "pesquis", "check ", "inspect ", "review ", "investigate ", "fix ", "run tests"
+    ]
+
+    private static let workspaceTargetNouns = [
+        "projeto", "project", "codigo", "código", "repositorio", "repositório", "repo",
+        "arquivo", "arquivos", "ficheiro", "ficheiros", "pasta", "diretorio", "diretório",
+        "aplicacao", "aplicação", "aplicativo", "app", "branch", "git", "commit", "diff", "merge",
+        "teste", "testes", "erro", "erros", "bug", "bugs", "falha", "funcionalidade", "implementacao", "implementação",
+        "implementado", "arquitetura", "sistema", "classe", "funcao", "função", "metodo", "método", "modulo", "módulo",
+        "backend", "frontend", "endpoint", "rota", "autenticacao", "autenticação", "seguranca", "segurança",
+        "tarefa anterior", "esta tarefa", "esse problema", "este problema"
     ]
 
     private static let workspaceInspectionPhrases = [
-        "neste projeto", "nesse projeto", "neste repositório", "nesse repositório",
-        "no código do projeto", "no código deste", "no arquivo ", "na classe ",
-        "quais arquivos", "quantos arquivos", "o que tem no arquivo", "consulte o especialista",
-        "consulte um agente", "consulte o agente", "chame um especialista",
+        "neste projeto", "nesse projeto", "no projeto", "do projeto",
+        "neste repositório", "nesse repositório", "no repositório", "do repositório",
+        "no código", "do código", "neste app", "nesse app", "desse app", "deste app",
+        "no arquivo ", "na classe ", "quais arquivos", "quantos arquivos", "que arquivos",
+        "o que tem no", "o que existe no", "consulte o especialista", "consulte um agente",
+        "consulte o agente", "chame um especialista", "continue a tarefa", "retome a tarefa",
         "in this project", "in this repository", "which files are in", "check with a specialist"
+    ]
+
+    private static let followUpExpansionStems = [
+        "detalh", "aprofund", "mostre mais", "verifique melhor", "então verifica", "entao verifica",
+        "então analisa", "entao analisa", "pode verificar também", "verifique também", "olha também"
     ]
 
     private static let conceptualQuestionPrefixes = [
@@ -115,6 +136,11 @@ public enum LocalQueryComplexityAnalyzer {
     private static let destructivePatterns = [
         "apague tudo", "delete all", "rm -rf", "drop database", "reset --hard", "force push"
     ]
+
+    private static func normalizeFolded(_ text: String) -> String {
+        text.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     public static func detectLanguage(from utterance: String, fallback: VoiceLanguageVariant) -> VoiceLanguageVariant {
         let lower = " " + utterance.lowercased() + " "
@@ -152,12 +178,25 @@ public enum LocalQueryComplexityAnalyzer {
 
     public static func route(
         utterance: String,
-        currentLanguage: VoiceLanguageVariant
+        currentLanguage: VoiceLanguageVariant,
+        hasActiveProject: Bool = false,
+        activeProjectName: String? = nil,
+        isTaskRunning: Bool = false,
+        priorTurnWasWorkspaceOrAgentic: Bool = false
     ) -> VoiceIntentDecision {
         let trimmed = utterance.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
+        let folded = normalizeFolded(trimmed)
 
-        // 1. Voice self-controls
+        // 1. Task cancellation vs Voice self-controls
+        let cancelTaskPhrases = [
+            "pare esta tarefa", "pode parar esta tarefa", "para esta tarefa", "pare essa tarefa",
+            "cancele a tarefa", "cancelar tarefa", "pare a execucao", "interrompa a tarefa",
+            "stop this task", "cancel this task", "stop the task"
+        ]
+        if cancelTaskPhrases.contains(where: { folded.contains($0) }) || (isTaskRunning && (folded == "pode parar" || folded == "pare a tarefa")) {
+            return .voiceControl(.cancelActiveTask)
+        }
         if lower == "pare" || lower == "para" || lower == "stop" || lower.contains("silenciar microfone") || lower.contains("mutar microfone") {
             return .voiceControl(.muteMicrophone)
         }
@@ -180,27 +219,45 @@ public enum LocalQueryComplexityAnalyzer {
             return .voiceControl(.switchLanguage(.spanishES))
         }
 
-        // 2. Task / project status inspection (never invent states; reads live orchestrator snapshot!)
-        if statusPatterns.contains(where: { lower.contains($0) }) {
-            return .queryTaskStatus(projectHint: extractProjectMention(from: trimmed))
+        // 2. Task / project status inspection (reads live ExecutionEventBus snapshot; never invents progress!)
+        if statusPatterns.contains(where: { folded.contains(normalizeFolded($0)) }) {
+            return .queryTaskStatus(projectHint: extractProjectMention(from: trimmed) ?? activeProjectName)
         }
 
-        // 3. Explicit agent delegation or explicit actionable workspace request (never accidental on mere agent name mention or conceptual chat)
+        // 3. Agentic / Project / Code Execution Requests
         let agentHint = detectAgentHint(in: lower)
         let hasDirectDelegateVerb = directDelegatePhrases.contains(where: { lower.contains($0) })
-        let hasWorkspaceInspection = workspaceInspectionPhrases.contains(where: { lower.contains($0) })
-        let isPureConceptualQuestion = conceptualQuestionPrefixes.contains(where: { lower.hasPrefix($0) }) && !hasDirectDelegateVerb && !hasWorkspaceInspection
-        let hasWorkspaceAction = !isPureConceptualQuestion && (workspaceActionPatterns.contains(where: { lower.contains($0) }) || hasWorkspaceInspection)
+        let hasWorkspaceInspection = workspaceInspectionPhrases.contains(where: { folded.contains(normalizeFolded($0)) })
+        let mentionsActiveProj = activeProjectName.map { !$0.isEmpty && folded.contains(normalizeFolded($0)) } ?? false
+        let mentionsProduct = ["wisdmeet", "wisdai", "wisdfin", "wisdkids", "wisdplay"].contains(where: { folded.contains($0) })
+        let hasActionVerb = workspaceActionVerbStems.contains(where: { folded.contains($0) })
+        let hasTargetNoun = workspaceTargetNouns.contains(where: { folded.contains(normalizeFolded($0)) }) || mentionsActiveProj || mentionsProduct
+        let isFollowUpExpansion = (priorTurnWasWorkspaceOrAgentic || hasActiveProject) && followUpExpansionStems.contains(where: { folded.contains(normalizeFolded($0)) })
+        let isCasualOpinionAboutTool = folded.contains("e bom para") || folded.contains("voce acha") || folded.contains("vale a pena")
+
+        let isPureConceptualQuestion = conceptualQuestionPrefixes.contains(where: { folded.hasPrefix(normalizeFolded($0)) })
+            && !hasDirectDelegateVerb
+            && !hasWorkspaceInspection
+            && !mentionsActiveProj
+            && !(hasActionVerb && hasTargetNoun)
+
+        let hasAgenticActionIntent = !isPureConceptualQuestion
+            && !isCasualOpinionAboutTool
+            && (hasDirectDelegateVerb || hasWorkspaceInspection || isFollowUpExpansion || (hasActionVerb && hasTargetNoun))
         let isHighRisk = destructivePatterns.contains(where: { lower.contains($0) })
 
-        if hasDirectDelegateVerb || hasWorkspaceAction || isHighRisk {
-            let isWriteVerb = lower.contains("edite") || lower.contains("edita") || lower.contains("altere")
-                || lower.contains("corrija") || lower.contains("corrige") || lower.contains("implemente")
-                || lower.contains("crie um arquivo") || lower.contains("rode os testes")
+        if hasAgenticActionIntent || isHighRisk {
+            let isWriteVerb = folded.contains("edite") || folded.contains("edita") || folded.contains("editar")
+                || folded.contains("altere") || folded.contains("altera") || folded.contains("alterar")
+                || folded.contains("corrija") || folded.contains("corrige") || folded.contains("corrigir")
+                || folded.contains("implemente") || folded.contains("implementa") || folded.contains("refatore")
+                || folded.contains("crie um arquivo") || folded.contains("rode os testes") || folded.contains("execute os testes")
+                || folded.contains("compile")
             let risk: VoiceActionRiskTier = isHighRisk ? .high : (isWriteVerb ? .medium : .low)
             let parallel = lower.contains("continua conversando") || lower.contains("continue conversando")
                 || lower.contains("enquanto") || lower.contains("em paralelo") || lower.contains("em segundo plano")
-                || lower.contains("continue talking") || agentHint != nil
+                || lower.contains("também") || lower.contains("tambem") || lower.contains("outra coisa")
+                || lower.contains("continue talking") || agentHint != nil || isTaskRunning
             return .delegateToSpecialist(
                 agentHint: agentHint ?? .autoActive,
                 prompt: trimmed,
@@ -209,7 +266,7 @@ public enum LocalQueryComplexityAnalyzer {
             )
         }
 
-        // 4. Local conversational brain handles greetings, reasoning, memory questions, conceptual questions & brainstorming
+        // 4. Local conversational brain handles ONLY genuine casual greetings, social conversation & pure conceptual questions
         let detected = detectLanguage(from: trimmed, fallback: currentLanguage)
         let score = computeSemanticComplexityScore(utterance: trimmed)
         return .handleLocally(complexityScore: score, languageDetected: detected)
@@ -377,7 +434,7 @@ public final class LocalConversationalBrain: ObservableObject {
         }
         if !recentAssistantOpenings.isEmpty {
             let openingsHint = recentAssistantOpenings.suffix(3).joined(separator: " | ")
-            enrichedInstructions += "\nEvite repetir as mesmas aberturas usadas recentemente (\(openingsHint)); varie naturalmente como em diálogo humano."
+            enrichedInstructions += "\nVarie a abertura da resposta e nunca comece repetidamente com 'Hmm', 'Ah', 'Entendi' ou fórmulas usadas recentemente (\(openingsHint))."
         }
 
         // Route to external local runtime (llama.cpp Metal / MLX Server) if explicitly selected or when Apple FM unavailable

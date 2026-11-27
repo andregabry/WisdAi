@@ -288,6 +288,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     private var clauseEnqueueCounter: Int = 0
     private var preTurnAuxVocalizationEmitted: Bool = false
     private var activeTTSProsodyCapabilities = EngineProsodyCapabilities.forEngine(.kokoro82M, isKokoroActive: true)
+    // Execution & Unified Agentic Pipeline Bridges (P0 Fix)
+    @Published public var executionEventBus = ExecutionEventBus()
+    @Published public private(set) var lastPresentedSpokenTextForTelemetry: String = ""
+    private var priorTurnWasProjectOrAgentic: Bool = false
+    private var recentSpokenAssistantOpenings: [String] = []
+    private var activeConversationIDProvider: (() -> String?)?
+    private var onSubmitUnifiedMessage: ((String, MessageInputSource, VoiceSpecialistAgentHint, VoiceActionRiskTier, Bool) -> UnifiedSubmissionOutcome)?
+    private var onCancelActiveTask: (() -> Bool)?
+
     private var onCommitUserUtterance: ((String) -> Void)?
     private var onTranscriptDeltaUI: ((String, String) -> Void)?
     private var activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])?
@@ -715,11 +724,22 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
 
     public func notifySpecialistTaskFinished(agentName: String, title: String, succeeded: Bool, summary: String) {
-        let prefix = succeeded ? "Pronto, o agente \(agentName) concluiu \(title)." : "O agente \(agentName) encontrou um erro ao executar \(title)."
+        let isEn = behavior.languageVariant.bcp47LanguagePrefix == "en"
         let body = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fullNotice = body.isEmpty ? prefix : "\(prefix) \(body)"
+        let fullNotice: String = {
+            if body.isEmpty {
+                return succeeded
+                    ? (isEn ? "\(agentName) finished \(title)." : "Pronto, o agente \(agentName) concluiu \(title).")
+                    : (isEn ? "\(agentName) encountered an error while running \(title)." : "O agente \(agentName) encontrou um erro ao executar \(title).")
+            }
+            let lead = succeeded
+                ? (isEn ? "\(agentName) finished:" : "Concluí com \(agentName).")
+                : (isEn ? "\(agentName) reported a problem:" : "O agente \(agentName) encontrou um problema:")
+            return "\(lead) \(body)"
+        }()
 
         memoryStore.appendAssistantTurn(fullNotice, providerID: "wisdai_agent_observer", wasInterruptedByBargeIn: false)
+        recordPresentedSpokenTextForTelemetry(fullNotice)
         if policy.allowPersistentVoiceMemory {
             knowledgeStore.storeFact(
                 fullNotice,
@@ -750,6 +770,56 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         speakSystemNoticeNaturally(fullNotice, priorityInterrupt: false)
     }
 
+    public func updateContextualVocabulary(_ terms: [String]) {
+        localSTT.setContextualVocabulary(terms)
+        appleSTT.setContextualVocabulary(terms)
+    }
+
+    public func updateWorkspaceContext(_ context: VoiceWorkspaceContextSnapshot) {
+        memoryStore.updateWorkspaceContext(context)
+        if let vocab = context.resolvedProject?.contextualVocabulary, !vocab.isEmpty {
+            updateContextualVocabulary(vocab)
+        }
+    }
+
+    public func configureAgenticBridgeForSession(
+        workspaceContext: VoiceWorkspaceContextSnapshot,
+        executionEventBus: ExecutionEventBus?,
+        conversationIDProvider: (() -> String?)?,
+        activeTasksProvider: (() -> [VoiceTaskSummarySnapshot])?,
+        onSubmitUnifiedMessage: ((String, MessageInputSource, VoiceSpecialistAgentHint, VoiceActionRiskTier, Bool) -> UnifiedSubmissionOutcome)?,
+        onCancelActiveTask: (() -> Bool)?,
+        onCommitUserUtterance: ((String) -> Void)? = nil,
+        onRecordLocalExchangeToChat: ((String, String) -> Void)? = nil
+    ) {
+        updateWorkspaceContext(workspaceContext)
+        if let executionEventBus {
+            self.executionEventBus = executionEventBus
+        }
+        self.activeConversationIDProvider = conversationIDProvider
+        self.activeTasksProvider = activeTasksProvider
+        self.onSubmitUnifiedMessage = onSubmitUnifiedMessage
+        self.onCancelActiveTask = onCancelActiveTask
+        self.onCommitUserUtterance = onCommitUserUtterance
+        self.onRecordLocalExchangeToChat = onRecordLocalExchangeToChat
+        if let tasks = activeTasksProvider?() {
+            self.activeTasksSnapshot = tasks
+        }
+    }
+
+    /// Normalizes a raw transcript with project/ecosystem context and routes it through the full autonomous voice pipeline.
+    @discardableResult
+    public func submitNormalizedVoiceTranscript(_ rawTranscript: String) -> NormalizedTranscriptResult {
+        let normalized = ContextualTranscriptNormalizer.normalize(
+            rawTranscript,
+            activeProjectName: memoryStore.workspaceContext.projectName
+        )
+        let finalUtterance = normalized.normalizedTranscript
+        guard !finalUtterance.isEmpty else { return normalized }
+        handleFinalizedAutonomousTurn(finalUtterance)
+        return normalized
+    }
+
     public func startSessionWithContinuity(
         workspaceContext: VoiceWorkspaceContextSnapshot,
         continuityItems: [CodexContinuityItem],
@@ -759,7 +829,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         onDelegateTaskToAgent: ((VoiceSpecialistAgentHint, String, VoiceActionRiskTier) -> VoiceDelegationDispatchResult)? = nil,
         onRecordLocalExchangeToChat: ((String, String) -> Void)? = nil,
         onCommitUserUtterance: @escaping (String) -> Void,
-        onTranscriptDeltaUI: ((String, String) -> Void)? = nil
+        onTranscriptDeltaUI: ((String, String) -> Void)? = nil,
+        executionEventBus: ExecutionEventBus? = nil,
+        conversationIDProvider: (() -> String?)? = nil,
+        onSubmitUnifiedMessage: ((String, MessageInputSource, VoiceSpecialistAgentHint, VoiceActionRiskTier, Bool) -> UnifiedSubmissionOutcome)? = nil,
+        onCancelActiveTask: (() -> Bool)? = nil
     ) async {
         stopSession(clearUI: false)
         sessionGenerationID &+= 1
@@ -773,7 +847,15 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         userSpeechStartedAtNs = 0
         lastCommittedNormalizedUtterance = ""
         lastCommittedUtteranceAtNs = 0
+        priorTurnWasProjectOrAgentic = false
+        recentSpokenAssistantOpenings.removeAll()
 
+        if let executionEventBus {
+            self.executionEventBus = executionEventBus
+        }
+        self.activeConversationIDProvider = conversationIDProvider
+        self.onSubmitUnifiedMessage = onSubmitUnifiedMessage
+        self.onCancelActiveTask = onCancelActiveTask
         self.onCommitUserUtterance = onCommitUserUtterance
         self.onTranscriptDeltaUI = onTranscriptDeltaUI
         self.activeTasksProvider = activeTasksProvider
@@ -794,7 +876,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         self.activeListeningEngine.resetSession()
         self.acousticExtractor.resetTurn()
         self.userStyleAdapter.reset()
-        self.memoryStore.updateWorkspaceContext(workspaceContext)
+        self.updateWorkspaceContext(workspaceContext)
         self.memoryStore.seedFromHistoryItems(continuityItems, providerID: routing.requestedTransportProvider.rawValue)
         refreshResolvedPipeline(hasCodexAppServer: hasCodexAppServer)
 
@@ -1223,14 +1305,34 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
+    public func recordPresentedSpokenTextForTelemetry(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            lastPresentedSpokenTextForTelemetry = trimmed
+        }
+    }
+
     public func speakSystemNoticeNaturally(_ notice: String, priorityInterrupt: Bool = false) {
+        let trimmed = notice.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        recordPresentedSpokenTextForTelemetry(trimmed)
         guard isVoiceSessionActive, !isOutputMuted else { return }
         if priorityInterrupt {
             _ = audioEngine.bargeInFlushPlayback()
             queuedSpeechChunks.removeAll()
         }
         guard state != .userSpeaking else { return }
-        enqueueAdaptedSpeechClause(notice)
+        if trimmed.count > 140 {
+            speechSegmenter.reset()
+            let segments = speechSegmenter.appendDelta(trimmed) + speechSegmenter.flushFinal()
+            if !segments.isEmpty {
+                for seg in segments {
+                    enqueueAdaptedSpeechClause(seg)
+                }
+                return
+            }
+        }
+        enqueueAdaptedSpeechClause(trimmed)
     }
 
     // MARK: - Barge-In Trigger
@@ -1616,7 +1718,7 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 committed = transcript
             }
             let rawFinal = committed.isEmpty ? transcript : committed
-            let finalUtterance = rawFinal.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedFinal = rawFinal.trimmingCharacters(in: .whitespacesAndNewlines)
             let speechEndNs = lastAcousticSpeechTimestampNs > 0
                 ? lastAcousticSpeechTimestampNs
                 : (lastSTTResultTimestampNs > 0 ? lastSTTResultTimestampNs : nowNs)
@@ -1629,10 +1731,16 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             userSpeechStartedAtNs = 0
             lastSTTResultTimestampNs = 0
 
-            guard !finalUtterance.isEmpty, !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(finalUtterance) else {
+            guard !trimmedFinal.isEmpty, !VoiceMemoryHygieneAnalyzer.isZeroSemanticFragment(trimmedFinal) else {
                 transitionState(.listening, reason: "Enunciado vazio após filtragem")
                 return
             }
+
+            let normalizedSTT = ContextualTranscriptNormalizer.normalize(
+                trimmedFinal,
+                activeProjectName: memoryStore.workspaceContext.projectName
+            )
+            let finalUtterance = normalizedSTT.normalizedTranscript
 
             let normFinal = VoiceMemoryHygieneAnalyzer.normalizeForComparison(finalUtterance)
             if !normFinal.isEmpty,
@@ -1647,11 +1755,14 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             lastCommittedUtteranceAtNs = nowNs
             activeTurnGenerationID &+= 1
 
+            let sttTraceDetail = normalizedSTT.wasModified
+                ? "raw='\(normalizedSTT.originalTranscript)' -> norm='\(finalUtterance)'"
+                : finalUtterance
             telemetry.recordPipelineTrace(
                 stage: .finalSTT,
                 sessionToken: "\(sessionGenerationID)",
                 turnEpoch: activeTurnGenerationID,
-                detail: finalUtterance
+                detail: sttTraceDetail
             )
 
             turnUserSpeechEndNs = speechEndNs
@@ -1700,9 +1811,18 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         memoryStore.appendUserTurn(utterance, providerID: resolvedPipeline.effectiveProvider.rawValue)
         // Raw ASR output is not a verified fact. Keep it in session history only.
 
+        let liveTasks = activeTasksProvider?() ?? activeTasksSnapshot
+        activeTasksSnapshot = liveTasks
+        let hasActiveProject = !(memoryStore.workspaceContext.projectName ?? "").isEmpty
+            || !(memoryStore.workspaceContext.absoluteDirectoryPath ?? "").isEmpty
+
         let decision = LocalQueryComplexityAnalyzer.route(
             utterance: utterance,
-            currentLanguage: behavior.languageVariant
+            currentLanguage: behavior.languageVariant,
+            hasActiveProject: hasActiveProject,
+            activeProjectName: memoryStore.workspaceContext.projectName,
+            isTaskRunning: !liveTasks.isEmpty,
+            priorTurnWasWorkspaceOrAgentic: priorTurnWasProjectOrAgentic
         )
 
         switch decision {
@@ -1710,41 +1830,40 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             handleVoiceControlAction(action, rawUtterance: utterance)
 
         case .queryTaskStatus(_):
-            let liveTasks = activeTasksProvider?() ?? activeTasksSnapshot
-            activeTasksSnapshot = liveTasks
-            let reply = LocalConversationalBrain.formatTaskStatusReply(
-                tasks: liveTasks,
-                projectName: memoryStore.workspaceContext.projectName,
-                language: behavior.languageVariant
-            )
+            let activeCID = activeConversationIDProvider?()
+            let reply: String = {
+                if executionEventBus.snapshot(for: activeCID) != nil {
+                    return executionEventBus.formatGroundedProgressAnswer(
+                        for: utterance,
+                        conversationID: activeCID,
+                        projectName: memoryStore.workspaceContext.projectName,
+                        language: behavior.languageVariant
+                    )
+                }
+                return LocalConversationalBrain.formatTaskStatusReply(
+                    tasks: liveTasks,
+                    projectName: memoryStore.workspaceContext.projectName,
+                    language: behavior.languageVariant
+                )
+            }()
             emitImmediateLocalSpeechReply(reply, userUtterance: utterance)
 
-        case .delegateToSpecialist(let hint, let prompt, let riskTier, _):
-            if let delegate = onDelegateTaskToAgent {
-                let outcome = delegate(hint, prompt, riskTier)
-                switch outcome {
-                case .awaitingUserApproval(let reason):
-                    let safetyReply = behavior.languageVariant.bcp47LanguagePrefix == "en"
-                        ? "This action requires manual approval on your screen before executing. \(reason)"
-                        : "Essa operação exige sua aprovação manual na tela antes de executar. \(reason)"
-                    emitImmediateLocalSpeechReply(safetyReply, userUtterance: utterance)
-
-                case .dispatched(let confirmedAgentName):
-                    let ackReply = behavior.languageVariant.bcp47LanguagePrefix == "en"
-                        ? "Got it. \(confirmedAgentName) started working on that in the background, and we can keep talking while it runs."
-                        : "Certo, já acionei \(confirmedAgentName) em segundo plano com confirmação real da tarefa. Pode continuar conversando comigo normalmente enquanto ele executa."
-                    emitImmediateLocalSpeechReply(ackReply, userUtterance: utterance)
-
-                case .unavailable(let reason):
-                    let failReply = behavior.languageVariant.bcp47LanguagePrefix == "en"
-                        ? "I could not dispatch the task to an agent: \(reason)"
-                        : "Não foi possível encaminhar a tarefa ao agente agora: \(reason)"
-                    emitImmediateLocalSpeechReply(failReply, userUtterance: utterance)
-                }
-            } else {
-                // Standalone / unit-test caller with single callback
-                onCommitUserUtterance?(utterance)
-            }
+        case .delegateToSpecialist(let hint, let prompt, let riskTier, let parallelFriendly):
+            priorTurnWasProjectOrAgentic = true
+            let shouldQueueIfBusy = !liveTasks.isEmpty && (
+                parallelFriendly
+                || utterance.lowercased().contains("também")
+                || utterance.lowercased().contains("tambem")
+                || utterance.lowercased().contains("outra coisa")
+                || utterance.lowercased().contains("depois")
+            )
+            dispatchVoiceRequestToExecutionPipeline(
+                hint: hint,
+                prompt: prompt,
+                riskTier: riskTier,
+                enqueueIfBusy: shouldQueueIfBusy,
+                originalUtterance: utterance
+            )
 
         case .handleLocally(_, let detectedLang):
             if let detectedLang, detectedLang != behavior.languageVariant {
@@ -1758,6 +1877,79 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
+    private func dispatchVoiceRequestToExecutionPipeline(
+        hint: VoiceSpecialistAgentHint,
+        prompt: String,
+        riskTier: VoiceActionRiskTier,
+        enqueueIfBusy: Bool,
+        originalUtterance: String
+    ) {
+        let liveTasks = activeTasksProvider?() ?? activeTasksSnapshot
+        let inputSource: MessageInputSource = liveTasks.isEmpty ? .voice : .voiceIntervention
+        let isEn = behavior.languageVariant.bcp47LanguagePrefix == "en"
+
+        if let submitUnified = onSubmitUnifiedMessage {
+            let outcome = submitUnified(prompt, inputSource, hint, riskTier, enqueueIfBusy)
+            switch outcome {
+            case .started(let meta):
+                let projNote = meta.projectName.map { isEn ? " in \($0)" : " no projeto \($0)" } ?? ""
+                let ack = isEn
+                    ? "Running that\(projNote) with \(meta.agentDisplayName) on \(meta.modelID). We can keep talking while it works."
+                    : "Iniciei agora\(projNote) com \(meta.agentDisplayName) no modelo \(meta.modelID). Podemos continuar conversando enquanto ele executa."
+                emitImmediateLocalSpeechReply(ack, userUtterance: originalUtterance, persistToChat: false)
+
+            case .queued(let meta, let position):
+                let queuedAck = isEn
+                    ? "I queued that as step \(position) for \(meta.agentDisplayName) right after the current task finishes."
+                    : "Coloquei essa nova solicitação na fila (#\(position)) para \(meta.agentDisplayName) executar logo em seguida, sem interromper a tarefa atual."
+                emitImmediateLocalSpeechReply(queuedAck, userUtterance: originalUtterance, persistToChat: false)
+
+            case .blockedDirectory(let dirError, _):
+                let blockReply = isEn
+                    ? "I cannot run this because the project directory is unavailable: \(dirError)"
+                    : "Não consigo executar esta análise porque há um problema no diretório do projeto: \(dirError)"
+                emitImmediateLocalSpeechReply(blockReply, userUtterance: originalUtterance)
+
+            case .awaitingUserApproval(let reason, _):
+                let safetyReply = isEn
+                    ? "This operation requires your manual approval on screen before executing. \(reason)"
+                    : "Essa operação exige sua confirmação manual na tela antes de executar. \(reason)"
+                emitImmediateLocalSpeechReply(safetyReply, userUtterance: originalUtterance)
+
+            case .unavailable(let reason):
+                let failReply = isEn
+                    ? "I could not start the agent right now: \(reason)"
+                    : "Não foi possível iniciar o agente agora: \(reason)"
+                emitImmediateLocalSpeechReply(failReply, userUtterance: originalUtterance)
+            }
+            return
+        }
+
+        if let delegate = onDelegateTaskToAgent {
+            let outcome = delegate(hint, prompt, riskTier)
+            switch outcome {
+            case .awaitingUserApproval(let reason):
+                let safetyReply = isEn
+                    ? "This action requires manual approval on your screen before executing. \(reason)"
+                    : "Essa operação exige sua aprovação manual na tela antes de executar. \(reason)"
+                emitImmediateLocalSpeechReply(safetyReply, userUtterance: originalUtterance)
+            case .dispatched(let confirmedAgentName):
+                let ackReply = isEn
+                    ? "Started working on that with \(confirmedAgentName) in the background."
+                    : "Certo, já acionei \(confirmedAgentName) em segundo plano. Pode acompanhar ou falar comigo enquanto ele executa."
+                emitImmediateLocalSpeechReply(ackReply, userUtterance: originalUtterance, persistToChat: false)
+            case .unavailable(let reason):
+                let failReply = isEn
+                    ? "I could not dispatch the task to an agent: \(reason)"
+                    : "Não foi possível encaminhar a tarefa ao agente agora: \(reason)"
+                emitImmediateLocalSpeechReply(failReply, userUtterance: originalUtterance)
+            }
+            return
+        }
+
+        onCommitUserUtterance?(prompt)
+    }
+
     private func handleVoiceControlAction(_ action: VoiceControlAction, rawUtterance: String) {
         switch action {
         case .muteMicrophone:
@@ -1766,6 +1958,13 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             if isMuted { toggleMute() }
         case .interruptSpeech:
             performManualOrVADBarageIn(reason: "Interrupção solicitada por voz")
+        case .cancelActiveTask:
+            let stopped = onCancelActiveTask?() ?? false
+            let isEn = behavior.languageVariant.bcp47LanguagePrefix == "en"
+            let msg = stopped
+                ? (isEn ? "I stopped the running task." : "Encerrei a tarefa que estava em execução.")
+                : (isEn ? "There is no active task running to cancel." : "Não há nenhuma tarefa ativa em andamento para cancelar agora.")
+            emitImmediateLocalSpeechReply(msg, userUtterance: rawUtterance)
         case .stopVoiceSession:
             let bye = behavior.languageVariant.bcp47LanguagePrefix == "en" ? "Closing voice mode. Talk soon!" : "Encerrando a conversa por voz. Até já!"
             emitImmediateLocalSpeechReply(bye, userUtterance: rawUtterance)
@@ -1792,13 +1991,30 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         }
     }
 
-    private func emitImmediateLocalSpeechReply(_ reply: String, userUtterance: String) {
+    private func emitImmediateLocalSpeechReply(_ reply: String, userUtterance: String, persistToChat: Bool = true) {
+        let clean = VoicePresentationEngine.stripRepetitiveOpeners(reply)
+        recordPresentedSpokenTextForTelemetry(clean)
         beginAssistantTurnResponseTracking(userSpeechEndNs: turnUserSpeechEndNs)
-        handleStreamingAssistantDelta(reply)
-        finishAssistantResponse(fullMarkdownText: reply)
-        memoryStore.appendAssistantTurn(reply, providerID: "wisdai_local_autonomous", wasInterruptedByBargeIn: false)
-        onTranscriptDeltaUI?("assistant", reply)
-        onRecordLocalExchangeToChat?(userUtterance, reply)
+        handleStreamingAssistantDelta(clean)
+        finishAssistantResponse(fullMarkdownText: clean)
+        memoryStore.appendAssistantTurn(clean, providerID: "wisdai_local_autonomous", wasInterruptedByBargeIn: false)
+        onTranscriptDeltaUI?("assistant", clean)
+        if persistToChat {
+            onRecordLocalExchangeToChat?(userUtterance, clean)
+        }
+    }
+
+    private static func looksLikeUngroundedRepoClaimOrAsk(_ text: String) -> Bool {
+        let lower = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        let markers = [
+            "compartilhar o codigo", "compartilhe o codigo", "compartilhar o repositorio",
+            "compartilhe o repositorio", "forneca o codigo", "envie o codigo",
+            "cole o codigo", "share the code", "share the repository", "paste the code",
+            "o projeto contem codigo", "o projeto inclui codigo", "redes neurais convolucionais",
+            "redes convolucionais", "camada unica", "implementa sistemas de rede neural"
+        ]
+        return markers.contains(where: { lower.contains($0) })
     }
 
     private func runLocalBrainConversationalTurn(utterance: String) {
@@ -1857,8 +2073,9 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let systemPrompt = buildLocalBrainInstructions(for: activeLang)
         let portable = memoryStore.exportPortableSnapshot(targetProviderID: "wisdai_local_brain")
         var contextParts: [String] = []
-        if let project = portable.workspaceContext.projectName, !project.isEmpty {
-            contextParts.append("Workspace project: \(project) (mode: \(portable.workspaceContext.securityModeName), agent: \(portable.workspaceContext.activeExecutionAgent)).")
+        let detailedWorkspace = portable.workspaceContext.renderDetailedContextBlock()
+        if !detailedWorkspace.isEmpty {
+            contextParts.append(detailedWorkspace)
         }
         if !portable.compactedSummary.isEmpty {
             contextParts.append("Compacted prior conversation summary:\n\(portable.compactedSummary)")
@@ -1939,23 +2156,35 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                   self.activeTurnGenerationID == expectedTurn else { return }
 
             let parsed = LocalConversationalBrain.extractSpecialistEscalation(from: rawReply)
-            var finalVisibleReply = parsed.spokenText
+            let finalVisibleReply = VoicePresentationEngine.stripRepetitiveOpeners(parsed.spokenText)
+            let hasWorkspaceScope = !(self.memoryStore.workspaceContext.projectName ?? "").isEmpty
+                || !(self.memoryStore.workspaceContext.absoluteDirectoryPath ?? "").isEmpty
+            let blockedHallucinationOrRepoAsk = hasWorkspaceScope && Self.looksLikeUngroundedRepoClaimOrAsk(finalVisibleReply)
+
+            if blockedHallucinationOrRepoAsk && parsed.specialistQuery == nil {
+                self.cancelPendingSpeechForLiveVoiceSwitch()
+                self.priorTurnWasProjectOrAgentic = true
+                self.dispatchVoiceRequestToExecutionPipeline(
+                    hint: .autoActive,
+                    prompt: utterance,
+                    riskTier: .low,
+                    enqueueIfBusy: activeAgentsRunning,
+                    originalUtterance: utterance
+                )
+                return
+            }
+
             if let specialistQuery = parsed.specialistQuery {
-                if let delegate = self.onDelegateTaskToAgent {
-                    let outcome = delegate(.autoActive, specialistQuery, .low)
-                    switch outcome {
-                    case .dispatched(let agentLabel):
-                        if finalVisibleReply.isEmpty {
-                            finalVisibleReply = "Não tenho acesso direto aos arquivos locais neste modelo, então já consultei \(agentLabel) em modo somente leitura. Pode continuar conversando comigo enquanto ele analisa."
-                        }
-                    case .awaitingUserApproval(let reason):
-                        finalVisibleReply += (finalVisibleReply.isEmpty ? "" : " ") + "Para consultar o especialista, é preciso confirmar na tela: \(reason)"
-                    case .unavailable(let reason):
-                        finalVisibleReply += (finalVisibleReply.isEmpty ? "" : " ") + "Não foi possível consultar o agente especialista agora: \(reason)"
-                    }
-                } else if finalVisibleReply.isEmpty {
-                    finalVisibleReply = "Este modelo local não possui acesso direto aos arquivos do repositório e nenhum agente especialista externo está conectado nesta sessão."
-                }
+                self.cancelPendingSpeechForLiveVoiceSwitch()
+                self.priorTurnWasProjectOrAgentic = true
+                self.dispatchVoiceRequestToExecutionPipeline(
+                    hint: .autoActive,
+                    prompt: specialistQuery,
+                    riskTier: .low,
+                    enqueueIfBusy: activeAgentsRunning,
+                    originalUtterance: utterance
+                )
+                return
             }
 
             if finalVisibleReply.count > sanitizer.emittedCount {
@@ -1990,8 +2219,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
 
     private func buildLocalBrainInstructions(for language: VoiceLanguageVariant) -> String {
         var instructions = behavior.systemPromptInstructions(projectName: memoryStore.workspaceContext.projectName)
-        instructions += "\nResponda à pergunta atual sem inventar fatos, nomes de arquivos ou tarefas. O histórico anterior serve apenas como contexto."
-        instructions += "\nVocê é o cérebro conversacional local (sem ferramentas diretas no disco). Se o usuário pedir análise real de arquivos do repositório ou informação técnica que ultrapasse seu contexto local e você precisar consultar um agente especialista em somente leitura, explique honestamente sua limitação em 1 frase curta e encerre com a tag oculta `[CONSULTAR_ESPECIALISTA: <pergunta objetiva em modo somente leitura>]`. Nunca finja ter lido arquivos nem executado comandos."
+        let workspaceBlock = memoryStore.workspaceContext.renderDetailedContextBlock()
+        if !workspaceBlock.isEmpty {
+            instructions += "\n[Contexto Real do Workspace Ativo]\n\(workspaceBlock)"
+        }
+        instructions += "\nRegras estritas de veracidade: nunca peça ao utilizador para enviar, colar ou compartilhar código/repositório quando existe um projeto ou diretório ativo, pois o WisdAI já tem acesso através do agente selecionado. Se a pergunta exigir ler, auditar ou verificar arquivos/testes/código, responda EXCLUSIVAMENTE com `[CONSULTAR_ESPECIALISTA: <solicitação objetiva>]` sem texto antes. Nunca invente ficheiros, classes, arquiteturas (como redes neurais) ou resultados de testes."
         instructions += "\nIdentidade vocal ativa: \(voiceIdentity.persona.displayName) (\(voiceIdentity.persona.subtitle))."
         if voiceIdentity.persona == .jarvis {
             instructions += " Adote a postura executiva do JARVIS: sereno, lúcido, articulado, estratégico e objetivo, com discrição refinada e zero clichês de chatbot."
@@ -2159,9 +2391,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
     }
 
     private func enqueueAdaptedSpeechClause(_ rawClause: String) {
+        let activeProviderID = selectActiveTTSProvider().providerID
         let caps = EngineProsodyCapabilities.forEngine(
             selectedTTSEngine,
-            isKokoroActive: selectActiveTTSProvider().providerID == kokoroTTS.providerID
+            isKokoroActive: activeProviderID == kokoroTTS.providerID,
+            isSupertonicActive: activeProviderID == supertonicTTS.providerID
         )
         let adapted = NaturalSpeechComposer.compose(
             rawClause,
@@ -2246,6 +2480,8 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 }
             }
 
+            let turnDSP = VoiceStudioDSPProcessor(sampleRate: 24_000)
+
             while !Task.isCancelled,
                   self.sessionGenerationID == expectedSession,
                   gateRef.isCurrent(expectedPlayback),
@@ -2304,7 +2540,6 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                 }
                 let probeBox = TurnAudioProbeBox()
                 let dspParams = self.identityManager.activeDSPParameters
-                let turnDSP = VoiceStudioDSPProcessor(sampleRate: 24_000)
                 let deliverAudioChunk: @Sendable ([Float], String) -> Void = { [weak self] floats24k, spanLabel in
                     guard let self,
                           !Task.isCancelled,
@@ -2428,7 +2663,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
                             rate: self.effectiveSpeechRate()
                         ) { [weak self] floats24k, spanLabel in
                             guard let self, !Task.isCancelled, gateRef.isCurrent(expectedPlayback) else { return }
-                            _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(floats24k, transcriptText: spanLabel)
+                            let shaped = turnDSP.process(floats24k, parameters: dspParams, isFinalChunk: false)
+                            if !shaped.isEmpty {
+                                _ = self.audioEngine.outputJitterBuffer.pushFloatSamples(shaped, transcriptText: spanLabel)
+                            }
                         }
                         let fbSynthMs = Double(DispatchTime.now().uptimeNanoseconds &- ttsStartNs) / 1_000_000.0
                         await MainActor.run {
@@ -3278,6 +3516,10 @@ public final class WisdVoiceOrchestrator: ObservableObject {
         let prevTasks = activeTasksProvider
         let prevDelegate = onDelegateTaskToAgent
         let prevRecord = onRecordLocalExchangeToChat
+        let prevBus = executionEventBus
+        let prevConvProvider = activeConversationIDProvider
+        let prevSubmit = onSubmitUnifiedMessage
+        let prevCancel = onCancelActiveTask
 
         stopSession(clearUI: false)
         try? await Task.sleep(nanoseconds: 120_000_000)
@@ -3290,7 +3532,11 @@ public final class WisdVoiceOrchestrator: ObservableObject {
             onDelegateTaskToAgent: prevDelegate,
             onRecordLocalExchangeToChat: prevRecord,
             onCommitUserUtterance: prevCommit,
-            onTranscriptDeltaUI: prevDelta
+            onTranscriptDeltaUI: prevDelta,
+            executionEventBus: prevBus,
+            conversationIDProvider: prevConvProvider,
+            onSubmitUnifiedMessage: prevSubmit,
+            onCancelActiveTask: prevCancel
         )
     }
 
