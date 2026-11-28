@@ -1,6 +1,33 @@
 OpenAI Codex
-Copyright 2025 OpenAI
+Copyright 2025 OpenAI
 
 This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
 Copyright (c) 2016-2022 Florian Dehau
 Copyright (c) 2023-2025 The Ratatui Developers
+
+--------------------------------------------------------------------------------
+WisdAI Voice & OpenJarvis Integration Third-Party Notices
+--------------------------------------------------------------------------------
+
+1. OpenJarvis (https://github.com/open-jarvis/OpenJarvis)
+   Copyright (c) OpenJarvis Contributors
+   Licensed under the Apache License, Version 2.0.
+   Bundled source copy located at `OpenJarvisRuntime/src/openjarvis` and
+   `OpenJarvisRuntime/prompts`, with full license text in `LICENSE-OPENJARVIS.txt`.
+
+2. Local Neural Speech & Inference Runtimes
+   - llama.cpp (https://github.com/ggml-org/llama.cpp): MIT License.
+   - Qwen3-1.7B-Q4_K_M: Apache License 2.0.
+   - sherpa-onnx (https://github.com/k2-fsa/sherpa-onnx): Apache License 2.0.
+   - ONNX Runtime (https://github.com/microsoft/onnxruntime): MIT License.
+   - Supertonic-3 ONNX TTS weights: MIT License.
+   - Kokoro-82M ONNX TTS weights (hexgrad / k2-fsa): Apache License 2.0.
+   - Faster-Whisper & CTranslate2: MIT License.
+
+3. Managed OpenJarvis Bridge Python Runtime (`OpenJarvisRuntime`)
+   All packages in `requirements-clean.txt` use permissive OSI licenses
+   (Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, PSF-2.0, MPL-2.0), including
+   FastAPI, Starlette, Uvicorn, HTTPX, Pydantic, NumPy, SoundFile, PyAV,
+   Rich, psutil, tokenizers, and HuggingFace Hub. Excluded upstream optional
+   extras (`piper-tts` GPL-3.0-or-later, `phonemizer-fork` GPL-3.0,
+   `python-telegram-bot` LGPL-3.0-only) are not installed or distributed.

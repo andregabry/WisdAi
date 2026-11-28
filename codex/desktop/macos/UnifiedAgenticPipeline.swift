@@ -1,5 +1,45 @@
 import Foundation
 
+// MARK: - Canonical Action Tiers, Specialist Hints & Delegation Contracts
+
+public enum VoiceActionRiskTier: String, Codable, Sendable {
+    case trivial
+    case low
+    case medium
+    case high
+}
+
+public enum VoiceSpecialistAgentHint: String, Equatable, Codable, Sendable {
+    case autoActive
+    case codex
+    case antigravity
+    case claude
+}
+
+public struct VoiceTaskSummarySnapshot: Identifiable, Equatable, Codable, Sendable {
+    public let id: String
+    public let title: String
+    public let agentName: String
+    public let modelName: String
+    public let status: String
+    public let progressNote: String
+
+    public init(id: String, title: String, agentName: String, modelName: String, status: String, progressNote: String) {
+        self.id = id
+        self.title = title
+        self.agentName = agentName
+        self.modelName = modelName
+        self.status = status
+        self.progressNote = progressNote
+    }
+}
+
+public enum VoiceDelegationDispatchResult: Equatable, Sendable {
+    case dispatched(agentDisplayName: String)
+    case awaitingUserApproval(reason: String)
+    case unavailable(reason: String)
+}
+
 // MARK: - Unified Message Input Metadata & Outcomes (P0 Architecture Fix)
 
 public enum MessageInputSource: String, Codable, Sendable {
@@ -880,11 +920,9 @@ public enum VoicePresentationEngine {
 
         let selectedLines = !narrativeLines.isEmpty ? Array(narrativeLines.prefix(3)) : Array(fallbackLines.prefix(2))
         let joined = selectedLines.joined(separator: " ")
-        let adapted = NaturalSpeechComposer.compose(
+        let adapted = VoiceResponseAdapter.adaptForSpeech(
             joined,
-            plan: nil,
             profile: profile,
-            capabilities: EngineProsodyCapabilities.forEngine(.supertonic3, isKokoroActive: false, isSupertonicActive: true),
             customDictionary: customDictionary
         ).spokenText
 

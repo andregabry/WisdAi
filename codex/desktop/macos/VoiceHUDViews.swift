@@ -273,7 +273,7 @@ struct VoiceHUDModalView: View {
                                     )
                                     roleBadge(
                                         icon: "brain.head.profile",
-                                        label: orchestrator.brainStatus.rawValue
+                                        label: orchestrator.openJarvis.lifecycleState.displayTitle
                                     )
                                     roleBadge(
                                         icon: "cpu",
@@ -1013,7 +1013,7 @@ struct WisdEnterpriseVoiceSettingsCard: View {
                 Text("Build: \(WisdVoiceBuildInfo.summary) · Estado Engine: \(engStats.lifecycleState.rawValue) · AudioUnit: \(engStats.audioUnitState)")
                     .font(.system(size: 10.5))
                     .foregroundStyle(DesktopStyle.muted)
-                Text("Reconhecimento Ativo: \(sttSnap?.activeEngineOrModel ?? orchestrator.resolvedPipeline.activeSTTName) · Cérebro Ativo: \(llmSnap?.activeEngineOrModel ?? orchestrator.brainStatus.rawValue)")
+                Text("Reconhecimento Ativo: \(sttSnap?.activeEngineOrModel ?? orchestrator.resolvedPipeline.activeSTTName) · OpenJarvis: \(llmSnap?.activeEngineOrModel ?? orchestrator.openJarvis.lifecycleState.displayTitle)")
                     .font(.system(size: 11))
                 Text("Síntese Vocal Ativa: \(ttsSnap?.activeEngineOrModel ?? orchestrator.resolvedPipeline.activeTTSName) · Vozes PT Instaladas: \(orchestrator.installedPTVoicesCount) · Locales STT: \(orchestrator.installedSpeechLocales.isEmpty ? "verificar via Testar" : orchestrator.installedSpeechLocales.joined(separator: ", "))")
                     .font(.system(size: 11))

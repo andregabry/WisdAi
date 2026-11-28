@@ -413,10 +413,10 @@ final class VoiceController: NSObject, ObservableObject, AVSpeechSynthesizerDele
     var activeVoiceSummary: String {
         let cfg = orchestrator.identityManager.configuredSnapshot
         if orchestrator.isVoiceSessionActive {
-            return "Motor Autônomo · \(cfg.identityId.shortName) · \(cfg.engineId.shortName) (\(cfg.speakerId)) · \(orchestrator.brainStatus.rawValue)"
+            return "OpenJarvis · \(cfg.identityId.shortName) · \(cfg.engineId.shortName) (\(cfg.speakerId)) · \(orchestrator.openJarvis.lifecycleState.displayTitle)"
         }
         if isVoiceModeActive && isConnecting {
-            return "Inicializando Motor WisdAI · \(cfg.identityId.shortName) · \(cfg.speakerId)"
+            return "Inicializando OpenJarvis · \(cfg.identityId.shortName) · \(cfg.speakerId)"
         }
         return "\(cfg.identityId.shortName) · \(cfg.engineId.shortName) · \(cfg.speakerId) (\(cfg.language.shortCode))"
     }

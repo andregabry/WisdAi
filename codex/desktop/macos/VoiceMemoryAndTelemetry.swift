@@ -204,6 +204,7 @@ public final class VoiceMemoryStore: ObservableObject {
 
     public let hardwareProfile: HardwareMemoryProfile
     private let persistentStorageURL: URL
+    private var scopedProjectHistories: [String: (turns: [VoiceTurnRecord], summary: String, compactions: Int)] = [:]
 
     public init(
         hardwareProfile: HardwareMemoryProfile = .detect(),
@@ -223,6 +224,24 @@ public final class VoiceMemoryStore: ObservableObject {
     }
 
     public func updateWorkspaceContext(_ context: VoiceWorkspaceContextSnapshot) {
+        let oldScope = (workspaceContext.absoluteDirectoryPath ?? workspaceContext.projectName ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let newScope = (context.absoluteDirectoryPath ?? context.projectName ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !oldScope.isEmpty && !newScope.isEmpty && oldScope != newScope {
+            scopedProjectHistories[oldScope] = (sessionTurns, compactedSummary, compactionCount)
+            if let restored = scopedProjectHistories[newScope] {
+                sessionTurns = restored.turns
+                compactedSummary = restored.summary
+                compactionCount = restored.compactions
+            } else {
+                sessionTurns = []
+                compactedSummary = ""
+                compactionCount = 0
+            }
+        }
         var copy = context
         copy.workspaceDirectoryDisplay = context.workspaceDirectoryDisplay.map { VoiceLogRedactor.redact($0) }
         workspaceContext = copy

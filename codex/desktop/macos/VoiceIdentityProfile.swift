@@ -96,11 +96,18 @@ public enum WisdVoicePersona: String, CaseIterable, Identifiable, Codable, Senda
         }
     }
 
-    public var defaultDSPParameters: VoiceDSPParameters {
+    public var defaultConversationalWarmth: Double {
         switch self {
-        case .ultronBR: return .ultronBRDefault
-        case .jarvis, .aurora, .atlas, .aria: return .clean
+        case .jarvis: return 0.72
+        case .ultronBR: return 0.64
+        case .aurora: return 0.84
+        case .atlas: return 0.62
+        case .aria: return 0.80
         }
+    }
+
+    public var defaultDSPParameters: VoiceDSPParameters {
+        return .clean
     }
 }
 
@@ -1881,19 +1888,19 @@ public struct VoiceDesignConfig: Equatable, Codable, Sendable {
     )
 
     public static let ultronDefault = VoiceDesignConfig(
-        flowMatchingSteps: 10,
+        flowMatchingSteps: 8,
         cadence: 0.94,
-        pauseScale: 1.12,
+        pauseScale: 1.08,
         warmth: 0.64,
         directness: 0.92,
         expressivity: .warmAndDynamic,
         formality: .balanced,
         detailLevel: .balanced,
         toneSemitones: 0.0,
-        metallicIntensity: 0.24,
-        resonance: 0.48,
-        expressivityAmount: 0.78,
-        outputVolume: 1.08
+        metallicIntensity: 0.0,
+        resonance: 0.0,
+        expressivityAmount: 0.65,
+        outputVolume: 1.04
     )
 
     public static let naturalDefault = VoiceDesignConfig(
@@ -1977,7 +1984,7 @@ public struct PerVoiceAudioPreferences: Equatable, Codable, Sendable {
         cfg.design.expressivity = expressivity
         cfg.design.expressivityAmount = min(1.0, max(0.0, expressivityAmount))
         cfg.design.outputVolume = min(1.50, max(0.25, outputVolume))
-        cfg.design.warmth = VoicePersonalityProfile.profile(for: persona).conversationalWarmth
+        cfg.design.warmth = persona.defaultConversationalWarmth
         cfg.design.directness = persona == .ultronBR ? 0.92 : (persona == .jarvis ? 0.90 : 0.78)
     }
 

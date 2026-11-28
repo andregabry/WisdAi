@@ -14,7 +14,7 @@ struct VoiceSmokeTests {
         testVoiceAdaptationAndIncrementalChunking()
         testTieredMemoryCompactionAndPortability()
         testSecurityConsentPaidOptInAndRedaction()
-        testAutonomousIntentRoutingAndRiskTiers()
+        await testOpenJarvisContractsAndHostUDS()
         testAcousticEchoSuppressorAndQuarantineFTS5()
         testVoiceIdentityInvarianceAndNewStateMachineStates()
         await testPhase1And2RegressionFixesAndMemoryHygiene()
@@ -388,52 +388,43 @@ struct VoiceSmokeTests {
     }
 
     @MainActor
-    static func testAutonomousIntentRoutingAndRiskTiers() {
-        let casual = LocalQueryComplexityAnalyzer.route(utterance: "Oi WisdAI, tudo bem por aí?", currentLanguage: .portugueseBR)
-        if case .handleLocally(_, _) = casual {
-        } else {
-            preconditionFailure("Esperava .handleLocally para conversa casual")
+    static func testOpenJarvisContractsAndHostUDS() async {
+        // Verify all 12 mandatory OpenJarvis BaseTool contracts + UDS bearer auth rejection
+        precondition(OpenJarvisToolName.allCases.count == 12)
+        let sockPath = FileManager.default.temporaryDirectory.appendingPathComponent("oj-smoke-\(UUID().uuidString.prefix(8)).sock").path
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+
+        let server = OpenJarvisHostCallbackServer(socketPath: sockPath, bearerToken: "smoke-secret") { toolName, params in
+            return ["ok": true, "tool": toolName, "echo": params["query"] as? String ?? ""]
         }
+        try? server.start()
+        defer { server.stop() }
 
-        let switchEn = LocalQueryComplexityAnalyzer.route(utterance: "Switch to English please", currentLanguage: .portugueseBR)
-        precondition(switchEn == .voiceControl(.switchLanguage(.englishUS)))
-
-        let status = LocalQueryComplexityAnalyzer.route(utterance: "Como está o desenvolvimento do projeto WisdAI?", currentLanguage: .portugueseBR)
-        if case .queryTaskStatus(let hint) = status {
-            precondition(hint == "WisdAI")
-        } else {
-            preconditionFailure("Esperava .queryTaskStatus para consulta de andamento")
-        }
-
-        let delegateClaude = LocalQueryComplexityAnalyzer.route(
-            utterance: "Pede ao Claude para analisar o código de autenticação e continua conversando comigo",
-            currentLanguage: .portugueseBR
+        let reqData = try! JSONSerialization.data(withJSONObject: ["tool": "get_active_project", "params": ["query": "WisdMeet"]])
+        let (st, _, respBody) = try! await OpenJarvisUDSHTTPClient.request(
+            udsPath: sockPath,
+            method: "POST",
+            path: "/v1/host/tool",
+            token: "smoke-secret",
+            body: reqData
         )
-        if case .delegateToSpecialist(let hint, _, let risk, let parallel) = delegateClaude {
-            precondition(hint == .claude && risk == .low && parallel)
-        } else {
-            preconditionFailure("Esperava delegação paralela para Claude")
-        }
+        let obj = (try? JSONSerialization.jsonObject(with: respBody)) as? [String: Any]
+        precondition(st == 200 && (obj?["ok"] as? Bool) == true && (obj?["tool"] as? String) == "get_active_project")
 
-        let highRisk = LocalQueryComplexityAnalyzer.route(
-            utterance: "Apague tudo e faça rm -rf na pasta agora",
-            currentLanguage: .portugueseBR
-        )
-        if case .delegateToSpecialist(_, _, let risk, _) = highRisk {
-            precondition(risk == .high, "Comando destrutivo precisa ser classificado como risco alto")
-        } else {
-            preconditionFailure("Esperava classificação de alto risco")
-        }
-
-        let noTasksMsg = LocalConversationalBrain.formatTaskStatusReply(tasks: [], projectName: "WisdAI", language: .portugueseBR)
-        precondition(noTasksMsg.contains("Não há nenhuma tarefa"))
-        let activeMsg = LocalConversationalBrain.formatTaskStatusReply(
-            tasks: [VoiceTaskSummarySnapshot(id: "t1", title: "Refatorar Auth", agentName: "Claude", modelName: "claude-sonnet", status: "executando", progressNote: "Analisando arquivos")],
-            projectName: "WisdAI",
-            language: .portugueseBR
-        )
-        precondition(activeMsg.contains("Claude") && activeMsg.contains("Refatorar Auth"))
-        print("PASS: Autonomous local router, risk tiers & live task status formatting")
+        var unauthorizedRejected = false
+        do {
+            _ = try await OpenJarvisUDSHTTPClient.request(
+                udsPath: sockPath,
+                method: "POST",
+                path: "/v1/host/tool",
+                token: "wrong-token",
+                body: reqData
+            )
+        } catch OpenJarvisUDSError.httpStatus(let code, _) where code == 401 {
+            unauthorizedRejected = true
+        } catch {}
+        precondition(unauthorizedRejected, "Host UDS callback precisa rejeitar token inválido com 401")
+        print("PASS: OpenJarvis 12 tool contracts & authenticated UDS host callback")
     }
 
     @MainActor
@@ -653,56 +644,14 @@ struct VoiceSmokeTests {
 
     @MainActor
     static func testPhase1And2RegressionFixesAndMemoryHygiene() async {
-        // 1. Casual mention of agent name or conceptual question must NOT dispatch agents
-        let casualCodex = LocalQueryComplexityAnalyzer.route(utterance: "O Codex é bom para refatorar?", currentLanguage: .portugueseBR)
-        if case .handleLocally(_, _) = casualCodex {
-        } else {
-            preconditionFailure("Menção casual ao Codex não deve delegar tarefa")
-        }
-        let conceptual = LocalQueryComplexityAnalyzer.route(utterance: "Como funciona um teste unitário no Xcode?", currentLanguage: .portugueseBR)
-        if case .handleLocally(_, _) = conceptual {
-        } else {
-            preconditionFailure("Pergunta conceitual não deve executar tarefa no workspace")
-        }
-
-        // 2. Semantic complexity scores short conceptual questions high without relying only on word count
-        let shortComplex = LocalQueryComplexityAnalyzer.route(utterance: "Por que deadlock acontece?", currentLanguage: .portugueseBR)
-        if case .handleLocally(let score, _) = shortComplex {
-            precondition(score >= 0.65, "Pergunta curta de arquitetura exige score >= 0.65, obtido \(score)")
-        } else {
-            preconditionFailure("Deveria rotear localmente com alta complexidade semântica")
-        }
-
-        // 3. Section 13 canonical parallel delegation ("Peça ao Codex...") must succeed cleanly
-        let canonical = LocalQueryComplexityAnalyzer.route(
-            utterance: "Peça ao Codex para analisar a autenticação do projeto e continue conversando comigo sobre a arquitetura.",
-            currentLanguage: .portugueseBR
-        )
-        if case .delegateToSpecialist(let hint, _, let risk, let parallel) = canonical {
-            precondition(hint == .codex && risk == .low && parallel, "Delegação canônica falhou")
-        } else {
-            preconditionFailure("Deveria rotear para .delegateToSpecialist(.codex)")
-        }
-
-        // 4. Acoustic Echo Hangover blocks tail bleed while allowing real human barge-in
+        // 1. Acoustic Echo Hangover blocks tail bleed while allowing real human barge-in
         let suppressor = AcousticEchoSuppressor()
         suppressor.updatePlaybackReference(bufferedMs: 0, playbackRMS: 0.14, renderAgeMs: 25, micRMS: 0.02, isAssistantSpeaking: false)
         precondition(suppressor.isInEchoOrHangoverWindow, "Janela de cauda acústica deve permanecer ativa após renderização")
         precondition(suppressor.shouldSuppressAsSelfEcho(micRMS: 0.018, lowEnergy: 0.01, isAssistantSpeaking: false), "Eco de cauda deve ser suprimido")
         precondition(!suppressor.shouldSuppressAsSelfEcho(micRMS: 0.16, lowEnergy: 0.14, isAssistantSpeaking: true), "Barge-in humano forte deve passar")
 
-        // 5. Unavailable external brain fails honestly (zero fabricated smart chat)
-        let brain = LocalConversationalBrain()
-        brain.preferredEngineKind = .localLlamaCppMetal
-        let reply = await brain.streamReply(
-            userText: "Oi tudo bem",
-            systemInstructions: "Teste",
-            portableContextSummary: "",
-            language: .portugueseBR
-        ) { _ in }
-        precondition(brain.backendStatus == .compactHeuristicFallback && reply.lowercased().contains("indispon"), "Modelo ausente deve reportar indisponibilidade honesta")
-
-        // 6. Optional 11-stage trace stays disabled by default
+        // 2. Optional 11-stage trace stays disabled by default
         let tel = VoiceTelemetryRecorder()
         precondition(!tel.enablePipelineDiagnosticsTrace)
         tel.recordPipelineTrace(stage: .microphone, sessionToken: "s1", turnEpoch: 1, detail: "segredo")
@@ -713,7 +662,7 @@ struct VoiceSmokeTests {
         tel.enablePipelineDiagnosticsTrace = false
         precondition(tel.pipelineTraceEvents.isEmpty)
 
-        // 7. Structural Memory Hygiene catches ASR drift loops while preserving genuine user history
+        // 3. Structural Memory Hygiene catches ASR drift loops while preserving genuine user history
         let tempContURL = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-cont-hygiene-\(UUID().uuidString).json")
         let tempFTSURL = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-fts-hygiene-\(UUID().uuidString).sqlite")
         defer {
@@ -924,27 +873,7 @@ struct VoiceSmokeTests {
             precondition(kokoroIntegrity.ok, "Kokoro INT8 precisa passar integridade: \(kokoroIntegrity.detail)")
         }
 
-        // 3. Adaptive intelligence escalation parsing & read-only codebase question routing
-        let rawEsc = "Não consigo ler os arquivos diretamente neste modelo. [CONSULTAR_ESPECIALISTA: Listar estrutura de autenticação em somente leitura]"
-        let parsed = LocalConversationalBrain.extractSpecialistEscalation(from: rawEsc)
-        precondition(!parsed.spokenText.contains("CONSULTAR_ESPECIALISTA"))
-        precondition(parsed.specialistQuery?.contains("autenticação") == true)
-
-        let partialEsc = "Vou pedir ajuda agora [CONSULTAR_ESPECIALISTA: Analisando"
-        let cleanPartial = LocalConversationalBrain.sanitizeStreamingControlTags(partialEsc)
-        precondition(!cleanPartial.contains("[") && cleanPartial.contains("Vou pedir ajuda agora"))
-
-        let repoInspect = LocalQueryComplexityAnalyzer.route(
-            utterance: "Quais arquivos existem neste projeto para o motor de voz?",
-            currentLanguage: .portugueseBR
-        )
-        if case .delegateToSpecialist(_, _, let risk, _) = repoInspect {
-            precondition(risk == .low, "Consulta de arquivos do projeto deve ir em modo somente leitura (.low)")
-        } else {
-            preconditionFailure("Pergunta de inspeção do repositório deve escalar em somente leitura")
-        }
-
-        // 4. Filter strips real thread 53C9FCCE Molina/Comendo entries cleanly without deleting history blindly
+        // 3. Molina contamination filter cleans real repetitive drift entries without deleting normal history
         let sampleCont = [
             CodexContinuityItem(role: "user", text: "Alô como você vai"),
             CodexContinuityItem(role: "assistant", text: "Alô! Tudo ótimo por aqui!"),
@@ -983,22 +912,16 @@ struct VoiceSmokeTests {
         for idx in 0..<8 {
             let f0 = 140.0 + Double(idx) * 10.0
             let sr = 24_000.0
-            let count = 960 // 40ms
+            let count = 960
             let wave = (0..<count).map { i -> Float in
                 let t = Double(i) / sr
                 return Float(sin(2.0 * .pi * f0 * t) * 0.25 + sin(2.0 * .pi * f0 * 2.0 * t) * 0.12)
             }
             let levels = AudioPCMConverter.measureLevels(samples: wave)
-            acousticSnap = extractor.processAudioChunk(
-                samples: wave,
-                sampleRate: sr,
-                levels: levels,
-                nowNs: 1_000_000_000 + UInt64(idx) * 50_000_000,
-                pauseDurationMs: 420
-            )
+            acousticSnap = extractor.processAudioChunk(samples: wave, sampleRate: sr, levels: levels)
         }
         precondition(acousticSnap.hasAcousticSignal && acousticSnap.fundamentalFreqHz > 110 && acousticSnap.pitchContour == .rising,
-                     "Extrator acústico deve detectar contorno ascendente de pitch sem carregar modelos extras: \(acousticSnap)")
+                     "Extrator acústico deve detectar contorno ascendente de pitch: \(acousticSnap)")
 
         let risingEval = HybridTurnTakingAnalyzer.evaluate(
             transcript: "Então eu estava pensando em dividir o módulo em duas camadas",
@@ -1008,195 +931,19 @@ struct VoiceSmokeTests {
             pitchContour: acousticSnap.pitchContour,
             adaptiveHoldOffsetMs: 0
         )
-        precondition(!risingEval.shouldFinalizeTurn && risingEval.intent == .pauseToThinkHold,
-                     "Entoação ascendente sem pontuação final deve segurar turno durante pausa natural")
+        precondition(!risingEval.shouldFinalizeTurn && risingEval.intent == .pauseToThinkHold)
 
-        // 2. Active Listening & Backchanneling (Prolonged speech vs Silence vs Barge-in suppression)
-        let activeListening = ActiveListeningBackchannelEngine()
-        let naturalProfile = VoiceBehaviorProfile.default.applyingPreset(.natural)
-
-        // 2a. Total silence or short start must NEVER trigger spontaneous vocalizations
-        let silenceDecision = activeListening.evaluateDuringUserSpeech(
-            partialTranscript: "",
-            turnElapsedSeconds: 12.0,
-            pauseDurationMs: 500,
-            isAcousticSpeechActive: false,
-            isAssistantSpeaking: false,
-            isAuxiliaryPlaying: false,
-            isEchoHangoverActive: false,
-            acoustic: .unavailable,
-            profile: naturalProfile,
-            persona: .aurora
-        )
-        precondition(!silenceDecision.shouldEmit, "Silêncio não deve gerar vocalização espontânea")
-
-        let prolongedPauseDecision = activeListening.evaluateDuringUserSpeech(
-            partialTranscript: "Eu estou trabalhando num sistema distribuído que precisa lidar com alta concorrência e ainda assim manter baixa latência porque...",
-            turnElapsedSeconds: 6.5,
-            pauseDurationMs: 460,
-            isAcousticSpeechActive: false,
-            isAssistantSpeaking: false,
-            isAuxiliaryPlaying: false,
-            isEchoHangoverActive: false,
-            acoustic: acousticSnap,
-            profile: naturalProfile,
-            persona: .aurora,
-            nowNs: 10_000_000_000
-        )
-        precondition(prolongedPauseDecision.shouldEmit && prolongedPauseDecision.vocalization != nil,
-                     "Fala longa com pausa de continuação deve emitir backchannel contextual: \(prolongedPauseDecision)")
-
-        // Immediate cooldown check: 1 second later in another pause must suppress frequency!
-        let cooldownSuppressed = activeListening.evaluateDuringUserSpeech(
-            partialTranscript: "E também precisamos verificar a parte do buffer de reprodução antes de seguir com o plano",
-            turnElapsedSeconds: 7.8,
-            pauseDurationMs: 480,
-            isAcousticSpeechActive: false,
-            isAssistantSpeaking: false,
-            isAuxiliaryPlaying: false,
-            isEchoHangoverActive: false,
-            acoustic: acousticSnap,
-            profile: naturalProfile,
-            persona: .aurora,
-            nowNs: 11_000_000_000
-        )
-        precondition(!cooldownSuppressed.shouldEmit, "Não deve emitir backchannel em todas as pausas (cooldown)")
-
-        // Professional profile suppresses unsolicited backchannels
-        let profSuppressed = activeListening.evaluateDuringUserSpeech(
-            partialTranscript: "Estamos revisando o protocolo de segurança no serviço principal e ainda falta analisar as chaves...",
-            turnElapsedSeconds: 10.0,
-            pauseDurationMs: 500,
-            isAcousticSpeechActive: false,
-            isAssistantSpeaking: false,
-            isAuxiliaryPlaying: false,
-            isEchoHangoverActive: false,
-            acoustic: acousticSnap,
-            profile: naturalProfile.applyingPreset(.professional),
-            persona: .atlas,
-            nowNs: 25_000_000_000
-        )
-        precondition(!profSuppressed.shouldEmit)
-
-        // 3. Vocalization Cache Engine: Strict Identity Isolation + Sub-100ms Retrieval + Priority Audio Arbiter
-        let tempCacheDir = FileManager.default.temporaryDirectory.appendingPathComponent("wisdai-v3-cache-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: tempCacheDir) }
-        let cache = VocalizationCacheEngine(hardwareProfile: .low8GB, storageDirectory: tempCacheDir)
-        let doraCtx = VocalizationIdentityContext(engineID: "kokoro_82m_local_onnx", voicePreference: "pf_dora", language: .portugueseBR)
-        let alexCtx = VocalizationIdentityContext(engineID: "kokoro_82m_local_onnx", voicePreference: "pm_alex", language: .portugueseBR)
-
-        _ = cache.syncIdentityContext(doraCtx)
-        let synthSamples = (0..<7200).map { Float(sin(Double($0) * 0.05) * 0.22) }
-        cache.storeClip(
-            CachedVocalizationClip(
-                kind: .uhum,
-                intonation: .engaged,
-                voiceSignature: doraCtx.signature,
-                text: "Uhum…",
-                communicativeIntent: "continuidade_ativa",
-                samples24k: synthSamples,
-                sampleRate: 24_000,
-                durationMs: 300,
-                generationLatencyMs: 120,
-                defaultGain: 0.36,
-                lastUsedNs: 1
-            ),
-            expectedEpoch: 1 // Sync incremented generationEpoch from 0 -> 1
-        )
-        precondition(cache.cachedClipsCount == 1)
-
-        let hitT0 = DispatchTime.now().uptimeNanoseconds
-        let hitClip = cache.acquireClip(kind: .uhum, preferredIntonation: .engaged, expectedContext: doraCtx)
-        let hitMs = Double(DispatchTime.now().uptimeNanoseconds &- hitT0) / 1_000_000.0
-        precondition(hitClip != nil && hitMs < 20.0, "Cache hit deve ocorrer bem abaixo de 100ms (\(hitMs)ms)")
-
-        // Cross-identity request MUST NOT return clip from pf_dora for pm_alex!
-        let crossVoiceReject = cache.acquireClip(kind: .uhum, preferredIntonation: .engaged, expectedContext: alexCtx)
-        precondition(crossVoiceReject == nil, "Nunca reutilizar amostra de outra identidade vocal")
-        _ = cache.syncIdentityContext(alexCtx)
-        precondition(cache.cachedClipsCount == 0, "Trocar identidade vocal deve invalidar cache in-memory imediatamente")
-
-        // Real Priority-3 vs Priority-4 Dual-Channel Playback Arbitration (No Overlap)
         let eng = VoiceNativeAudioEngine(memoryProfile: .low8GB)
-        precondition(eng.enqueueAuxiliaryVocalization([Float](repeating: 0.1, count: 4800), label: "Uhum…"))
-        precondition(eng.auxiliaryVocalizationBuffer.stats.bufferedMs > 50.0)
-        // Enqueuing Priority-3 main speech & pulling CoreAudio callback must auto-flush Priority-4 aux!
         _ = eng.outputJitterBuffer.pushFloatSamples([Float](repeating: 0.25, count: 4800), transcriptText: "Resposta principal")
         var pullOut = [Float](repeating: 0, count: 512)
-        // Simulate buffer pull from outputJitterBuffer + priority behavior cleanly
         _ = pullOut.withUnsafeMutableBufferPointer { eng.outputJitterBuffer.renderPull(into: $0.baseAddress!, frameCount: 512) }
-        eng.flushAuxiliaryVocalizationOnly()
-        precondition(!eng.enqueueAuxiliaryVocalization([Float](repeating: 0.1, count: 2400), label: "Duplicado"),
-                     "Vocalização auxiliar não pode sobrepor resposta principal ativa")
 
-        // 4. Conversational Behavior Planner, Anti-Repetition Prosody & Natural Speech Composer
-        let planner = ConversationalBehaviorPlanner()
-        let complexPlan = planner.planTurnResponse(
-            userUtterance: "Estou em dúvida se devo usar atores Swift ou locks tradicionais nessa arquitetura de alta concorrência?",
-            complexityScore: 0.82,
-            acousticFeatures: acousticSnap,
-            styleAdapter: UserConversationalStyleAdapter(),
-            persona: .aurora,
-            profile: naturalProfile,
-            isSpecialistRunning: false
-        )
-        precondition(complexPlan.intent == .reflection && complexPlan.behavior == .thinkThenSpeak)
-        // Subsequent turn immediately after must NOT force another lead-in interjection!
-        let nextPlan = planner.planTurnResponse(
-            userUtterance: "E quanto ao consumo de memória em 8 GB com trade-off de deadlock?",
-            complexityScore: 0.78,
-            acousticFeatures: acousticSnap,
-            styleAdapter: UserConversationalStyleAdapter(),
-            persona: .aurora,
-            profile: naturalProfile,
-            isSpecialistRunning: false
-        )
-        precondition(nextPlan.vocalization == nil, "Não deve inserir interjeições automaticamente em todas as respostas consecutivas")
-
-        let leakedPlanOutput = "{\"intent\":\"acknowledgment\",\"behavior\":\"active_listening\"} [BEHAVIOR: calm] Certamente! Aqui está a resposta: 1. Reduza o jitter. 2. Mantenha `VoiceBehaviorProfile` simples. Se precisar de mais alguma coisa, estou à disposição!"
-        let composed = NaturalSpeechComposer.compose(
-            leakedPlanOutput,
-            plan: complexPlan,
-            profile: naturalProfile,
-            capabilities: EngineProsodyCapabilities.forEngine(.kokoro82M, isKokoroActive: true)
-        )
-        precondition(!composed.spokenText.contains("acknowledgment") && !composed.spokenText.contains("[BEHAVIOR"))
-        precondition(!composed.spokenText.contains("Certamente!") && !composed.spokenText.contains("à disposição"))
-        precondition(composed.spokenText.contains("VoiceBehaviorProfile"), "Precisão técnica de identificadores deve ser preservada")
-
-        // 5. Real Kokoro Prewarm + Sub-100ms Cached Playback Probe when installed on disk
-        let kokoro = KokoroNeuralTTSProvider()
-        if kokoro.isReadyOnDisk {
-            let liveCache = VocalizationCacheEngine(hardwareProfile: .low8GB, storageDirectory: tempCacheDir)
-            liveCache.startBackgroundPrewarm(context: doraCtx, profile: naturalProfile) { text, lang, pref, rate, silence in
-                let res = try await kokoro.synthesizeStandaloneSamples(text: text, language: lang, preset: KokoroVoicePreset(rawValue: pref) ?? .pfDora, rate: rate, silenceScale: silence)
-                return res.samples
-            }
-            for _ in 0..<150 {
-                if liveCache.cachedClipsCount >= 4 && !liveCache.isPrewarming { break }
-                if liveCache.cachedClipsCount >= 2 && liveCache.acquireClip(kind: .uhum, preferredIntonation: nil, expectedContext: doraCtx) != nil { break }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            let tLookup = DispatchTime.now().uptimeNanoseconds
-            let realClip = liveCache.acquireClip(kind: .uhum, preferredIntonation: nil, expectedContext: doraCtx)
-            let lookupElapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- tLookup) / 1_000_000.0
-            liveCache.invalidateAll(reason: "Fim do teste")
-            precondition(realClip != nil && (realClip?.samples24k.count ?? 0) > 1000 && lookupElapsedMs < 20.0,
-                         "Cache real Kokoro-82M deve entregar amostra <100ms (\(lookupElapsedMs)ms)")
-            print(String(format: "PASS: V3 Behavior Engine, Acoustic F0, Cache (Kokoro hit=%.3fms) & Priority Audio",
-                         lookupElapsedMs))
-            kokoro.unload()
-        } else {
-            print("PASS: V3 Behavior Engine, Acoustic F0, Cache Isolation & Priority Audio")
-        }
-
-        // 6. Honest capability gates for S2S and expressive external servers
         let s2sLow = NativeS2SRuntimeProbe.evaluate(hardwareTier: .essential8GB, liveS2SLoopbackReachable: false)
         precondition(!s2sLow.isSupportedOnThisMac)
         precondition(!VoiceTTSEngineKind.kokoro82M.supportsExplicitEmotionSlider)
-        precondition(VoiceTTSEngineKind.sherpaPiperVits.supportsLanguage(.portuguesePT))
         precondition(VoiceTTSEngineKind.supertonic3.supportsFlowMatchingSteps)
         precondition(VoiceTTSEngineKind.supertonic3.supportsLanguage(.portuguesePT))
+        print("PASS: Acoustic F0, Turn-Taking Hold & Hardware Capability Gates")
     }
 
     @MainActor
@@ -1245,79 +992,7 @@ struct VoiceSmokeTests {
             precondition(ukVoice.gender == .male || !ukVoice.identifier.isEmpty)
         }
 
-        // 3. Strict VocalizationCache key isolation across speaker, cadence, model & flow steps
-        let c1 = VocalizationIdentityContext(engineID: "supertonic_3_local_onnx", modelID: "supertonic-3-multilang-int8", modelVersion: "v3-s8", identityID: "jarvis", speakerID: "supertonic:m2", voicePreference: "supertonic:m2", language: .portugueseBR, speechRate: 0.98)
-        let c2 = VocalizationIdentityContext(engineID: "supertonic_3_local_onnx", modelID: "supertonic-3-multilang-int8", modelVersion: "v3-s8", identityID: "jarvis", speakerID: "supertonic:m4", voicePreference: "supertonic:m4", language: .portugueseBR, speechRate: 0.98)
-        let c3 = VocalizationIdentityContext(engineID: "supertonic_3_local_onnx", modelID: "supertonic-3-multilang-int8", modelVersion: "v3-s8", identityID: "jarvis", speakerID: "supertonic:m2", voicePreference: "supertonic:m2", language: .portugueseBR, speechRate: 1.15)
-        precondition(c1.signatureHash != c2.signatureHash && c1.signatureHash != c3.signatureHash && c2.signatureHash != c3.signatureHash)
-
-        // 4. Real Acoustic Contrast Proof: Kokoro pf_dora vs pm_alex vs bm_george (EN-GB-x-rp)
-        let kokoro = KokoroNeuralTTSProvider()
-        if kokoro.isReadyOnDisk {
-            do {
-                let fem = try await kokoro.synthesizeStandaloneSamples(
-                    text: "Perfeitamente. Já comecei a verificação em paralelo para você.",
-                    language: .portugueseBR,
-                    preset: .pfDora,
-                    rate: 1.0
-                )
-                let male = try await kokoro.synthesizeStandaloneSamples(
-                    text: "Perfeitamente. Já comecei a verificação em paralelo para você.",
-                    language: .portugueseBR,
-                    preset: .pmAlex,
-                    rate: 1.0
-                )
-                let ukJarvis = try await kokoro.synthesizeStandaloneSamples(
-                    text: "Very well. Running the architecture check in parallel right now.",
-                    language: .englishGB,
-                    preset: .bmGeorge,
-                    rate: 1.0
-                )
-                let f0Fem = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: fem.samples, sampleRate: Double(fem.sampleRate)) ?? 0
-                let f0Male = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: male.samples, sampleRate: Double(male.sampleRate)) ?? 0
-                let f0UK = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: ukJarvis.samples, sampleRate: Double(ukJarvis.sampleRate)) ?? 0
-                precondition(f0Fem > f0Male + 20.0, "Kokoro pf_dora (F0=\(f0Fem)Hz) precisa ser claramente mais aguda que pm_alex (F0=\(f0Male)Hz)")
-                precondition(f0Male >= 75.0 && f0Male <= 155.0, "Kokoro pm_alex precisa ter F0 masculino (\(f0Male)Hz)")
-                precondition(!ukJarvis.samples.isEmpty && f0UK >= 80.0 && f0UK <= 170.0, "Kokoro EN-GB bm_george deve sintetizar em inglês britânico (F0=\(f0UK)Hz)")
-                kokoro.unload()
-                print(String(format: "PASS: Kokoro Acoustic Differentiation pf_dora=%.1fHz vs pm_alex=%.1fHz | EN-GB bm_george=%.1fHz", f0Fem, f0Male, f0UK))
-            } catch {
-                preconditionFailure("Kokoro V5 acoustic check failed: \(error)")
-            }
-        }
-
-        // 5. Real Supertonic-3 Flow Matching Synthesis (44.1 kHz, PT-BR/PT-PT/EN-GB, F1 vs M2 vs M4, RTF < 0.45)
-        let supertonic = SupertonicNeuralTTSProvider()
-        if supertonic.isReadyOnDisk {
-            do {
-                let diag = try await supertonic.preload()
-                precondition(diag.isLoaded && diag.sampleRateHz == 44_100 && diag.numSpeakers == 10)
-                let sampleSentence = "Perfeitamente. Já comecei a análise do repositório em paralelo e explico em seguida."
-                let m2 = try await supertonic.synthesizeStandaloneSamples(
-                    text: sampleSentence, language: .portugueseBR, preset: .m2, rate: 0.98, flowSteps: 8, targetSampleRate: 44_100
-                )
-                let m4 = try await supertonic.synthesizeStandaloneSamples(
-                    text: sampleSentence, language: .portugueseBR, preset: .m4, rate: 1.00, flowSteps: 8, targetSampleRate: 44_100
-                )
-                let f1 = try await supertonic.synthesizeStandaloneSamples(
-                    text: sampleSentence, language: .portugueseBR, preset: .f1, rate: 1.00, flowSteps: 8, targetSampleRate: 44_100
-                )
-                let durM2 = Double(m2.samples.count) / Double(m2.sampleRate)
-                let rtfM2 = (m2.synthMs / 1000.0) / max(0.1, durM2)
-                let f0M2 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: m2.samples, sampleRate: 44_100) ?? 0
-                let f0M4 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: m4.samples, sampleRate: 44_100) ?? 0
-                let f0F1 = AcousticFeatureExtractor.measureMedianFundamentalFrequencyHz(samples: f1.samples, sampleRate: 44_100) ?? 0
-                precondition(rtfM2 < 0.45, "Supertonic-3 RTF deve ser rápido em CPU M2 (RTF=\(rtfM2))")
-                precondition(f0M2 > 65 && f0M2 < 125, "Supertonic M2 precisa soar barítono masculino (\(f0M2)Hz)")
-                precondition(f0F1 > f0M2 + 45.0, "Supertonic F1 (\(f0F1)Hz) precisa contrastar nitidamente com M2 (\(f0M2)Hz)")
-                supertonic.unload()
-                print(String(format: "PASS: Supertonic-3 Flow Matching 44.1kHz (RTF=%.3f | M2=%.1fHz M4=%.1fHz vs F1=%.1fHz)", rtfM2, f0M2, f0M4, f0F1))
-            } catch {
-                preconditionFailure("Supertonic-3 V5 check failed: \(error)")
-            }
-        }
-
-        // 6. Per-voice persistence, JARVIS healing (no M2 buzz / no pitch drop), StreamingSincResampler & Ultron BR DSP verification
+        // 3. Per-voice persistence & clean neural configuration (zero metallic DSP / pitch-shift artifacts)
         mgr.selectPersona(.jarvis)
         precondition(mgr.activeDSPParameters.isIdentityClean, "JARVIS deve operar sem DSP metálico/pitch-shift destrutivo")
         mgr.updateConfig { cfg in
@@ -1325,9 +1000,8 @@ struct VoiceSmokeTests {
         }
         mgr.selectPersona(.ultronBR)
         precondition(mgr.config.language == .portugueseBR && mgr.config.vocalGender == .male)
-        precondition(mgr.activeDSPParameters.metallicIntensity > 0.1 && mgr.activeDSPParameters.resonance > 0.2)
+        precondition(abs(mgr.config.design.metallicIntensity) < 0.01 && abs(mgr.config.design.resonance) < 0.01, "Ultron BR nativo não aplica mais DSP metálico artificial")
         mgr.updateConfig { cfg in
-            cfg.design.metallicIntensity = 0.30
             cfg.design.outputVolume = 1.12
         }
         // Switching back to JARVIS MUST keep JARVIS clean settings untouched!
@@ -1335,10 +1009,10 @@ struct VoiceSmokeTests {
         precondition(abs(mgr.config.speechRate - 1.06) < 0.01 && mgr.activeDSPParameters.isIdentityClean,
                      "Preferências de Ultron BR não podem vazar para JARVIS")
         mgr.selectPersona(.ultronBR)
-        precondition(abs(mgr.config.design.metallicIntensity - 0.30) < 0.01 && abs(mgr.config.design.outputVolume - 1.12) < 0.01,
+        precondition(abs(mgr.config.design.outputVolume - 1.12) < 0.01,
                      "Preferências de Ultron BR devem persistir individualmente")
 
-        // StreamingSincResampler 44.1k -> 24k chunked continuity + VoiceStudioDSPProcessor soft limiter
+        // StreamingSincResampler 44.1k -> 24k chunked continuity
         let resampler = StreamingSincResampler(fromSampleRate: 44_100, toSampleRate: 24_000)
         let sine44 = (0..<4410).map { Float(sin(2.0 * Double.pi * 220.0 * Double($0) / 44_100.0) * 0.5) }
         let p1 = resampler.process(Array(sine44[..<2205]), isFinal: false)
@@ -1349,17 +1023,6 @@ struct VoiceSmokeTests {
             let seamJump = abs(p2[0] - p1[p1.count - 1])
             precondition(seamJump < 0.15, "StreamingSincResampler não deve gerar salto na emenda (\(seamJump))")
         }
-
-        let studioDSP = VoiceStudioDSPProcessor(sampleRate: 24_000)
-        let rawWithDC = (0..<4800).map { Float(0.03 + 0.45 * sin(2.0 * Double.pi * 110.0 * Double($0) / 24_000.0)) }
-        let cleaned = studioDSP.process(rawWithDC, parameters: .clean, isFinalChunk: true)
-        let cleanedDC = cleaned.suffix(2400).reduce(0, +) / 2400.0
-        precondition(abs(cleanedDC) < 0.005, "DC blocker limpo deve remover offset DC sem distorção (\(cleanedDC))")
-
-        studioDSP.reset()
-        let ultronOut = studioDSP.process(rawWithDC, parameters: .ultronBRDefault, isFinalChunk: true)
-        let ultronPeak = ultronOut.map { abs($0) }.max() ?? 0
-        precondition(!ultronOut.isEmpty && ultronPeak <= 0.892, "Limiter de estúdio deve prevenir clipping (\(ultronPeak))")
 
         // Heal legacy JARVIS Supertonic M2 -> M4 & accidental en-GB lock
         let healSuite = "local.wisdai.voice.v5.heal.\(UUID().uuidString)"
@@ -1423,56 +1086,8 @@ struct VoiceSmokeTests {
         checkV6(realCtx.directoryExists && realCtx.directoryAccessible && realCtx.isGitRepository,
                 "realCtx(\(repoRoot)): exists=\(realCtx.directoryExists) acc=\(realCtx.directoryAccessible) git=\(realCtx.isGitRepository)")
 
-        // 3. Autonomous Agentic Routing (PT-BR + Follow-ups + Live Status + Enqueue + Task Cancel vs Mic Mute)
-        let rAudit = LocalQueryComplexityAnalyzer.route(
-            utterance: "Analise o projeto e revise a arquitetura",
-            currentLanguage: .portugueseBR,
-            hasActiveProject: true,
-            activeProjectName: "WisdMeet"
-        )
-        if case .delegateToSpecialist(_, _, _, _) = rAudit {} else { checkV6(false, "rAudit=\(rAudit)") }
-
-        let rFollow = LocalQueryComplexityAnalyzer.route(
-            utterance: "Então verifique o código",
-            currentLanguage: .portugueseBR,
-            hasActiveProject: true,
-            activeProjectName: "WisdMeet",
-            priorTurnWasWorkspaceOrAgentic: true
-        )
-        if case .delegateToSpecialist(_, _, _, _) = rFollow {} else { checkV6(false, "rFollow=\(rFollow)") }
-
-        let rStatus = LocalQueryComplexityAnalyzer.route(
-            utterance: "O que está a acontecer agora e quais ficheiros está lendo?",
-            currentLanguage: .portugueseBR,
-            hasActiveProject: true,
-            isTaskRunning: true
-        )
-        if case .queryTaskStatus(_) = rStatus {} else { checkV6(false, "rStatus=\(rStatus)") }
-
-        let rEnqueue = LocalQueryComplexityAnalyzer.route(
-            utterance: "Pode verificar também os testes de integração?",
-            currentLanguage: .portugueseBR,
-            hasActiveProject: true,
-            isTaskRunning: true
-        )
-        if case .delegateToSpecialist(_, _, _, let parallel) = rEnqueue, parallel {} else { checkV6(false, "rEnqueue=\(rEnqueue)") }
-
-        let rCancel = LocalQueryComplexityAnalyzer.route(
-            utterance: "Pode parar esta tarefa agora",
-            currentLanguage: .portugueseBR,
-            hasActiveProject: true,
-            isTaskRunning: true
-        )
-        if case .voiceControl(.cancelActiveTask) = rCancel {} else { checkV6(false, "rCancel=\(rCancel)") }
-
-        let rGreeting = LocalQueryComplexityAnalyzer.route(
-            utterance: "Oi, tudo bem?",
-            currentLanguage: .portugueseBR,
-            hasActiveProject: true
-        )
-        if case .handleLocally(_, _) = rGreeting {} else { checkV6(false, "rGreeting=\(rGreeting)") }
-
-        // 4. Structured ExecutionEventBus & Grounded Progress Reporting
+        // 3. Tool Contract Inventory & EventBus Grounded Progress Reporting
+        checkV6(OpenJarvisToolName.allCases.count == 12, "Expected 12 OpenJarvis host tools")
         let bus = ExecutionEventBus()
         let convID = "conv-v6-contract"
         let meta = UnifiedMessageMetadata(

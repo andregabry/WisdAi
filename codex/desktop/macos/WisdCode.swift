@@ -787,8 +787,10 @@ final class Workspace: ObservableObject {
 
     func shutdownGracefully() {
         voice.stopVoiceConversation()
+        voice.orchestrator.openJarvis.shutdown()
         voice.orchestrator.llamaBrainRuntime.unloadModel()
         voice.orchestrator.kokoroTTS.unload()
+        voice.orchestrator.supertonicTTS.unload()
         if let cliProc = activeCLIProcess, cliProc.isRunning {
             cliProc.terminate()
         }
@@ -1142,7 +1144,11 @@ final class Workspace: ObservableObject {
                let found = localDataRef?.aiAccounts.first(where: { $0.provider == .openai && $0.sessionID == activeSession.id && $0.workspaceID == activeSession.workspaceID }) {
                 return found
             }
-            return selectedAccount ?? localDataRef?.aiAccounts.first(where: { $0.provider == .openai && $0.isActive })
+            if let pref = selectedAccount, pref.provider == .openai {
+                return pref
+            }
+            return localDataRef?.aiAccounts.first(where: { $0.provider == .openai && $0.isActive })
+                ?? localDataRef?.aiAccounts.first(where: { $0.provider == .openai })
         }()
         if let targetAccount {
             quotaStore.updateFromRateLimits(payload, account: targetAccount, fallbackModels: models.map(\.id))
@@ -2334,8 +2340,15 @@ final class Workspace: ObservableObject {
     }
 
     private func syncVoiceWorkspaceSnapshotToOrchestrator() {
+        voice.orchestrator.workspaceSnapshotProvider = { [weak self] in
+            self?.buildOpenJarvisWorkspaceContextDictionary() ?? [:]
+        }
         let snap = buildVoiceWorkspaceSnapshot()
         voice.orchestrator.updateWorkspaceContext(snap)
+        let ctxDict = buildOpenJarvisWorkspaceContextDictionary()
+        Task {
+            await voice.orchestrator.openJarvis.pushWorkspaceSnapshot(ctxDict)
+        }
     }
 
     @discardableResult
@@ -2429,6 +2442,16 @@ final class Workspace: ObservableObject {
     /// Binds Workspace and WisdVoiceOrchestrator to the unified pipeline without starting microphone hardware capture.
     func configureHeadlessAgenticVoiceBridge() {
         refreshResolvedProjectContext(inspectGit: true)
+        voice.orchestrator.openJarvis.setHostToolHandler { [weak self] name, params in
+            guard let self else { return ["ok": false, "error": "Workspace encerrado."] }
+            return await self.handleOpenJarvisToolCall(name: name, params: params)
+        }
+        voice.orchestrator.workspaceSnapshotProvider = { [weak self] in
+            self?.buildOpenJarvisWorkspaceContextDictionary() ?? [:]
+        }
+        Task {
+            await voice.orchestrator.openJarvis.pushWorkspaceSnapshot(buildOpenJarvisWorkspaceContextDictionary())
+        }
         voice.orchestrator.configureAgenticBridgeForSession(
             workspaceContext: buildVoiceWorkspaceSnapshot(),
             executionEventBus: executionEventBus,
@@ -2468,6 +2491,16 @@ final class Workspace: ObservableObject {
             : nil
 
         let ctxSnapshot = buildVoiceWorkspaceSnapshot()
+        voice.orchestrator.openJarvis.setHostToolHandler { [weak self] name, params in
+            guard let self else { return ["ok": false, "error": "Workspace encerrado."] }
+            return await self.handleOpenJarvisToolCall(name: name, params: params)
+        }
+        voice.orchestrator.workspaceSnapshotProvider = { [weak self] in
+            self?.buildOpenJarvisWorkspaceContextDictionary() ?? [:]
+        }
+        Task {
+            await voice.orchestrator.openJarvis.pushWorkspaceSnapshot(buildOpenJarvisWorkspaceContextDictionary())
+        }
 
         voice.startConversationalChatMode(
             workspaceContext: ctxSnapshot,
@@ -2661,6 +2694,7 @@ final class Workspace: ObservableObject {
         if prevPath == project?.path {
             refreshResolvedProjectContext(inspectGit: true)
         }
+        syncVoiceWorkspaceSnapshotToOrchestrator()
         let cached = ChatStorage.shared.loadMessages(for: id)
         if !cached.isEmpty {
             messages = cached

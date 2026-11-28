@@ -228,6 +228,83 @@ private enum SherpaDynamicBridge {
     }
 }
 
+public final class StreamingSincResampler: @unchecked Sendable {
+    private let fromRate: Double
+    private let toRate: Double
+    private let ratio: Double
+    private let halfTaps: Int = 12
+    private var history: [Float] = []
+    private var fracPos: Double = 0
+
+    public init(fromSampleRate: Double, toSampleRate: Double) {
+        self.fromRate = max(8_000, fromSampleRate)
+        self.toRate = max(8_000, toSampleRate)
+        self.ratio = self.fromRate / self.toRate
+        self.history = [Float](repeating: 0, count: self.halfTaps)
+    }
+
+    public func reset() {
+        history = [Float](repeating: 0, count: halfTaps)
+        fracPos = 0
+    }
+
+    public func process(_ chunk: [Float], isFinal: Bool = false) -> [Float] {
+        guard !chunk.isEmpty else { return [] }
+        if abs(fromRate - toRate) < 1.0 { return chunk }
+
+        var buf = history + chunk
+        if isFinal {
+            buf.append(contentsOf: [Float](repeating: 0, count: halfTaps))
+        }
+        let cutoff = min(0.92, (toRate / fromRate) * 0.94)
+        let availableEnd = Double(buf.count - halfTaps - 1)
+        guard availableEnd > fracPos else {
+            history = Array(buf.suffix(halfTaps * 2))
+            return []
+        }
+
+        var out: [Float] = []
+        out.reserveCapacity(Int((Double(chunk.count) / ratio).rounded()) + 8)
+
+        var pos = fracPos + Double(halfTaps)
+        let limit = Double(buf.count - halfTaps - 1)
+        while pos < limit {
+            let center = Int(pos)
+            let frac = pos - Double(center)
+            var acc: Double = 0
+            var wsum: Double = 0
+            for k in (-halfTaps)...halfTaps {
+                let x = Double(k) - frac
+                let sincVal: Double
+                if abs(x) < 1e-6 {
+                    sincVal = cutoff
+                } else {
+                    let arg = Double.pi * x * cutoff
+                    sincVal = sin(arg) / (Double.pi * x)
+                }
+                let n = Double(k + halfTaps) / Double(2 * halfTaps)
+                let win = 0.42 - 0.50 * cos(2.0 * Double.pi * n) + 0.08 * cos(4.0 * Double.pi * n)
+                let coeff = sincVal * win
+                acc += Double(buf[center + k]) * coeff
+                wsum += coeff
+            }
+            out.append(Float(wsum > 1e-6 ? acc / wsum : acc))
+            pos += ratio
+        }
+
+        let consumedFromChunk = Int(floor(pos)) - history.count
+        fracPos = (pos - floor(pos))
+        if consumedFromChunk >= 0 && consumedFromChunk < chunk.count {
+            let histStart = max(0, min(buf.count - 1, Int(floor(pos)) - halfTaps))
+            history = Array(buf[histStart...(buf.count - 1)])
+        } else {
+            history = Array(buf.suffix(halfTaps))
+            fracPos = 0
+        }
+        return out
+    }
+}
+
 public struct NeuralSynthesisExecutionInfo: Equatable, Sendable {
     public let engineID: String
     public let modelID: String
@@ -260,6 +337,15 @@ public struct KokoroEngineDiagnosticsSnapshot: Equatable, Sendable {
         numSpeakers: 0,
         lastError: nil
     )
+}
+
+private func centerAudioDCOffset(_ samples: [Float]) -> [Float] {
+    guard !samples.isEmpty else { return samples }
+    var sum: Float = 0
+    for s in samples { sum += s }
+    let mean = sum / Float(samples.count)
+    guard abs(mean) > 1e-4 else { return samples }
+    return samples.map { $0 - mean }
 }
 
 public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unchecked Sendable {
@@ -616,8 +702,9 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
                             } else {
                                 converted = rawSamples
                             }
-                            guard !converted.isEmpty else { return }
-                            onAudioFloats24k(converted, labelState.claimLabel())
+                            let centered = centerAudioDCOffset(converted)
+                            guard !centered.isEmpty else { return }
+                            onAudioFloats24k(centered, labelState.claimLabel())
                         }
                     )
 
@@ -646,8 +733,9 @@ public final class KokoroNeuralTTSProvider: StreamingTextToSpeechProvider, @unch
                                 let out = (audio.sample_rate > 0 && Int(audio.sample_rate) != 24_000)
                                     ? AudioPCMConverter.resampleLinear(samples: raw, fromSampleRate: Double(audio.sample_rate), toSampleRate: 24_000)
                                     : raw
-                                if !out.isEmpty {
-                                    onAudioFloats24k(out, clean)
+                                let centered = centerAudioDCOffset(out)
+                                if !centered.isEmpty {
+                                    onAudioFloats24k(centered, clean)
                                 }
                             }
                         }
@@ -1249,7 +1337,7 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
         let t0 = DispatchTime.now().uptimeNanoseconds
         let proc = Process()
         proc.executableURL = resolved.serverURL
-        let ctxSize = assetManager.hardwareProfile == .low8GB ? "2048" : "4096"
+        let ctxSize = assetManager.hardwareProfile == .low8GB ? "4096" : "8192"
         let threads = assetManager.hardwareProfile == .low8GB ? "4" : "6"
         var serverArgs = [
             "-m", resolved.ggufURL.path,
@@ -1258,6 +1346,7 @@ public final class LocalLlamaServerBrainRuntime: ObservableObject {
             "-ngl", "99",
             "--ctx-size", ctxSize,
             "--threads", threads,
+            "--jinja",
             "--no-webui"
         ]
         if resolved.descriptor.id.contains("qwen3") {

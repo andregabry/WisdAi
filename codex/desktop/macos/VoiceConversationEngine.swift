@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import os
 
@@ -1017,5 +1018,240 @@ public final class BargeInCoordinator {
             cancelledBufferedSamples: snapshot.discardedBufferedSamples,
             flushTimestampUptimeNs: snapshot.flushTimestampUptimeNs
         )
+    }
+}
+
+// MARK: - Preserved Acoustic & Profile Value Types (Clean Neural Output, No Metallic DSP)
+
+public enum VoiceConversationProfilePreset: String, CaseIterable, Identifiable, Codable, Sendable {
+    case natural = "natural"
+    case expressive = "expressivo"
+    case professional = "profissional"
+    case casual = "casual"
+    case custom = "personalizado"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .natural: return "Natural"
+        case .expressive: return "Expressivo"
+        case .professional: return "Profissional"
+        case .casual: return "Casual"
+        case .custom: return "Personalizado"
+        }
+    }
+}
+
+public enum PitchContourKind: String, Codable, Sendable {
+    case rising
+    case falling
+    case level
+    case unknown
+}
+
+public struct VoiceDSPParameters: Equatable, Codable, Sendable {
+    public var toneSemitones: Double
+    public var metallicIntensity: Double
+    public var resonance: Double
+    public var expressivityAmount: Double
+    public var outputVolume: Double
+
+    public init(
+        toneSemitones: Double = 0.0,
+        metallicIntensity: Double = 0.0,
+        resonance: Double = 0.0,
+        expressivityAmount: Double = 0.55,
+        outputVolume: Double = 1.0
+    ) {
+        self.toneSemitones = 0.0
+        self.metallicIntensity = 0.0
+        self.resonance = 0.0
+        self.expressivityAmount = min(1.0, max(0.0, expressivityAmount))
+        self.outputVolume = min(1.50, max(0.25, outputVolume))
+    }
+
+    public static let clean = VoiceDSPParameters(
+        toneSemitones: 0.0,
+        metallicIntensity: 0.0,
+        resonance: 0.0,
+        expressivityAmount: 0.55,
+        outputVolume: 1.0
+    )
+
+    public var isIdentityClean: Bool {
+        abs(outputVolume - 1.0) <= 0.01
+    }
+}
+
+public struct AcousticTurnFeatures: Equatable, Sendable {
+    public let rms: Float
+    public let peak: Float
+    public let lowEnergy: Float
+    public let highEnergy: Float
+    public let voicedRatio: Double
+    public let fundamentalFreqHz: Double
+    public let pitchContour: PitchContourKind
+    public let hasAcousticSignal: Bool
+
+    public static let unavailable = AcousticTurnFeatures(
+        rms: 0,
+        peak: 0,
+        lowEnergy: 0,
+        highEnergy: 0,
+        voicedRatio: 0,
+        fundamentalFreqHz: 0,
+        pitchContour: .unknown,
+        hasAcousticSignal: false
+    )
+}
+
+public final class AcousticFeatureExtractor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recentF0: [Double] = []
+    private var totalFrames = 0
+    private var voicedFrames = 0
+
+    public init() {}
+
+    public func processAudioChunk(
+        samples: [Float],
+        sampleRate: Double,
+        levels: (rms: Float, peak: Float, low: Float, mid: Float, high: Float)
+    ) -> AcousticTurnFeatures {
+        let hz = (levels.rms >= 0.015 && levels.low >= 0.012 && sampleRate >= 12_000 && samples.count >= 256)
+            ? Self.computeNormalizedAutocorrelationF0(samples: samples, sampleRate: sampleRate)
+            : 0.0
+        return lock.withLock {
+            totalFrames += 1
+            if hz >= 65.0 && hz <= 340.0 {
+                voicedFrames += 1
+                recentF0.append(hz)
+                if recentF0.count > 12 { recentF0.removeFirst(recentF0.count - 12) }
+            }
+            let contour: PitchContourKind = {
+                guard recentF0.count >= 4, let first = recentF0.first, let last = recentF0.last else { return .unknown }
+                let diff = last - first
+                if diff >= 12.0 { return .rising }
+                if diff <= -12.0 { return .falling }
+                return .level
+            }()
+            let ratio = totalFrames > 0 ? Double(voicedFrames) / Double(totalFrames) : 0.0
+            return AcousticTurnFeatures(
+                rms: levels.rms,
+                peak: levels.peak,
+                lowEnergy: levels.low,
+                highEnergy: levels.high,
+                voicedRatio: ratio,
+                fundamentalFreqHz: recentF0.last ?? hz,
+                pitchContour: contour,
+                hasAcousticSignal: true
+            )
+        }
+    }
+
+    public func currentContour() -> PitchContourKind {
+        lock.withLock {
+            guard recentF0.count >= 4, let first = recentF0.first, let last = recentF0.last else { return .unknown }
+            let diff = last - first
+            if diff >= 12.0 { return .rising }
+            if diff <= -12.0 { return .falling }
+            return .level
+        }
+    }
+
+    public func resetTurn() {
+        lock.withLock {
+            recentF0.removeAll()
+            totalFrames = 0
+            voicedFrames = 0
+        }
+    }
+
+    /// Computes median fundamental frequency (65-340 Hz) across voiced frames using vDSP normalized autocorrelation.
+    public static func measureMedianFundamentalFrequencyHz(samples: [Float], sampleRate: Double) -> Double? {
+        guard sampleRate >= 12_000, samples.count >= 512 else { return nil }
+        let win = max(384, min(samples.count, Int(0.048 * sampleRate)))
+        let hop = max(192, win / 2)
+        var series: [Double] = []
+        var offset = 0
+        while offset + win <= samples.count {
+            let frame = Array(samples[offset..<(offset + win)])
+            var rms: Float = 0
+            vDSP_rmsqv(frame, 1, &rms, vDSP_Length(win))
+            if rms >= 0.014 {
+                let f0 = computeNormalizedAutocorrelationF0(samples: frame, sampleRate: sampleRate)
+                if f0 >= 65.0 && f0 <= 340.0 {
+                    series.append(f0)
+                }
+            }
+            offset += hop
+        }
+        guard !series.isEmpty else { return nil }
+        series.sort()
+        return series[series.count / 2]
+    }
+
+    private static func computeNormalizedAutocorrelationF0(samples: [Float], sampleRate: Double) -> Double {
+        let winSize = min(samples.count, max(512, Int(sampleRate * 0.032)))
+        guard winSize >= 384 else { return 0 }
+        let start = samples.count - winSize
+        let minLag = max(16, Int(sampleRate / 350.0))
+        let maxLag = min(winSize - 32, Int(sampleRate / 65.0))
+        guard maxLag > minLag + 8 else { return 0 }
+
+        var zeroMean = Array(samples[start..<samples.count])
+        var mean: Float = 0
+        vDSP_meanv(zeroMean, 1, &mean, vDSP_Length(winSize))
+        var negMean = -mean
+        vDSP_vsadd(zeroMean, 1, &negMean, &zeroMean, 1, vDSP_Length(winSize))
+
+        var zeroLagEnergy: Float = 0
+        vDSP_dotpr(zeroMean, 1, zeroMean, 1, &zeroLagEnergy, vDSP_Length(winSize))
+        guard zeroLagEnergy > 1e-5 else { return 0 }
+
+        var bestCorr: Float = 0
+        let checkLen = winSize - maxLag
+        guard checkLen > 64 else { return 0 }
+
+        var corrs = [Float](repeating: 0, count: maxLag + 1)
+        zeroMean.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            for lag in minLag...maxLag {
+                var dot: Float = 0
+                var normA: Float = 0
+                var normB: Float = 0
+                vDSP_dotpr(base, 1, base.advanced(by: lag), 1, &dot, vDSP_Length(checkLen))
+                vDSP_dotpr(base, 1, base, 1, &normA, vDSP_Length(checkLen))
+                vDSP_dotpr(base.advanced(by: lag), 1, base.advanced(by: lag), 1, &normB, vDSP_Length(checkLen))
+                let denom = sqrt(max(1e-8, normA * normB))
+                let corr = dot / denom
+                corrs[lag] = corr
+                if corr > bestCorr {
+                    bestCorr = corr
+                }
+            }
+        }
+        guard bestCorr >= 0.48 else { return 0 }
+
+        // Select the peak of the FIRST period peak above 90% of global maximum so 2T/3T subharmonics cannot hijack F0.
+        let peakThreshold = max(Float(0.48), bestCorr * 0.90)
+        var bestLag = 0
+        var bestPeakCorr: Float = -1
+        var insidePeak = false
+        for lag in minLag...maxLag {
+            let corr = corrs[lag]
+            if corr >= peakThreshold {
+                insidePeak = true
+                if corr > bestPeakCorr {
+                    bestPeakCorr = corr
+                    bestLag = lag
+                }
+            } else if insidePeak {
+                break
+            }
+        }
+        guard bestLag > 0 else { return 0 }
+        return sampleRate / Double(bestLag)
     }
 }
